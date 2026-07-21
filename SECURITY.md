@@ -2,16 +2,22 @@
 
 ## Supported Versions
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+This project is in early development. Security updates are provided only for the
+latest released version.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+| 0.0.x   | :white_check_mark: |
 
 ## Reporting a Vulnerability
 
-To report a security issue, please email $VMTalias with a description of the issue, the steps you took to create the issue, affected versions, and if known, mitigations for the issue. Our vulnerability management team will acknowledge receiving your email within 3 working days. This project follows a 90 day disclosure timeline.
+Please do not report security vulnerabilities through public GitHub issues.
+
+To report a security issue, use GitHub's private
+[security advisory](https://github.com/IBM/embasi-qiskit-integration/security/advisories/new)
+reporting for this repository. Please include a description of the issue, the
+steps you took to create it, affected versions, and, if known, mitigations for
+the issue.
+
+We will acknowledge receipt within 3 working days. This project follows a 90 day
+disclosure timeline.
