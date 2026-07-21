@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "embasi-qiskit-integration"       # import: embasi_qiskit_integration
+version = "0.0.1"
+description = "Couple EmbASI projection-based embedding with the Qiskit SQD stack."
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pyscf>=2.3",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+]
+
+[project.optional-dependencies]
+quantum  = ["qiskit>=1.0", "qiskit-aer", "qiskit-addon-sqd", "ffsim"]
+# qiskit-fermions is NOT on PyPI and builds a native (Rust) extension, so it is
+# referenced directly from git rather than by name. Requires a Rust toolchain
+# (see README prerequisites). Install with: uv pip install -e ".[fermions]".
+fermions = ["qiskit-fermions @ git+https://github.com/Qiskit/qiskit-fermions.git"]
+hardware = ["qiskit-ibm-runtime"]
+embed    = ["embasi", "mpi4py"]          # EmbASI (from PyPI); pulls ase + asi4py
+dev      = ["pytest>=7", "pytest-cov", "ruff", "mypy", "pre-commit"]
+
+[project.scripts]
+embasi-qiskit-integration = "embasi_qiskit_integration.cli:main"
+
+[tool.pytest.ini_options]
+markers = ["embasi: requires EmbASI + FHI-aims", "slow: heavy simulation"]
+addopts = "-m 'not embasi'"
+testpaths = ["tests"]
+# The vendored EmbASI/ checkout ships its own FHI-aims tests; keep them out.
+norecursedirs = ["EmbASI", ".venv", "build", "dist"]
+filterwarnings = [
+    # PySCF emits benign divide/overflow RuntimeWarnings from its Davidson/Fock
+    # diagnostics on the small dense custom-integral problems used in tests.
+    "ignore:divide by zero encountered:RuntimeWarning",
+    "ignore:overflow encountered:RuntimeWarning",
+    "ignore:invalid value encountered:RuntimeWarning",
+]
+
+[tool.hatch.metadata]
+# The `fermions` extra references qiskit-fermions directly from git (it is not
+# on PyPI); hatchling requires opting in to direct references.
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/embasi_qiskit_integration"]
+
+[tool.ruff]
+src = ["src", "tests"]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true

@@ -2,12 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
 ## [Unreleased]
 
-## [0.0.1] - 2019-02-15
-
 ### Added
-- Added a changelog
+- Initial open-source release of `embasi-qiskit-integration`, coupling EmbASI
+  projection-based embedding with the Qiskit SQD stack.
 
-[unreleased]: https://github.com/ibm/repo-template/compare/v0.0.1...HEAD
-[0.0.1]: https://github.com/ibm/repo-template/releases/tag/v0.0.1
+[Unreleased]: https://github.com/IBM/embasi-qiskit-integration/commits/main

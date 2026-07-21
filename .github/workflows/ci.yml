@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv venv --python 3.12
+
+      - name: Install project
+        run: uv pip install -e ".[dev,quantum]"
+
+      - name: Check formatting (ruff)
+        run: uv run ruff format --check src scripts tests
+
+      - name: Lint (ruff)
+        run: uv run ruff check src scripts tests
+
+      - name: Run unit tests
+        run: uv run pytest -q
