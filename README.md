@@ -231,9 +231,7 @@ so you only need this to exercise the real embedding backend.
 
 ## License
 
-This project is licensed under the [Apache License 2.0](LICENSE).
-
-Every source file carries an SPDX license header:
+This project is licensed under the [Apache License 2.0](LICENSE). Every source file carries an SPDX license header:
 
 ```
 # Copyright IBM Corp. 2026
