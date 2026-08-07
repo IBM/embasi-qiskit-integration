@@ -121,7 +121,7 @@ def build_sqdrift_circuits(
 
     occ = _hf_occupation(ham.norb, ham.nelec)
 
-    def _base_circuit() -> "FermionicCircuit":
+    def _base_circuit() -> FermionicCircuit:
         circ = FermionicCircuit(num_modes)
         circ.append(InitializeModes(occ), circ.modes)
         circ.append(Evolution(num_modes, normal, time), circ.modes)

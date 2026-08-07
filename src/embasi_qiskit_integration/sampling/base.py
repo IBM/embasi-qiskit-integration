@@ -45,7 +45,7 @@ class MockSampler:
         # total exactly by handing any rounding remainder to the largest bin.
         scaled: dict[str, int] = {}
         for bitstring, count in self._counts.items():
-            scaled[bitstring] = int(round(count * shots / total))
+            scaled[bitstring] = round(count * shots / total)
         drift = shots - sum(scaled.values())
         if drift != 0 and scaled:
             top = max(scaled, key=scaled.__getitem__)

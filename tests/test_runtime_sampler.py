@@ -14,9 +14,9 @@ import pytest
 
 pytest.importorskip("qiskit_ibm_runtime", reason="needs the 'hardware' extra")
 
-from qiskit import QuantumCircuit  # noqa: E402
+from qiskit import QuantumCircuit
 
-from embasi_qiskit_integration.sampling.runtime import RuntimeSampler  # noqa: E402
+from embasi_qiskit_integration.sampling.runtime import RuntimeSampler
 
 
 class _FakeService:

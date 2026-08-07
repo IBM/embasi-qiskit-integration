@@ -119,9 +119,7 @@ class _FeedbackMockEmbedding:
 
 
 def _build_adapter(n_occ_a: int = 1, mu: float = 1.0e6):
-    mol = pyscf.M(
-        atom="H 0 0 0; H 0 0 0.74; H 0 0 1.48; H 0 0 2.22", basis="sto-3g"
-    )
+    mol = pyscf.M(atom="H 0 0 0; H 0 0 0.74; H 0 0 1.48; H 0 0 2.22", basis="sto-3g")
     mf_hl = mol.RHF()
     mock = _FeedbackMockEmbedding(mol, mu=mu, n_occ_a=n_occ_a)
     return ProjectionEmbeddingAdapter(mock, PySCFIntegrals(mf_hl), mu=mu)
@@ -186,9 +184,7 @@ def test_single_cycle_matches_direct_calls():
     adapter2 = _build_adapter()
     adapter2.run_low_level()
     wf = _workflow(solver="fci", max_cycles=1)
-    energy = wf._run_outer_loop(
-        adapter2, FCISolver(), None, rank=0, log=lambda *a, **k: None
-    )
+    energy = wf._run_outer_loop(adapter2, FCISolver(), None, rank=0, log=lambda *a, **k: None)
     assert energy.total == pytest.approx(ref.total, abs=1e-9)
 
 
@@ -198,9 +194,7 @@ def test_loop_converges_and_stops_early():
     adapter.run_low_level()
     logs: list[str] = []
     wf = _workflow(solver="fci", max_cycles=8, e_tol=1e-6, rho_tol=1e-5)
-    energy = wf._run_outer_loop(
-        adapter, FCISolver(), None, rank=0, log=logs.append
-    )
+    energy = wf._run_outer_loop(adapter, FCISolver(), None, rank=0, log=logs.append)
     assert energy is not None
     # FCI on the full A space is a fixed point: the density fed back equals the
     # one that produced it, so cycle 2 already matches cycle 1 and the loop stops.
@@ -216,9 +210,7 @@ def test_converge_on_energy_stops_when_density_still_moving():
     cycle 2, so the energy criterion fires immediately.
     """
     logs_e: list[str] = []
-    wf_e = _workflow(
-        solver="fci", max_cycles=8, e_tol=1e-6, rho_tol=1e-30, converge_on="energy"
-    )
+    wf_e = _workflow(solver="fci", max_cycles=8, e_tol=1e-6, rho_tol=1e-30, converge_on="energy")
     adapter_e = _build_adapter()
     adapter_e.run_low_level()
     wf_e._run_outer_loop(adapter_e, FCISolver(), None, rank=0, log=logs_e.append)
@@ -258,15 +250,14 @@ def test_mix_alpha_damps_the_fed_back_density():
             return super().construct_embedded_fock(dmab_in=dmab_in)
 
     def build(alpha):
-        mol = pyscf.M(
-            atom="H 0 0 0; H 0 0 0.74; H 0 0 1.48; H 0 0 2.22", basis="sto-3g"
-        )
+        mol = pyscf.M(atom="H 0 0 0; H 0 0 0.74; H 0 0 1.48; H 0 0 2.22", basis="sto-3g")
         mock = _Recording(mol, mu=1.0e6, n_occ_a=1)
         adapter = ProjectionEmbeddingAdapter(mock, PySCFIntegrals(mol.RHF()), mu=1.0e6)
         adapter.run_low_level()
         seen.clear()
-        wf = _workflow(solver="fci", max_cycles=3, mix_alpha=alpha,
-                       e_tol=1e-30, rho_tol=1e-30)  # never stop early -> full 3 cycles
+        wf = _workflow(
+            solver="fci", max_cycles=3, mix_alpha=alpha, e_tol=1e-30, rho_tol=1e-30
+        )  # never stop early -> full 3 cycles
         wf._run_outer_loop(adapter, FCISolver(), None, rank=0, log=lambda *a, **k: None)
         return [m.copy() for m in seen]
 
@@ -300,7 +291,7 @@ def test_reseed_advances_seed_when_solver_has_one():
         seed = 100
 
     stub = _StubSeeded()
-    wf._maybe_reseed(stub, cycle=0)   # cycle 0 never changes the seed
+    wf._maybe_reseed(stub, cycle=0)  # cycle 0 never changes the seed
     assert stub.seed == 100
     wf._maybe_reseed(stub, cycle=3)
     assert stub.seed == 103

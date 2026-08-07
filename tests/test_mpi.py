@@ -41,6 +41,7 @@ def _run_mpi(code: str, nranks: int = 2) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=300,
+        check=False,
         cwd=REPO_ROOT,
     )
 
@@ -100,6 +101,7 @@ def test_embedding_workflow_mpi_orchestration():
         capture_output=True,
         text=True,
         timeout=300,
+        check=False,
         cwd=REPO_ROOT,
     )
     assert proc.returncode == 0, proc.stderr

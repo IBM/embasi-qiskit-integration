@@ -73,12 +73,12 @@ def concentric_selector(
         sc = s @ c_virt
         w = np.einsum("mv,mv->v", sc[frag, :], c_virt[frag, :])
 
-        order = np.argsort(-w)                     # strongest fragment coupling first
+        order = np.argsort(-w)  # strongest fragment coupling first
         w_sorted = w[order]
 
         # Largest gap from the top that clears the tolerance sets the shell edge.
         gaps = w_sorted[:-1] - w_sorted[1:]
-        keep = n_virt                              # default: keep everything
+        keep = n_virt  # default: keep everything
         significant = np.nonzero(gaps >= gap_tol)[0]
         if significant.size:
             # +1: a gap after index i keeps virtuals 0..i inclusive.

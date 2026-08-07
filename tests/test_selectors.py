@@ -17,7 +17,6 @@ value the physics happens to produce.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from embasi_qiskit_integration.selectors import (
     concentric_selector,
@@ -110,8 +109,8 @@ def test_max_virtual_caps_after_the_gap():
     # gap_tol high enough that nothing cuts on the gap; cap does the work.
     sel = concentric_selector(s, frag, gap_tol=0.5, max_virtual=2)
     active = sel(coeff, energy, n_occ)
-    assert active[0] == 0                       # occupied kept
-    assert len(active) - n_occ == 2             # capped at 2 virtuals
+    assert active[0] == 0  # occupied kept
+    assert len(active) - n_occ == 2  # capped at 2 virtuals
     # the two kept are the two strongest-coupled (columns 1 and 2).
     assert set(active[n_occ:]) == {1, 2}
 
@@ -134,7 +133,7 @@ def test_no_significant_gap_keeps_everything():
 
     sel = concentric_selector(s, frag, gap_tol=0.1)  # gaps are all 0.02
     active = sel(coeff, energy, n_occ)
-    assert len(active) == nao                        # all occ + all virt
+    assert len(active) == nao  # all occ + all virt
     assert set(active[n_occ:]) == set(range(n_occ, nao))
 
 
@@ -210,9 +209,9 @@ def test_fragment_ao_indices_from_mock_mol():
             # columns 2 and 3 are (ao_start, ao_end) per atom.
             return np.array(
                 [
-                    [0, 0, 0, 2],   # atom 0 -> AOs 0,1
-                    [0, 0, 2, 5],   # atom 1 -> AOs 2,3,4
-                    [0, 0, 5, 6],   # atom 2 -> AO 5
+                    [0, 0, 0, 2],  # atom 0 -> AOs 0,1
+                    [0, 0, 2, 5],  # atom 1 -> AOs 2,3,4
+                    [0, 0, 5, 6],  # atom 2 -> AO 5
                 ]
             )
 

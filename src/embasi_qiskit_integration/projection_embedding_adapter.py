@@ -154,11 +154,11 @@ class PySCFIntegrals:
     """
 
     def __init__(self, mf_hl, *, density_fit: bool | str = False):
-        self.mf = mf_hl                 # the same object passed to calc_base_hl
+        self.mf = mf_hl  # the same object passed to calc_base_hl
         self.mol = mf_hl.mol
-        self._hf = mf_hl.mol.RHF()      # integral engine only; never kernel()'d
+        self._hf = mf_hl.mol.RHF()  # integral engine only; never kernel()'d
         self._density_fit = density_fit
-        self._df = None                 # built lazily on first eri_mo call
+        self._df = None  # built lazily on first eri_mo call
 
     def overlap(self) -> np.ndarray:
         return np.asarray(self.mol.intor("int1e_ovlp"))
@@ -221,11 +221,11 @@ class FHIaimsIntegrals:
 class EmbeddedOrbitals:
     """Orthonormal orbitals of subsystem A in the (possibly truncated) AO basis."""
 
-    coeff: np.ndarray        # (nao, nmo_A) -- environment columns already dropped
-    energy: np.ndarray       # (nmo_A,)
-    n_occ: int               # doubly occupied orbitals of A
-    inactive: np.ndarray     # column indices frozen into e_core
-    active: np.ndarray       # column indices handed to the solver
+    coeff: np.ndarray  # (nao, nmo_A) -- environment columns already dropped
+    energy: np.ndarray  # (nmo_A,)
+    n_occ: int  # doubly occupied orbitals of A
+    inactive: np.ndarray  # column indices frozen into e_core
+    active: np.ndarray  # column indices handed to the solver
 
     @property
     def c_inactive(self) -> np.ndarray:
@@ -256,11 +256,11 @@ class EmbeddedOrbitals:
 class ProjectionEnergy:
     """Term-by-term breakdown of paper Eq. 8."""
 
-    e_low_total: float       # E_L[γ^A + γ^B]
-    e_low_A: float           # E_L[γ^A]
-    e_high_A: float          # E_H[Ψ̃^A], embedding potential removed
-    correction: float        # tr[(γ̃^A - γ^A) v_emb]
-    projector_leak: float    # tr[γ̃^A P_B], a numerical zero when clean
+    e_low_total: float  # E_L[γ^A + γ^B]
+    e_low_A: float  # E_L[γ^A]
+    e_high_A: float  # E_H[Ψ̃^A], embedding potential removed
+    correction: float  # tr[(γ̃^A - γ^A) v_emb]
+    projector_leak: float  # tr[γ̃^A P_B], a numerical zero when clean
 
     @property
     def total(self) -> float:
@@ -279,10 +279,10 @@ class ProjectionEmbeddingAdapter:
 
     def __init__(
         self,
-        projection,                       # embasi.embedding.ProjectionEmbedding
+        projection,  # embasi.embedding.ProjectionEmbedding
         integrals: AOIntegrals,
         *,
-        mu: float = 1.0e6,                # level-shift parameter, paper Eq. 6
+        mu: float = 1.0e6,  # level-shift parameter, paper Eq. 6
         env_eigenvalue_floor: float = _ENV_EIGENVALUE_FLOOR,
     ):
         if getattr(projection, "projection", None) != "level-shift":
@@ -302,9 +302,9 @@ class ProjectionEmbeddingAdapter:
         self.mu = mu
         self._floor = env_eigenvalue_floor
 
-        self._dm_a = None      # γ^A  (localized, low level), AO, 2-occupancy
-        self._dm_b = None      # γ^B  (environment, frozen), AO
-        self._fock = None      # F_emb
+        self._dm_a = None  # γ^A  (localized, low level), AO, 2-occupancy
+        self._dm_b = None  # γ^B  (environment, frozen), AO
+        self._fock = None  # F_emb
         self._s = None
 
     # ---------------- low-level embedding ---------------- #
@@ -345,9 +345,7 @@ class ProjectionEmbeddingAdapter:
         # (v_emb / P_B themselves are still recovered by subtraction -- see the
         # TODO(embasi-api) on `p_b` / `h_emb`.)
         mu_embasi = getattr(self.p, "mu_val", None)
-        if mu_embasi is not None and not np.isclose(
-            float(mu_embasi), self.mu, rtol=1e-9, atol=0.0
-        ):
+        if mu_embasi is not None and not np.isclose(float(mu_embasi), self.mu, rtol=1e-9, atol=0.0):
             raise ValueError(
                 f"level-shift mu mismatch: adapter mu={self.mu:g} but EmbASI "
                 f"used mu_val={float(mu_embasi):g}; the reconstructed P_B would "
@@ -433,7 +431,7 @@ class ProjectionEmbeddingAdapter:
     def _as_ao_by_mo(self, c) -> np.ndarray:
         """Fix layout: ASI/Fortran may hand back (nmo, nao) or a leading spin axis."""
         c = np.asarray(c)
-        if c.ndim == 3:                       # (nspin, ., .) -- closed shell only
+        if c.ndim == 3:  # (nspin, ., .) -- closed shell only
             # Open-shell embedding is a deferred package rewrite (see the
             # module docstring): everything downstream assumes a 2-occupancy
             # density and a spin-restricted downfold, so supporting open shells
@@ -514,7 +512,7 @@ class ProjectionEmbeddingAdapter:
         full-basis path via ``restrict_to_a=False``.
         """
         s = self._s
-        c_b = self.mo_b_ll                    # (nao, n_occ_B), S-orthonormal
+        c_b = self.mo_b_ll  # (nao, n_occ_B), S-orthonormal
         # Project span(B) out in the S-metric: P = I - c_b c_b^T S.
         proj = np.eye(s.shape[0]) - c_b @ (c_b.T @ s)
         # S-orthonormal basis of R^nao (columns of L^-T with L L^T = S), deflated.
@@ -570,18 +568,16 @@ class ProjectionEmbeddingAdapter:
             eps, c = self._eigh_subsystem_a()
         else:
             eps, c = sla.eigh(self._fock, self._s)
-            keep = eps < self._floor          # level shift removes subsystem B
+            keep = eps < self._floor  # level shift removes subsystem B
             eps, c = eps[keep], c[:, keep]
 
-        n_occ = self.mo_a_ll.shape[1]         # inferred, never passed in
+        n_occ = self.mo_a_ll.shape[1]  # inferred, never passed in
         self._validate_span(c[:, :n_occ])
 
         n_virt_total = c.shape[1] - n_occ
         n_virt = n_virt_total if n_virtual is None else min(n_virtual, n_virt_total)
         if not 0 <= n_frozen_occ < n_occ:
-            raise ValueError(
-                f"n_frozen_occ={n_frozen_occ} outside [0, {n_occ}) for subsystem A"
-            )
+            raise ValueError(f"n_frozen_occ={n_frozen_occ} outside [0, {n_occ}) for subsystem A")
 
         if selector is not None:
             # Hook for AVAS / MP2-NOON / concentric-localisation selection.  A
@@ -594,12 +590,8 @@ class ProjectionEmbeddingAdapter:
         else:
             active = np.arange(n_frozen_occ, n_occ + n_virt)
 
-        inactive = np.array(
-            [i for i in range(n_occ) if i not in set(active.tolist())], dtype=int
-        )
-        return EmbeddedOrbitals(
-            coeff=c, energy=eps, n_occ=n_occ, inactive=inactive, active=active
-        )
+        inactive = np.array([i for i in range(n_occ) if i not in set(active.tolist())], dtype=int)
+        return EmbeddedOrbitals(coeff=c, energy=eps, n_occ=n_occ, inactive=inactive, active=active)
 
     # ---------------- downfolding ---------------- #
     def embedded_hamiltonian(self, orbitals: EmbeddedOrbitals) -> EmbeddedHamiltonian:
@@ -608,7 +600,7 @@ class ProjectionEmbeddingAdapter:
         c_in, c_act = orbitals.c_inactive, orbitals.c_active
 
         dm_in = 2.0 * (c_in @ c_in.T)
-        veff_in = self.ints.veff_hf(dm_in)      # HF, regardless of the high level
+        veff_in = self.ints.veff_hf(dm_in)  # HF, regardless of the high level
 
         h1 = c_act.T @ (h_emb + veff_in) @ c_act
         # (h_emb + veff_in) is a symmetric operator and c_act is real, so h1 is
@@ -625,9 +617,7 @@ class ProjectionEmbeddingAdapter:
             )
         h1 = 0.5 * (h1 + h1.T)
         h2 = self.ints.eri_mo(c_act)
-        e_core = self.ints.energy_nuc() + np.einsum(
-            "ij,ji->", dm_in, h_emb + 0.5 * veff_in
-        )
+        e_core = self.ints.energy_nuc() + np.einsum("ij,ji->", dm_in, h_emb + 0.5 * veff_in)
 
         n_alpha = n_beta = orbitals.n_active_electrons // 2
 
@@ -635,9 +625,7 @@ class ProjectionEmbeddingAdapter:
         # separation is broken and everything above is meaningless.
         leak = float(np.abs(c_act.T @ self.p_b @ c_act).max())
         if leak > 1e-6:
-            raise ValueError(
-                f"active orbitals leak into subsystem B (|P_B| = {leak:.2e})"
-            )
+            raise ValueError(f"active orbitals leak into subsystem B (|P_B| = {leak:.2e})")
 
         return EmbeddedHamiltonian(
             h1=h1,
@@ -712,9 +700,7 @@ class ProjectionEmbeddingAdapter:
         return float(np.real(e_ab)) * _EV2HA, float(np.real(e_a)) * _EV2HA
 
     # ---------------- density feedback ---------------- #
-    def rdm1_ao(
-        self, rdm1_active: np.ndarray, orbitals: EmbeddedOrbitals
-    ) -> np.ndarray:
+    def rdm1_ao(self, rdm1_active: np.ndarray, orbitals: EmbeddedOrbitals) -> np.ndarray:
         """Back-transform the correlated (spin-summed) 1-RDM to the AO basis."""
         c_in, c_act = orbitals.c_inactive, orbitals.c_active
         return 2.0 * (c_in @ c_in.T) + c_act @ np.asarray(rdm1_active) @ c_act.T

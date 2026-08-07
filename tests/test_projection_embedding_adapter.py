@@ -40,16 +40,16 @@ def _build_adapter(xc_hl: str = "PBE", xc_ll: str = "PBE"):
     """
     import pyscf
     from ase.data.s22 import create_s22_system, s26
+    from embasi.embedding import ProjectionEmbedding
     from pyscf.pbc.tools.pyscf_ase import PySCF, ase_atoms_to_pyscf
 
-    from embasi.embedding import ProjectionEmbedding
     from embasi_qiskit_integration.projection_embedding_adapter import (
         ProjectionEmbeddingAdapter,
         PySCFIntegrals,
     )
 
     atoms = create_s22_system(s26[22])[:6]  # methanol monomer
-    active_atoms = [1, 5]                    # O and hydroxyl H
+    active_atoms = [1, 5]  # O and hydroxyl H
     embed_mask = len(atoms) * [2]
     for i in active_atoms:
         embed_mask[i] = 1
@@ -142,8 +142,8 @@ def _single_determinant_energy(ham, c_occ_active) -> float:
     the downfolded Hamiltonian -- exactly the quantity a mean-field solve of
     ``ham`` would return, with no correlation.
     """
-    norb = ham.norb
-    d = 2.0 * (c_occ_active @ c_occ_active.T)          # (norb, norb), MO basis
+    _ = ham.norb
+    d = 2.0 * (c_occ_active @ c_occ_active.T)  # (norb, norb), MO basis
     j = np.einsum("pqrs,rs->pq", ham.h2, d)
     k = np.einsum("prqs,rs->pq", ham.h2, d)
     e1 = np.einsum("pq,pq->", d, ham.h1)
@@ -334,12 +334,8 @@ def test_restricted_span_reproduces_full_basis_orbitals(adapter):
     inherit that identically, so their *difference* is far smaller, but 1e-6 is
     the honest floor set by the shared shift rather than a value tuned to pass.
     """
-    orb_restricted = adapter.build_orbitals(
-        n_frozen_occ=0, n_virtual=None, restrict_to_a=True
-    )
-    orb_full = adapter.build_orbitals(
-        n_frozen_occ=0, n_virtual=None, restrict_to_a=False
-    )
+    orb_restricted = adapter.build_orbitals(n_frozen_occ=0, n_virtual=None, restrict_to_a=True)
+    orb_full = adapter.build_orbitals(n_frozen_occ=0, n_virtual=None, restrict_to_a=False)
 
     # Same number of A orbitals recovered.
     assert orb_restricted.coeff.shape[1] == orb_full.coeff.shape[1]
@@ -347,8 +343,7 @@ def test_restricted_span_reproduces_full_basis_orbitals(adapter):
     e_r = np.sort(orb_restricted.energy)
     e_f = np.sort(orb_full.energy)
     assert np.allclose(e_r, e_f, atol=1e-6), (
-        f"restricted vs full eigenvalues differ by "
-        f"{np.abs(e_r - e_f).max():.2e}"
+        f"restricted vs full eigenvalues differ by {np.abs(e_r - e_f).max():.2e}"
     )
 
     # Both orbital sets are S-orthonormal (the restricted route by construction).

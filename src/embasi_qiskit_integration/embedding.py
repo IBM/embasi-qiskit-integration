@@ -106,37 +106,37 @@ class EmbeddingWorkflow(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="EQI_EMB_", cli_parse_args=True)
 
     # --- embedding system (mirrors the EmbASI PySCF example) --- #
-    s26_index: int = 22                  # methanol dimer in the s26 set
-    n_atoms: int | None = 6              # first N atoms -> monomer; None for the dimer
-    active_atoms: list[int] = [1, 5]     # O and its hydroxyl H -> the OH fragment
-    basis: str = "sto-3g"                # matches the EmbASI developers' example
+    s26_index: int = 22  # methanol dimer in the s26 set
+    n_atoms: int | None = 6  # first N atoms -> monomer; None for the dimer
+    active_atoms: list[int] = [1, 5]  # O and its hydroxyl H -> the OH fragment
+    basis: str = "sto-3g"  # matches the EmbASI developers' example
     xc_ll: str = "PBE"
     xc_hl: str = "PBE"
-    mu: float = 1.0e6                    # level-shift parameter, paper Eq. 6
+    mu: float = 1.0e6  # level-shift parameter, paper Eq. 6
 
     # --- active space: solver budget only, not embedding physics --- #
     n_frozen_occ: int = 0
-    n_virtual: int | None = None         # None -> every virtual of subsystem A
+    n_virtual: int | None = None  # None -> every virtual of subsystem A
     selector: Literal["none", "concentric"] = "none"
 
     # --- integral backend --- #
-    density_fit: bool = False            # density-fit the active-space ERIs
-    df_auxbasis: str | None = None       # fitting auxbasis; None -> PySCF default
+    density_fit: bool = False  # density-fit the active-space ERIs
+    df_auxbasis: str | None = None  # fitting auxbasis; None -> PySCF default
 
     # --- outer self-consistency loop --- #
-    max_cycles: int = 15                 # cap on feedback cycles (1 -> single pass)
-    e_tol: float = 1.0e-6                # |ΔE_total| convergence threshold (Ha)
-    rho_tol: float = 1.0e-5              # max |Δγ^A| convergence threshold
+    max_cycles: int = 15  # cap on feedback cycles (1 -> single pass)
+    e_tol: float = 1.0e-6  # |ΔE_total| convergence threshold (Ha)
+    rho_tol: float = 1.0e-5  # max |Δγ^A| convergence threshold
     converge_on: Literal["energy_and_density", "energy"] = "energy"
-    mix_alpha: float = 0.5               # linear density mixing (1.0 -> undamped)
-    reseed_sqd: bool = True              # re-sample the SQD subspace each cycle
+    mix_alpha: float = 0.5  # linear density mixing (1.0 -> undamped)
+    reseed_sqd: bool = True  # re-sample the SQD subspace each cycle
 
     # --- solver / sampling --- #
     solver: Literal["sqd", "fci"] = "sqd"
     handoff: Literal["in-process", "two-process"] = "in-process"
     sampler: Literal["aer", "mock", "runtime"] = "aer"
-    backend: str | None = None           # runtime backend name; else least-busy
-    optimization_level: int = 3          # runtime ISA-transpile level
+    backend: str | None = None  # runtime backend name; else least-busy
+    optimization_level: int = 3  # runtime ISA-transpile level
     shots: int = 100_000
     seed: int = 24
     job_dir: Path | None = None
@@ -157,6 +157,7 @@ class EmbeddingWorkflow(BaseSettings):
         rank, size = _rank_size()
 
         if log is None:
+
             def log(msg: str = "") -> None:
                 """Print only on rank 0 (keeps multi-rank output clean)."""
                 if rank == 0:
@@ -220,9 +221,7 @@ class EmbeddingWorkflow(BaseSettings):
             )
             log(f"   {orbitals}")
             if selector is not None:
-                n_kept_virt = orbitals.n_active_orbitals - (
-                    orbitals.n_occ - orbitals.inactive.size
-                )
+                n_kept_virt = orbitals.n_active_orbitals - (orbitals.n_occ - orbitals.inactive.size)
                 log(
                     f"   selector=concentric picked {n_kept_virt} virtuals "
                     "(--n_virtual is advisory when a selector is set)"
@@ -269,9 +268,7 @@ class EmbeddingWorkflow(BaseSettings):
                 log(f"   Δ: |ΔE| = {de:.2e} Ha, max|Δγ^A| = {drho:.2e}")
                 energy_ok = de < self.e_tol
                 density_ok = drho < self.rho_tol
-                converged = energy_ok and (
-                    density_ok or self.converge_on == "energy"
-                )
+                converged = energy_ok and (density_ok or self.converge_on == "energy")
                 if converged:
                     crit = "|ΔE|" if self.converge_on == "energy" else "|ΔE| and max|Δγ^A|"
                     log(f"   converged ({crit}) after {cycle + 1} cycles.")

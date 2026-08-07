@@ -48,7 +48,7 @@ class EmbeddedHamiltonian(BaseModel):
         return np.asarray(value, dtype=float)
 
     @model_validator(mode="after")
-    def _validate_shapes(self) -> "EmbeddedHamiltonian":
+    def _validate_shapes(self) -> EmbeddedHamiltonian:
         h1, h2 = self.h1, self.h2
         if h1.ndim != 2 or h1.shape[0] != h1.shape[1]:
             raise ValueError(f"h1 must be square (norb, norb); got shape {h1.shape}")

@@ -36,7 +36,7 @@ class _MockProjectionEmbedding:
         from pyscf import scf
 
         mf = scf.RHF(mol).run()
-        c = mf.mo_coeff                     # full orthonormal MO set (nao, nao)
+        c = mf.mo_coeff  # full orthonormal MO set (nao, nao)
         occ = mf.mo_occ > 0
         c_occ = c[:, occ]
         n_occ = c_occ.shape[1]
@@ -63,7 +63,7 @@ class _MockProjectionEmbedding:
         # the below-floor block is precisely the A space and the span check is
         # satisfied to machine precision.  F_emb = S C diag(eps) C^T S.
         eps = mf.mo_energy.copy()
-        eps[b_cols] += mu                   # level shift lifts B out of the A window
+        eps[b_cols] += mu  # level shift lifts B out of the A window
         sc = self._s @ c
         self._fock = sc @ np.diag(eps) @ sc.T
 
