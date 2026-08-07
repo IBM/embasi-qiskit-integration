@@ -23,7 +23,7 @@ quantum  = ["qiskit>=1.0", "qiskit-aer", "qiskit-addon-sqd", "ffsim"]
 # (see README prerequisites). Install with: uv pip install -e ".[fermions]".
 fermions = ["qiskit-fermions @ git+https://github.com/Qiskit/qiskit-fermions.git"]
 hardware = ["qiskit-ibm-runtime"]
-embed    = ["embasi", "mpi4py"]          # EmbASI (from PyPI); pulls ase + asi4py
+embed    = ["embasi @ git+https://github.com/tamm-cci/EmbASI.git@qm-code-adapter", "mpi4py"]          # EmbASI (from source); pulls ase + asi4py
 dev      = ["pytest>=7", "pytest-cov", "ruff", "mypy", "pre-commit"]
 
 [project.scripts]
