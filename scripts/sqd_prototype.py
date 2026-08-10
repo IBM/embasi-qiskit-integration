@@ -22,8 +22,8 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, CliApp, SettingsConfigDict
 
-from embasi_qiskit_integration.hamiltonian import fcidump
 from embasi_qiskit_integration.circuit_run.base import MockSampler
+from embasi_qiskit_integration.hamiltonian import fcidump
 from embasi_qiskit_integration.solvers import FCISolver
 from embasi_qiskit_integration.sqd.driver import run_sqd
 

@@ -18,8 +18,8 @@ from embasi_qiskit_integration.circuit_generator.sqdrift import (
     build_sqdrift_circuits,
     sqdrift_available,
 )
-from embasi_qiskit_integration.hamiltonian import fcidump
 from embasi_qiskit_integration.circuit_run.aer import AerSampler
+from embasi_qiskit_integration.hamiltonian import fcidump
 
 requires_fermions = pytest.mark.skipif(
     not sqdrift_available(), reason="qiskit-fermions not installed (fermions extra)"
@@ -95,7 +95,7 @@ def test_sqdrift_qdrift_randomizations_differ(n2_ham):
 @requires_fermions
 def test_sqdrift_qdrift_reproducible_in_process(n2_ham):
     """The same seed rebuilds byte-identical qDRIFT circuits within one process."""
-    kwargs = dict(method="qdrift", num_terms=10, num_randomizations=3, seed=42)
+    kwargs = {"method": "qdrift", "num_terms": 10, "num_randomizations": 3, "seed": 42}
     first = build_sqdrift_circuits(n2_ham, **kwargs)
     second = build_sqdrift_circuits(n2_ham, **kwargs)
     assert [_op_signature(qc) for qc in first] == [_op_signature(qc) for qc in second]
@@ -124,7 +124,7 @@ def test_sqdrift_qdrift_reproducible_across_processes(n2_ham, data_dir):
     fcidump_path = str(data_dir / "n2_8o10e.fcidump")
     runs = []
     for _ in range(2):
-        proc = subprocess.run(  # noqa: S603
+        proc = subprocess.run(
             [sys.executable, "-c", script, fcidump_path],
             capture_output=True,
             text=True,
@@ -187,7 +187,7 @@ def test_filter_trivial_is_separate_from_filter_diagonal_terms(n2_ham):
     -- but with pruning off it visibly changes the circuit, which is what proves
     the option reaches the pass.
     """
-    kwargs = dict(method="qdrift", num_terms=10, num_randomizations=1, seed=42)
+    kwargs = {"method": "qdrift", "num_terms": 10, "num_randomizations": 1, "seed": 42}
 
     pruned_on = _op_signature(
         build_sqdrift_circuits(n2_ham, **kwargs, filter_diagonal_terms=True, filter_trivial=True)[0]
