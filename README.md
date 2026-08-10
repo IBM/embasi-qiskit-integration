@@ -132,20 +132,25 @@ print(RuntimeSampler().sample(qc, shots=1024))   # -> counts dict from hardware
 
 ### 4. Two-process CLI handoff
 
-The CLI defaults to the **SQD pipeline** (`--solver sqd --sampler aer`); swap the
-sampler for `mock` (offline) or `runtime` (hardware):
+The CLI defaults to the **SQD pipeline on hardware** (`--solver sqd --sampler
+runtime`), so a bare `solve` needs configured IBM Quantum credentials (see §3).
+Swap the sampler for `aer` (local simulation) or `mock` (frozen replay) to run
+offline:
 
 ```bash
 # Process A writes <jobdir>/job.fcidump, then:
-uv run embasi-qiskit-integration solve <jobdir>                       # sqd + aer (default)
-uv run embasi-qiskit-integration solve <jobdir> --sampler runtime     # sqd on hardware
-uv run embasi-qiskit-integration solve <jobdir> --sampler runtime \
-    --backend ibm_kingston --optimization-level 3
+uv run embasi-qiskit-integration solve <jobdir>                       # sqd on hardware (default)
+uv run embasi-qiskit-integration solve <jobdir> \
+    --backend ibm_kingston --optimization-level 3                     # pick a backend explicitly
+uv run embasi-qiskit-integration solve <jobdir> --backend FakeManilaV2 # simulated device, no credentials
+uv run embasi-qiskit-integration solve <jobdir> --sampler aer         # local noiseless simulation
 uv run embasi-qiskit-integration solve <jobdir> --sampler mock \
     --counts tests/data/mock_counts.json --seed 24                    # offline, deterministic
 uv run embasi-qiskit-integration solve <jobdir> --solver fci          # classical reference
 # -> writes <jobdir>/result.npz (or result.ERROR on failure)
 ```
+
+Defaults are `--shots 10000` per circuit, `--optimization-level 1`, `--seed 42`.
 
 ### Demos
 
