@@ -143,14 +143,14 @@ delta is ≤ 2e-3 Ha:
 uv run python scripts/sqd_prototype.py
 ```
 
-[`scripts/embedding_workflow.py`](scripts/embedding_workflow.py) sketches the
-full embedding flow — EmbASI low-level embedding → extract an active-space
-Hamiltonian → solve with FCI/SQD → assemble the projection-based-embedding
-energy → feed the 1-RDM back — with **EmbASI mocked** (backed by a real PySCF
-active space) so it runs with no QM driver. Inline `# REAL:` comments mark where
-a live EmbASI object plugs in:
+[`scripts/embedding_workflow.py`](scripts/embedding_workflow.py) runs the full
+embedding flow against **real EmbASI** — EmbASI low-level embedding → extract an
+active-space Hamiltonian → solve with SQD/FCI → assemble the
+projection-based-embedding energy → feed the 1-RDM back. It drives a live
+`embasi.embedding.ProjectionEmbedding` (methanol monomer, OH active fragment,
+PBE-in-PBE, sto-3g), so it needs EmbASI installed (see below).
 
-The sketch defaults to the SQD pipeline:
+It defaults to the SQD pipeline:
 
 ```bash
 uv run python scripts/embedding_workflow.py                        # sqd + aer (default)
@@ -198,10 +198,11 @@ uv run ruff check src && uv run mypy src
 
 ### Running the EmbASI-marked tests
 
-The `@pytest.mark.embasi` tests only run when `EMBASI_AVAILABLE=1`, and a full
-run of them needs **EmbASI + a QM driver (FHI-aims)**. The EmbASI glue in this
-project is otherwise fully covered in the default suite via a `FakeEmbASI` stub,
-so you only need this to exercise the real embedding backend.
+The `@pytest.mark.embasi` tests only run when `EMBASI_AVAILABLE=1`, and they
+build a real `embasi.embedding.ProjectionEmbedding`. The package's own logic
+(orbital bookkeeping, downfolding, the outer loop, MPI orchestration) is covered
+in the default suite via small PySCF-backed test doubles, so you only need this
+to exercise the real embedding backend.
 
 1. **Install EmbASI** via the `embed` extra (EmbASI is on PyPI; this pulls it
    plus `ase`, `asi4py`, and `mpi4py`):

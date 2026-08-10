@@ -69,7 +69,7 @@ def build_sqdrift_circuits(
     num_terms: int = 200,
     num_randomizations: int = 10,
     time: float = 1.0,
-    filter_diagonal_terms: bool = True,
+    filter_trivial: bool = True,
     seed: int | None = None,
     measure: bool = True,
 ) -> list:
@@ -85,8 +85,9 @@ def build_sqdrift_circuits(
         num_randomizations: number of circuits to return (``method="qdrift"``;
             ``"exact"`` always returns one circuit).
         time: evolution time fed to the ``Evolution`` gate.
-        filter_diagonal_terms: drop occupation-diagonal terms that do not affect
-            sampled bitstrings.
+        filter_trivial: reject sampled qDRIFT terms that cannot change the
+            occupation (they act only within the occupied or only within the
+            unoccupied set), so they do not waste a ``num_terms`` slot.
         seed: RNG seed for the qDRIFT randomization (reproducible circuits).
         measure: append ``measure_all()`` to each circuit.
     """
@@ -120,7 +121,7 @@ def build_sqdrift_circuits(
 
     occ = _hf_occupation(ham.norb, ham.nelec)
 
-    def _base_circuit() -> "FermionicCircuit":
+    def _base_circuit() -> FermionicCircuit:
         circ = FermionicCircuit(num_modes)
         circ.append(InitializeModes(occ), circ.modes)
         circ.append(Evolution(num_modes, normal, time), circ.modes)
@@ -130,9 +131,7 @@ def build_sqdrift_circuits(
         pm = generate_preset_jw_pass_manager()
         circuits = [pm.run(_base_circuit())]
     elif method == "qdrift":
-        qdrift = QDriftTrotterization(
-            num_terms, filter_diagonal_terms=filter_diagonal_terms, rng=seed
-        )
+        qdrift = QDriftTrotterization(num_terms, filter_trivial=filter_trivial, rng=seed)
         pm = generate_preset_jw_pass_manager()
         pm.optimization = FermionicPassManager([qdrift])
         base = _base_circuit()
