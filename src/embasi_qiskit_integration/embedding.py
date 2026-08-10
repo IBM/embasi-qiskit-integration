@@ -255,6 +255,11 @@ class EmbeddingWorkflow(BaseSettings):
             )
             log(f"     = {energy.total:.6f} Ha")
             log(f"   tr[γ̃^A P_B] = {energy.projector_leak:.2e} Ha (should be ~0)")
+            # E_high(A) is rebased onto E_low(A)'s (ghosted subsystem-A) nuclear
+            # frame before the subtraction; without it the two A-terms would be
+            # ~4 Ha apart on incompatible frames.  Surface the shift so it is not
+            # a silent adjustment.
+            log(f"   footing shift applied to E_high(A): {energy.footing_shift:.6f} Ha")
 
             # Convergence check (only meaningful once we have a previous cycle).
             # `converge_on` selects the criterion: "energy" stops as soon as the

@@ -291,6 +291,104 @@ def test_projection_energy_reads_embasi_low_level(adapter, orbitals_full):
 
 
 # --------------------------------------------------------------------------- #
+# PbE total energy -- the physical null test.
+# --------------------------------------------------------------------------- #
+def test_pbe_in_pbe_null_case_A_terms_reduce_to_fragment_hf_minus_pbe(
+    adapter, orbitals_full
+):
+    """Full A space, γ̃^A = γ^A: the A-level terms cancel down to HF - PBE.
+
+    This is the decisive physics check the plumbing tests miss.  With the *full*
+    subsystem-A space active and the fed-back correlated density set equal to the
+    reference γ^A, the Eq. 8 correction ``tr[(γ̃^A - γ^A) v_emb]`` is exactly zero,
+    so the assembled total reduces to::
+
+        E_PbE = E_low(AB) - E_low(A) + E_high(A)
+
+    and the *only* thing separating this from E_low(AB) is the A-term difference
+    ``E_high(A) - E_low(A)``.  We build the "solver result" from γ^A itself -- the
+    energy of the *embedded* Hamiltonian evaluated at γ^A -- so no sampling or
+    correlation noise enters.
+
+    What that A-term difference must equal is the subtle part, and it is what a
+    ~4 Ha bookkeeping bug once hid.  Two footings had to be reconciled first:
+    ``E_high(A)`` carries the *full-supersystem* nuclear frame
+    (from the downfold's ``e_core``), while EmbASI's ``E_low(A)`` is computed on a
+    *ghosted subsystem-A* ``mol`` (only A's nuclei).  ``projection_energy`` now
+    rebases ``E_high(A)`` onto E_low(A)'s footing (``ProjectionEnergy.footing_shift``);
+    before that rebasing the two sat ~4 Ha apart and the loop still "converged" on
+    the density while the energy was wrong.
+
+    Once the frames match, the residual is *not* zero and *not* the paper's
+    1e-6 kJ/mol PBE-in-PBE cancellation: the embedded Hamiltonian we hand the
+    solver uses **bare ERIs with HF exchange** (``j - 0.5 k``), so ``E_high(A)`` is
+    the *HF-flavour* energy of γ^A, whereas ``E_low(A)`` is *PBE*.  The two
+    therefore differ by exactly the fragment HF-minus-PBE energy on the ghosted A
+    footing -- genuine exchange-correlation physics, ~0.29 Ha here, not a
+    bookkeeping artefact.  We compute that reference difference independently
+    (RHF J-K/2 vs the DFT ``energy_tot`` on the same ghosted ``mol`` at the same
+    γ^A) and assert the A-terms reproduce it.
+
+    Tolerance 1e-6 Ha: both sides are closed-form contractions of the *same* γ^A
+    against operators on the *same* ghosted mol, so agreement is limited only by
+    the AO-integral / ao2mo round-off, not by any physical approximation.  A
+    reappearance of the footing bug would blow the A-term difference back out to
+    ~4 Ha and fail this by six orders of magnitude.
+    """
+    from pyscf import scf
+
+    from embasi_qiskit_integration.contract import SolverResult
+
+    ham = adapter.embedded_hamiltonian(orbitals_full)
+
+    # γ^A expressed in the active MO basis: γ_MO = C_act^T S γ^A S C_act.
+    c_act, s = orbitals_full.c_active, adapter._s
+    rdm1_active = c_act.T @ s @ adapter._dm_a @ s @ c_act
+    assert np.trace(rdm1_active) == pytest.approx(sum(ham.nelec), abs=1e-6)
+
+    # Energy of the embedded Hamiltonian at that density (restricted 1-det, HF
+    # exchange -- this is what makes E_high(A) HF-flavoured, not PBE).
+    h1, h2 = np.asarray(ham.h1), np.asarray(ham.h2)
+    j = np.einsum("pqrs,rs->pq", h2, rdm1_active)
+    k = np.einsum("prqs,rs->pq", h2, rdm1_active)
+    e_solver = float(
+        ham.e_core
+        + np.einsum("pq,pq->", rdm1_active, h1)
+        + 0.5 * np.einsum("pq,pq->", rdm1_active, j - 0.5 * k)
+    )
+
+    energy = adapter.projection_energy(
+        SolverResult(energy=e_solver, rdm1=rdm1_active), orbitals_full
+    )
+    # Correction must vanish (γ̃ == γ), isolating the A-term difference.
+    assert abs(energy.correction) < 1e-8
+    # The footing rebasing must have fired (the frames genuinely differ here).
+    assert energy.footing_shift > 1.0  # ~3.8 Ha for this fragment
+
+    # Independent reference: fragment HF - PBE at γ^A on EmbASI's ghosted A mol.
+    dm_a = adapter._dm_a
+    mol_a = adapter.p.A_LL.atoms.calc.mol
+    hcore_a = np.asarray(mol_a.intor("int1e_kin") + mol_a.intor("int1e_nuc"))
+    enuc_a = float(mol_a.energy_nuc())
+    veff_hf = scf.RHF(mol_a).get_veff(mol_a, dm_a)  # J - K/2
+    e_hf_a = float(
+        enuc_a
+        + np.einsum("ij,ji->", dm_a, hcore_a)
+        + 0.5 * np.einsum("ij,ji->", dm_a, veff_hf)
+    )
+    # e_low_A is EmbASI's PBE energy_tot(γ^A) on that same ghosted mol; assert the
+    # adapter reads exactly that (so the reference difference below is apples-to-
+    # apples), then that the A-terms reproduce the HF - PBE gap.
+    mf_a = adapter.p.A_LL.atoms.calc.method
+    e_pbe_a = float(mf_a.energy_tot(dm_a, hcore_a, mf_a.get_veff(dm=dm_a)))
+    assert energy.e_low_A == pytest.approx(e_pbe_a, abs=1e-9)
+
+    assert energy.e_high_A - energy.e_low_A == pytest.approx(e_hf_a - e_pbe_a, abs=1e-6)
+    # Equivalently, the total sits exactly HF-minus-PBE above E_low(AB) -- no 4 Ha.
+    assert energy.total - energy.e_low_total == pytest.approx(e_hf_a - e_pbe_a, abs=1e-6)
+
+
+# --------------------------------------------------------------------------- #
 # Density-fitted eri_mo agrees with the dense transform.
 # --------------------------------------------------------------------------- #
 def test_density_fit_eri_matches_dense(adapter, orbitals_full):

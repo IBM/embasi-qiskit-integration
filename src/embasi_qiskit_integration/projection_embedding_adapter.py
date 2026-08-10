@@ -258,9 +258,10 @@ class ProjectionEnergy:
 
     e_low_total: float  # E_L[γ^A + γ^B]
     e_low_A: float  # E_L[γ^A]
-    e_high_A: float  # E_H[Ψ̃^A], embedding potential removed
+    e_high_A: float  # E_H[Ψ̃^A], embedding pot. removed, rebased to E_low(A)'s footing
     correction: float  # tr[(γ̃^A - γ^A) v_emb]
     projector_leak: float  # tr[γ̃^A P_B], a numerical zero when clean
+    footing_shift: float = 0.0  # nuclei/hcore rebasing applied to e_high_A (see below)
 
     @property
     def total(self) -> float:
@@ -653,6 +654,23 @@ class ProjectionEmbeddingAdapter:
         tr[(γ̃^A - γ^A) v_emb] is reported separately.  Summing the two shows the
         γ̃^A v_emb contributions cancel, leaving -tr[γ^A v_emb] against the raw
         solver energy -- a useful cross-check on the bookkeeping.
+
+        **Footing rebasing.**  The subtraction ``E_low(AB) - E_low(A) + E_high(A)``
+        only telescopes if ``E_high(A)`` and ``E_low(A)`` reference the *same*
+        one-electron operator.  They do not by default: ``E_high(A)`` inherits the
+        **full-supersystem** ``h_core`` / ``energy_nuc`` from the downfolded
+        Hamiltonian's ``e_core`` (all nuclei), whereas EmbASI computes
+        ``subsys_A_lowlvl_totalen`` on its **ghosted subsystem-A** ``mol`` (only A's
+        nuclei; the environment atoms are basis ghosts).  Left uncorrected the two
+        A-terms sit ~4 Ha apart and the paper's Eq. 8 cancellation fails -- and
+        the outer loop still converges on the *density* while carrying that offset
+        in the *energy*, so density convergence alone never reveals it.  The shift
+        between the two references is a density-linear one-body quantity,
+        ``Δ = (E_nuc^full - E_nuc^A) + tr[γ̃^A (h_core^full - h_core^A)]`` (verified
+        density-independent in the 2-electron part -- same basis, same ERIs), so we
+        subtract it from ``e_high_A`` to land it on ``E_low(A)``'s footing.  What
+        remains after the shift is the genuine high-vs-low functional difference on
+        the fragment (WF-in-DFT), not the nuclear-frame artefact.
         """
         v_emb, p_b = self.v_emb, self.p_b
         dm_hl = self.rdm1_ao(result.rdm1, orbitals)
@@ -661,6 +679,14 @@ class ProjectionEmbeddingAdapter:
         e_high_a = float(result.energy) - np.einsum("ij,ji->", dm_hl, v_emb) - leak
         correction = float(np.einsum("ij,ji->", dm_hl - self._dm_a, v_emb))
 
+        # Rebase e_high_A onto E_low(A)'s (ghosted subsystem-A) nuclear footing.
+        hcore_a, enuc_a = self._a_fragment_footing()
+        footing_shift = float(
+            (self.ints.energy_nuc() - enuc_a)
+            + np.einsum("ij,ji->", dm_hl, self.ints.hcore() - hcore_a)
+        )
+        e_high_a -= footing_shift
+
         e_low_ab, e_low_a = self._low_level_energies()
         return ProjectionEnergy(
             e_low_total=e_low_ab,
@@ -668,7 +694,55 @@ class ProjectionEmbeddingAdapter:
             e_high_A=float(e_high_a),
             correction=correction,
             projector_leak=leak,
+            footing_shift=footing_shift,
         )
+
+    def _a_fragment_footing(self) -> tuple[np.ndarray, float]:
+        """(h_core^A, E_nuc^A) of EmbASI's *ghosted subsystem-A* reference.
+
+        These are the one-electron operator and nuclear repulsion EmbASI used to
+        build ``subsys_A_lowlvl_totalen`` (:meth:`_low_level_energies`): its
+        ``A_LL`` layer runs on a ``mol`` where only subsystem-A atoms carry nuclei
+        and the environment atoms are basis *ghosts* (basis functions, no charge).
+        ``E_high(A)`` must be rebased onto exactly this footing before the Eq. 8
+        subtraction (see :meth:`projection_energy`).
+
+        We read the operators *directly* off EmbASI's ``A_LL`` ``mol`` (the same
+        object it integrated), not by reconstructing them from a subtraction of
+        exposed matrices -- ``A_LL.hamiltonian_estat_plus_xc`` bundles the nuclear
+        attraction together with Coulomb+xc, so h_core^A is not separable from
+        what EmbASI exports.  ``int1e_kin + int1e_nuc`` on that ``mol`` reproduces
+        ``subsys_A_lowlvl_totalen`` to ~1e-14 Ha (asserted in the tests), and its
+        overlap matches ``self._s`` bit-for-bit (same basis, same AO ordering).
+
+        TODO(embasi-api): ASK EmbASI to expose ``subsys_A_highlvl_totalen`` (its
+        own high-level A energy, already on this footing, embedding.py:797) on the
+        ``construct_embedded_fock`` path.  SYMPTOM: absent it, we reach through
+        ``A_LL.atoms.calc.mol`` to a PySCF ``Mole`` -- fine for the PySCF backend,
+        but there is no equivalent reach-through for the FHI-aims/ASI backend, so
+        the footing rebasing is PySCF-only.  Exposing the A-fragment ``h_core`` /
+        ``energy_nuc`` (or the high-level A total directly) would make this
+        backend-agnostic and remove the reach-through entirely.
+        """
+        try:
+            mol_a = self.p.A_LL.atoms.calc.mol
+            hcore_a = np.asarray(mol_a.intor("int1e_kin") + mol_a.intor("int1e_nuc"))
+            enuc_a = float(mol_a.energy_nuc())
+        except AttributeError as exc:  # pragma: no cover - non-PySCF / upstream change
+            raise AttributeError(
+                "cannot reach EmbASI's subsystem-A (ghosted) mol via "
+                "A_LL.atoms.calc.mol to rebase E_high(A) onto E_low(A)'s nuclear "
+                "footing; the projection energy would be ~4 Ha off without it. "
+                "Expose subsys_A_highlvl_totalen or the A-fragment "
+                "h_core/energy_nuc upstream for a backend-agnostic fix."
+            ) from exc
+        if hcore_a.shape != self._s.shape:
+            raise ValueError(
+                f"subsystem-A h_core is {hcore_a.shape} but the supersystem basis "
+                f"is {self._s.shape}; the ghosted A mol and F_emb are on different "
+                "bases (basis truncation not yet mapped, see run_low_level TODO)"
+            )
+        return hcore_a, enuc_a
 
     def _low_level_energies(self) -> tuple[float, float]:
         """(E_low(AB), E_low(A)) in Hartree, read from EmbASI internals.

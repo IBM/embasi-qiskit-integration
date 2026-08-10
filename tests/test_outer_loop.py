@@ -28,6 +28,8 @@ behaviour under test.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -54,6 +56,15 @@ class _FeedbackMockEmbedding:
     form the adapter's ``_low_level_energies`` reads) so ``projection_energy``
     runs.  Constants -> a fixed energy offset that does not affect the
     convergence behaviour under test.
+
+    It also mimics EmbASI's ``A_LL.atoms.calc.mol`` reach-through that
+    ``projection_energy`` uses to rebase ``E_high(A)`` onto ``E_low(A)``'s nuclear
+    footing.  Real EmbASI runs the A layer on a *ghosted* subsystem-A ``mol``;
+    this mock never ghosts -- A and B share the one supersystem ``mol`` -- so the
+    A-fragment footing simply *is* the supersystem footing and the adapter's
+    ``footing_shift`` comes out ~0.  Exposing the same ``mol`` here keeps that
+    reach-through working (and the resulting fixed offset stable) without pulling
+    a second, differently-nuclei molecule into the mock.
     """
 
     projection = "level-shift"
@@ -81,6 +92,11 @@ class _FeedbackMockEmbedding:
         self._c = c
         self._eps0 = mf.mo_energy.copy()
         self._b_cols = np.arange(n_occ_a, n_occ)
+
+        # Minimal A_LL.atoms.calc.mol reach-through for _a_fragment_footing.  No
+        # ghosting in the mock: the A-fragment mol is the supersystem mol, so the
+        # rebasing is a full-vs-full no-op (footing_shift ~ 0).
+        self.A_LL = SimpleNamespace(atoms=SimpleNamespace(calc=SimpleNamespace(mol=mol)))
 
         c_a = c_occ[:, :n_occ_a]
         c_b = c_occ[:, n_occ_a:]
