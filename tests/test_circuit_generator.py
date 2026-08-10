@@ -63,10 +63,10 @@ def test_sqdrift_exact_one_circuit_per_time(n2_ham):
 
 
 @requires_fermions
-def test_sqdrift_qdrift_sweeps_time_by_num_terms(n2_ham):
-    """qDRIFT fans out over time x num_terms x randomizations."""
+def test_sqdrift_qdrift_sweeps_time_by_num_groups(n2_ham):
+    """qDRIFT fans out over time x num_groups x randomizations."""
     circuits = build_sqdrift_circuits(
-        n2_ham, method="qdrift", time=1.0, num_terms=10, num_randomizations=3, seed=42
+        n2_ham, method="qdrift", time=1.0, num_groups=10, num_randomizations=3, seed=42
     )
     assert len(circuits) == 3
     for qc in circuits:
@@ -77,7 +77,7 @@ def test_sqdrift_qdrift_sweeps_time_by_num_terms(n2_ham):
         n2_ham,
         method="qdrift",
         time=[0.5, 1.0],
-        num_terms=[8, 10],
+        num_groups=[8, 10],
         num_randomizations=2,
         seed=42,
     )
@@ -105,13 +105,13 @@ def test_sqdrift_qdrift_matches_reference_construction(n2_ham):
 
     from embasi_qiskit_integration.circuit_generator.operator import build_canonical_operator
 
-    time, num_terms, n_rand, seed = 1.0, 10, 3, 42
+    time, num_groups, n_rand, seed = 1.0, 10, 3, 42
 
     normal, num_modes = build_canonical_operator(n2_ham, atol=1e-16, filter_diagonal_terms=True)
 
     def reference_one(draw_seed: int):
         pm = generate_preset_jw_pass_manager(seed_transpiler=draw_seed)
-        pm.optimization = FermionicPassManager([QDriftTrotterization(num_terms, rng=draw_seed)])
+        pm.optimization = FermionicPassManager([QDriftTrotterization(num_groups, rng=draw_seed)])
         circ = FermionicCircuit(num_modes)
         circ.append(Evolution(num_modes, normal, time), circ.modes)
         return pm.run(circ)
@@ -121,7 +121,7 @@ def test_sqdrift_qdrift_matches_reference_construction(n2_ham):
         n2_ham,
         method="qdrift",
         time=time,
-        num_terms=num_terms,
+        num_groups=num_groups,
         num_randomizations=n_rand,
         seed=seed,
         include_initial_state=False,
@@ -147,19 +147,19 @@ def test_sqdrift_qdrift_matches_reference_construction(n2_ham):
 
 @requires_fermions
 def test_sqdrift_seeds_restart_per_sweep_combination(n2_ham):
-    """Randomization seeds restart at ``seed`` for every (time, num_terms) combo.
+    """Randomization seeds restart at ``seed`` for every (time, num_groups) combo.
 
     This matches the reference implementation, where each combination is its own
     ``build()`` call over ``range(num_randomizations)``. The consequence is that
     combinations sharing a randomization index share a qDRIFT draw, which isolates
-    the effect of time / num_terms from sampling noise. A flattened per-circuit
+    the effect of time / num_groups from sampling noise. A flattened per-circuit
     index would make every draw unique and diverge from the reference.
     """
     circuits = build_sqdrift_circuits(
         n2_ham,
         method="qdrift",
         time=[1.0, 2.0],
-        num_terms=10,
+        num_groups=10,
         num_randomizations=2,
         seed=42,
         include_initial_state=False,
@@ -183,8 +183,8 @@ def test_sqdrift_time_accepts_scalar_or_sequence(n2_ham):
 def test_sqdrift_rejects_empty_sweep_axes(n2_ham):
     with pytest.raises(ValueError, match="at least one evolution time"):
         build_sqdrift_circuits(n2_ham, method="exact", time=[])
-    with pytest.raises(ValueError, match="at least one term count"):
-        build_sqdrift_circuits(n2_ham, method="qdrift", time=1.0, num_terms=[])
+    with pytest.raises(ValueError, match="at least one group count"):
+        build_sqdrift_circuits(n2_ham, method="qdrift", time=1.0, num_groups=[])
 
 
 @requires_fermions
@@ -207,7 +207,7 @@ def test_sqdrift_exact_spans_ci_space(n2_ham):
 def test_sqdrift_qdrift_randomizations_differ(n2_ham):
     """Per-randomization seeding gives distinct draws, not one repeated circuit."""
     circuits = build_sqdrift_circuits(
-        n2_ham, method="qdrift", num_terms=10, num_randomizations=3, seed=42
+        n2_ham, method="qdrift", num_groups=10, num_randomizations=3, seed=42
     )
     ops = [_op_signature(qc) for qc in circuits]
     assert len(set(ops)) > 1, "all randomizations identical; per-draw seeding is not in effect"
@@ -216,7 +216,7 @@ def test_sqdrift_qdrift_randomizations_differ(n2_ham):
 @requires_fermions
 def test_sqdrift_qdrift_reproducible_in_process(n2_ham):
     """The same seed rebuilds byte-identical qDRIFT circuits within one process."""
-    kwargs = {"method": "qdrift", "num_terms": 10, "num_randomizations": 3, "seed": 42}
+    kwargs = {"method": "qdrift", "num_groups": 10, "num_randomizations": 3, "seed": 42}
     first = build_sqdrift_circuits(n2_ham, **kwargs)
     second = build_sqdrift_circuits(n2_ham, **kwargs)
     assert [_op_signature(qc) for qc in first] == [_op_signature(qc) for qc in second]
@@ -237,7 +237,7 @@ def test_sqdrift_qdrift_reproducible_across_processes(n2_ham, data_dir):
         "from embasi_qiskit_integration.hamiltonian import fcidump\n"
         "from embasi_qiskit_integration.circuit_generator.sqdrift import build_sqdrift_circuits\n"
         "ham = fcidump.read(sys.argv[1])\n"
-        "cs = build_sqdrift_circuits(ham, method='qdrift', num_terms=10,\n"
+        "cs = build_sqdrift_circuits(ham, method='qdrift', num_groups=10,\n"
         "                            num_randomizations=3, seed=42)\n"
         "print(json.dumps([[(i.operation.name, tuple(c._index for c in i.qubits))\n"
         "                   for i in qc.data] for qc in cs]))\n"
@@ -264,7 +264,9 @@ def test_sqdrift_qdrift_reproducible_across_processes(n2_ham, data_dir):
         return json.loads(json.dumps([_op_signature(qc) for qc in circuits]))
 
     in_process = _as_json_shape(
-        build_sqdrift_circuits(n2_ham, method="qdrift", num_terms=10, num_randomizations=3, seed=42)
+        build_sqdrift_circuits(
+            n2_ham, method="qdrift", num_groups=10, num_randomizations=3, seed=42
+        )
     )
     assert runs[0] == in_process
 
@@ -308,7 +310,7 @@ def test_filter_trivial_is_separate_from_filter_diagonal_terms(n2_ham):
     -- but with pruning off it visibly changes the circuit, which is what proves
     the option reaches the pass.
     """
-    kwargs = {"method": "qdrift", "num_terms": 10, "num_randomizations": 1, "seed": 42}
+    kwargs = {"method": "qdrift", "num_groups": 10, "num_randomizations": 1, "seed": 42}
 
     pruned_on = _op_signature(
         build_sqdrift_circuits(n2_ham, **kwargs, filter_diagonal_terms=True, filter_trivial=True)[0]
@@ -350,7 +352,7 @@ def test_filter_trivial_defaults_to_where_occupation_is_visible(n2_ham):
             build_sqdrift_circuits(
                 n2_ham,
                 method="qdrift",
-                num_terms=10,
+                num_groups=10,
                 num_randomizations=1,
                 seed=42,
                 include_initial_state=include,

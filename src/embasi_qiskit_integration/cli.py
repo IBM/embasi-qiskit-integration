@@ -40,7 +40,7 @@ class SolveCommand(BaseSettings):
     # Spelled out rather than importing circuit_run.SamplerKind: that package pulls
     # in qiskit, which would more than double CLI startup (141ms -> 318ms measured)
     # for a three-element alias. Keep in sync with circuit_run.base.SamplerKind.
-    sampler: Literal["aer", "mock", "runtime"] = "aer"
+    sampler: Literal["aer", "mock", "runtime"] = "runtime"
     counts: str | None = None
     backend: str | None = None  # runtime backend name; else least-busy
     # Defaults mirror the reference workflow's run-step settings.

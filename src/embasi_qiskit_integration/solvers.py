@@ -116,7 +116,7 @@ class SQDSolver(ActiveSpaceSolver):
         ansatz: str = "sqdrift",
         method: str = "exact",
         evolution_time: float = 1.0,
-        num_terms: int = 200,
+        num_groups: int = 200,
         num_randomizations: int = 1,
         initial_state_bitstring: str | None = None,
         samples_per_batch: int = 300,
@@ -129,7 +129,7 @@ class SQDSolver(ActiveSpaceSolver):
         self.ansatz = ansatz
         self.method = method
         self.evolution_time = evolution_time
-        self.num_terms = num_terms
+        self.num_groups = num_groups
         self.num_randomizations = num_randomizations
         self.initial_state_bitstring = initial_state_bitstring
         self.samples_per_batch = samples_per_batch
@@ -197,12 +197,12 @@ class SQDSolver(ActiveSpaceSolver):
         # run time, rather than baked in by the generator.
         # Every sweep axis is pinned to a single value here: a solver call wants a
         # definite ensemble size (num_randomizations), not the generator's default
-        # time x num_terms sweep, which would build thousands of circuits per solve.
+        # time x num_groups sweep, which would build thousands of circuits per solve.
         cores = build_sqdrift_circuits(
             ham,
             method=self.method,
             time=self.evolution_time,
-            num_terms=self.num_terms,
+            num_groups=self.num_groups,
             num_randomizations=self.num_randomizations,
             seed=self.seed,
             measure=False,

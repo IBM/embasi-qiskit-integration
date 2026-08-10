@@ -6,7 +6,7 @@
 Construction mirrors the reference SqDRIFT step: one canonicalized grouped
 operator (see :mod:`.operator`), then per randomization a *fresh* circuit and a
 *fresh* ``seed``-seeded JW pass manager carrying ``QDriftTrotterization``, swept
-over ``time x num_terms``, with ``measure_all`` appended last.
+over ``time x num_groups``, with ``measure_all`` appended last.
 ``build_sqdrift_circuits(method="qdrift", include_initial_state=False)``
 reproduces the reference's circuits exactly.
 
@@ -69,7 +69,7 @@ def build_sqdrift_circuits(
     ham: EmbeddedHamiltonian,
     *,
     method: str = "exact",
-    num_terms: int | Sequence[int] = (10, 15, 20),
+    num_groups: int | Sequence[int] = (10, 15, 20),
     num_randomizations: int = 500,
     time: float | Sequence[float] = (1.0, 2.0, 3.0),
     filter_diagonal_terms: bool = True,
@@ -86,29 +86,35 @@ def build_sqdrift_circuits(
     ``include_initial_state=False``.
 
     Defaults mirror the reference SqDRIFT settings (``time`` ``[1.0, 2.0, 3.0]``,
-    ``num_terms`` ``[10, 15, 20]``, ``num_randomizations`` 500, ``seed`` 42), so a
+    ``num_groups`` ``[10, 15, 20]``, ``num_randomizations`` 500, ``seed`` 42), so a
     bare ``method="qdrift"`` call produces that full sweep: **4500 circuits**
     (3 times x 3 term-counts x 500 randomizations). Narrow the axes for a smaller
-    budget -- ``SQDSolver`` does exactly that, pinning one ``(time, num_terms)``
+    budget -- ``SQDSolver`` does exactly that, pinning one ``(time, num_groups)``
     pair and its own ``num_randomizations``.
 
     Args:
         method: ``"exact"`` (one full-evolution circuit per ``time``) or
-            ``"qdrift"`` (ensemble over time x num_terms x randomizations).
-        num_terms: qDRIFT term-groups per circuit (``method="qdrift"`` only).
-            Scalar or sequence; a sequence is a sweep axis.
-        num_randomizations: randomizations per ``(time, num_terms)`` combination
+            ``"qdrift"`` (ensemble over time x num_groups x randomizations).
+        num_groups: how many term-groups qDRIFT samples per circuit
+            (``method="qdrift"`` only) -- the length of the randomized product,
+            so it trades circuit depth against accuracy. Scalar or sequence; a
+            sequence is a sweep axis. Named for consistency with the reference
+            settings; it is passed positionally to ``QDriftTrotterization``,
+            whose own parameter is called ``num_terms``. Note this is *not*
+            ``FermionOperator.num_groups()`` (how many groups the Hamiltonian
+            has, typically ~1000) -- it is how many of them get drawn.
+        num_randomizations: randomizations per ``(time, num_groups)`` combination
             (``method="qdrift"``; ``"exact"`` yields one circuit per ``time``).
         time: evolution time(s) t for ``exp(-i t H)``, fed to the ``Evolution``
             gate. Scalar or sequence; a sequence is a sweep axis, combined with
-            ``num_terms`` as a cartesian product.
+            ``num_groups`` as a cartesian product.
         filter_diagonal_terms: drop occupation-diagonal terms that do not affect
             sampled bitstrings. Applied during operator construction, before
             grouping (see :mod:`.operator`).
         filter_trivial: forwarded to ``QDriftTrotterization`` (``method="qdrift"``
             only). Rejects a *sampled* term that cannot change the occupation
             (acting only within the occupied or only within the unoccupied set),
-            so it does not waste one of the ``num_terms`` slots. This is a
+            so it does not waste one of the ``num_groups`` slots. This is a
             distinct mechanism from ``filter_diagonal_terms``: that one prunes the
             operator up front, this one filters draws during sampling.
 
@@ -118,12 +124,12 @@ def build_sqdrift_circuits(
             has no effect and makes qiskit emit a ``UserWarning``.
         atol: tolerance for simplifying the normal-ordered operator.
         seed: base RNG seed (default 42, as in the reference settings).
-            Randomization ``i`` of each ``(time, num_terms)`` combination uses
+            Randomization ``i`` of each ``(time, num_groups)`` combination uses
             ``seed + i`` for both the qDRIFT sampler and the transpiler, so each
             draw is independently reproducible. The index restarts per combination,
             so combinations sharing a randomization index share a draw -- this
             matches the reference implementation and isolates the effect of
-            ``time``/``num_terms`` from sampling noise. ``None`` leaves both
+            ``time``/``num_groups`` from sampling noise. ``None`` leaves both
             unseeded (non-reproducible).
         measure: append ``measure_all()`` to each circuit.
         include_initial_state: prepare the HF reference inside the circuit
@@ -133,7 +139,7 @@ def build_sqdrift_circuits(
 
     Returns:
         The generated circuits. Order is the flattened sweep: for each ``time``,
-        for each ``num_terms``, each randomization in turn.
+        for each ``num_groups``, each randomization in turn.
     """
     if method not in ("exact", "qdrift"):
         raise ValueError(f"unknown method {method!r}; use 'exact' or 'qdrift'")
@@ -159,12 +165,14 @@ def build_sqdrift_circuits(
     occ = _hf_occupation(ham.norb, ham.nelec)
 
     # The operator depends only on (ham, atol, filter_diagonal_terms) -- `time`
-    # enters the Evolution gate and `num_terms` only the qDRIFT pass -- so one
+    # enters the Evolution gate and `num_groups` only the qDRIFT pass -- so one
     # build above serves every combination of the sweep.
     times = _as_float_list(time)
-    term_counts = [int(num_terms)] if isinstance(num_terms, int) else [int(n) for n in num_terms]
-    if not term_counts:
-        raise ValueError("num_terms must contain at least one term count")
+    group_counts = (
+        [int(num_groups)] if isinstance(num_groups, int) else [int(n) for n in num_groups]
+    )
+    if not group_counts:
+        raise ValueError("num_groups must contain at least one group count")
 
     def _fresh_circuit(evolution_time: float) -> Any:
         """Build a fresh evolution circuit at ``evolution_time``.
@@ -189,25 +197,25 @@ def build_sqdrift_circuits(
     def _draw_seed(randomization: int) -> int | None:
         """Seed for randomization ``i``: ``seed + i`` (None stays unseeded).
 
-        The index is the randomization number *within* a ``(time, num_terms)``
+        The index is the randomization number *within* a ``(time, num_groups)``
         combination, and restarts at 0 for each combination -- matching the
         reference implementation, where every combination is a separate ``build()``
         call over ``range(num_randomizations)``. So combinations that share a
         randomization index also share a qDRIFT draw, which isolates the effect of
-        ``time``/``num_terms`` from sampling noise.
+        ``time``/``num_groups`` from sampling noise.
         """
         return None if seed is None else seed + randomization
 
     circuits = []
     if method == "exact":
-        # One full-evolution circuit per time; num_terms/num_randomizations are
+        # One full-evolution circuit per time; num_groups/num_randomizations are
         # qDRIFT-only knobs and do not apply. No sampling happens here, so the
         # seed only feeds the transpiler and need not vary across times.
         for evolution_time in times:
             circuits.append(_pass_manager(_draw_seed(0)).run(_fresh_circuit(evolution_time)))
     else:
 
-        def _run_one(evolution_time: float, n_terms: int, draw_seed: int | None) -> Any:
+        def _run_one(evolution_time: float, n_groups: int, draw_seed: int | None) -> Any:
             """Build one randomization with its own seeded pass manager.
 
             ``filter_trivial`` filters the pass's own *draws*; the occupation-
@@ -218,16 +226,16 @@ def build_sqdrift_circuits(
             """
             pm = _pass_manager(draw_seed)
             pm.optimization = FermionicPassManager(
-                [QDriftTrotterization(n_terms, filter_trivial=filter_trivial, rng=draw_seed)]
+                [QDriftTrotterization(n_groups, filter_trivial=filter_trivial, rng=draw_seed)]
             )
             return pm.run(_fresh_circuit(evolution_time))
 
         for evolution_time in times:
-            for n_terms in term_counts:
+            for n_groups in group_counts:
                 # Seeds restart at `seed` for every combination, as in the
                 # reference implementation (one build() call per combination).
                 for randomization in range(num_randomizations):
-                    circuits.append(_run_one(evolution_time, n_terms, _draw_seed(randomization)))
+                    circuits.append(_run_one(evolution_time, n_groups, _draw_seed(randomization)))
 
     if measure:
         circuits = [qc.measure_all(inplace=False) for qc in circuits]
