@@ -69,7 +69,7 @@ def build_sqdrift_circuits(
     ham: EmbeddedHamiltonian,
     *,
     method: str = "exact",
-    num_groups: int | Sequence[int] = (10, 15, 20),
+    num_groups: int | Sequence[int] = 15,
     num_randomizations: int = 500,
     time: float | Sequence[float] = (1.0, 2.0, 3.0),
     filter_diagonal_terms: bool = True,
