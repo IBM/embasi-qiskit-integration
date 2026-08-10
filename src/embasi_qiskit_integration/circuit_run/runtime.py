@@ -5,23 +5,7 @@
 
 Plugs the SQD pipeline into real quantum hardware via ``QiskitRuntimeService``.
 Assuming credentials are configured (``QiskitRuntimeService.save_account(...)``
-once, or the ``QISKIT_IBM_TOKEN`` env var), sampling on hardware is just::
-
-    from embasi_qiskit_integration.solvers import SQDSolver
-    from embasi_qiskit_integration.circuit_run.runtime import RuntimeSampler
-
-    solver = SQDSolver(RuntimeSampler(), shots=100_000, seed=24)   # least-busy backend
-    result = solver.solve(ham)
-
-or pick a backend explicitly with ``RuntimeSampler(backend="ibm_kingston")``, or
-run offline against a simulated device with ``RuntimeSampler(backend="FakeManilaV2")``.
-
-Circuits are transpiled to the target backend's ISA before submission (real
-backends only accept ISA circuits) via
-:func:`~embasi_qiskit_integration.circuit_run.backend.prepare_isa`, which builds
-one pass manager for the whole batch; a ``MockSampler``/``AerSampler`` skip that
-step. Everything is lazily imported so ``qiskit-ibm-runtime`` is only needed when
-hardware sampling is actually requested.
+once, or the ``QISKIT_IBM_TOKEN`` env var).
 """
 
 from __future__ import annotations

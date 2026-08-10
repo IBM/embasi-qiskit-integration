@@ -1,14 +1,6 @@
 # Copyright IBM Corp. 2026
 # SPDX-License-Identifier: Apache-2.0
 
-"""Orderable sort keys used to canonicalize fermionic operator term/group order.
-
-These back :func:`~embasi_qiskit_integration.circuit_generator.operator.
-_canonicalize_group_order`, which makes seeded qDRIFT sampling reproducible
-across process invocations. They are pure Python (no qiskit-fermions import), so
-they are importable and testable without the optional ``fermions`` extra.
-"""
-
 from __future__ import annotations
 
 from typing import Any

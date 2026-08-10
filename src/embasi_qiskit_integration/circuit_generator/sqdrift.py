@@ -1,47 +1,7 @@
 # Copyright IBM Corp. 2026
 # SPDX-License-Identifier: Apache-2.0
 
-"""SqDRIFT ansatz circuits via ``qiskit-fermions`` (primary ansatz).
-
-SqDRIFT (arXiv:2508.02578) samples bitstrings from a Hamiltonian time-evolution
-circuit. Two synthesis modes are provided:
-
-- ``method="exact"`` (default): the full Jordan-Wigner-synthesised evolution of
-  the (diagonal-filtered) Hamiltonian. Deterministic and dense enough to span the
-  CI space well -- used to generate the frozen SQD counts and as the default
-  noiseless sampling ansatz.
-- ``method="qdrift"``: the hardware-oriented ensemble of ``QDriftTrotterization``
-  randomizations. Shorter circuits, at the cost of per-circuit stochasticity.
-
-Each qDRIFT randomization ``i`` is an independent, reproducible draw: it is built
-from a fresh circuit and a fresh pass manager seeded ``seed + i``. That makes any
-single randomization reconstructible on its own (and the batch shardable), and
-gives more sampling variability than one RNG advanced across the whole batch.
-
-The operator these circuits evolve is built by :mod:`.operator`, which
-canonicalizes group order and filters diagonal terms *before* grouping -- both
-required for the seeded draw to be reproducible across processes. See that
-module's docstring for why.
-
-By default circuits start from the Hartree-Fock reference via ``InitializeModes``
-(occupying the lowest ``n_alpha`` alpha and ``n_beta`` beta modes); without a
-reference state the circuit would evolve the vacuum and sample zero-particle
-bitstrings.
-
-Pass ``include_initial_state=False`` to emit the *bare* evolution instead and let
-the run stage choose and prepend the reference state (see
-:mod:`embasi_qiskit_integration.circuit_run.prep`). Both routes are equivalent --
-the Jordan-Wigner preset synthesises ``InitializeModes`` into exactly the X gates
-that :func:`~embasi_qiskit_integration.circuit_run.prep.hf_prep_circuit` applies
--- so the split only decides *who* picks the determinant, not what is sampled.
-Circuits carry ``metadata["initial_state_included"]`` so the run stage knows
-whether a prep is still needed.
-
-``qiskit-fermions`` is not on PyPI and requires a Rust toolchain (see the README
-prerequisites and the ``fermions`` extra). All imports here are lazy so the rest
-of the package works without it; :func:`sqdrift_available` reports whether it is
-importable.
-"""
+"""SqDRIFT ansatz circuits via ``qiskit-fermions`` (primary ansatz)."""
 
 from __future__ import annotations
 

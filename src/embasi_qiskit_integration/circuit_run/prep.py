@@ -1,25 +1,7 @@
 # Copyright IBM Corp. 2026
 # SPDX-License-Identifier: Apache-2.0
 
-"""Initial-state preparation, prepended to a bare ansatz circuit at run time.
-
-The ansatz circuit ("core") encodes the *evolution*; which determinant it evolves
-is decided here and composed in front of it. Keeping the two separable means one
-generated core can be sampled from different reference states without rebuilding
-it.
-
-:func:`resolve_initial_state` picks the prep circuit by precedence:
-
-0. the core already contains its own initial state (``metadata
-   ["initial_state_included"]``) -- an identity prep, so nothing is applied twice;
-1. an explicit ``initial_state_bitstring``;
-2. Hartree-Fock from ``(n_alpha, n_beta, n_orbitals)``.
-
-Ordering convention throughout: Jordan-Wigner with a **blocked alpha|beta** mode
-layout -- the alpha block occupies qubits ``[0, n_alpha)`` and the beta block
-``[n_orbitals, n_orbitals + n_beta)``. This matches the ffsim / qiskit-fermions
-layout the circuit generator emits.
-"""
+"""Initial-state preparation, prepended to a bare ansatz circuit at run time."""
 
 from __future__ import annotations
 

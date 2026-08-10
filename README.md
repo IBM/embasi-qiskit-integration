@@ -121,11 +121,6 @@ sampler = RuntimeSampler(backend="FakeManilaV2")
 sampler = RuntimeSampler(options={"twirling": {"enable_measure": True}})
 ```
 
-Readout error is what this pipeline is least tolerant of: a flipped bit changes a
-determinant's Hamming weight, so SQD postselects that shot away entirely. That
-wastes shot budget *and* biases the recovered subspace, moving the energy rather
-than just its variance.
-
 Quick smoke test that credentials + submission work (a 2-qubit Bell circuit, no
 SQD):
 

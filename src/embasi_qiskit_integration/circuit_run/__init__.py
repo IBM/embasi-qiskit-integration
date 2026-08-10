@@ -6,21 +6,6 @@
 The execution half of the quantum path, kept separable from circuit generation.
 Circuits arrive as live :class:`~qiskit.QuantumCircuit` objects rather than files
 on disk, and counts are returned rather than written to a run directory.
-
-The pipeline a caller drives is:
-
-1. :func:`~.prep.resolve_initial_state` -- pick the reference determinant,
-2. :func:`~.prep.compose_full_circuit` -- prepend it to the bare ansatz circuit,
-3. ``sampler.run(circuits, shots)`` -- sample the batch,
-4. :func:`~.counts.merge_counts` -- pool the ensemble into one distribution.
-
-Modules:
-
-- :mod:`.base` -- the :class:`BitstringSampler` protocol and ``MockSampler``.
-- :mod:`.aer` / :mod:`.runtime` -- Aer and IBM Quantum Runtime samplers.
-- :mod:`.prep` -- initial-state resolution and composition.
-- :mod:`.counts` -- one shared ``SamplerV2``-result reader, plus count merging.
-- :mod:`.backend` -- backend resolution and ISA transpilation.
 """
 
 from __future__ import annotations

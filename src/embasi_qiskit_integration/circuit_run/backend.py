@@ -1,20 +1,7 @@
 # Copyright IBM Corp. 2026
 # SPDX-License-Identifier: Apache-2.0
 
-"""Backend resolution and ISA transpilation for hardware-backed sampling.
-
-Two concerns the samplers should not each re-implement:
-
-- :func:`resolve_backend` -- turn a backend *name* (or nothing) into a backend
-  object: a ``Fake*`` simulator from ``qiskit_ibm_runtime.fake_provider``, a
-  named real backend, or the least-busy one with enough qubits.
-- :func:`prepare_isa` -- transpile circuits to a backend's ISA. Real backends
-  only accept ISA circuits, and a batch shares one pass manager so the
-  construction cost is paid once rather than per circuit.
-
-``qiskit-ibm-runtime`` is an optional dependency (the ``hardware`` extra), so it
-is imported lazily inside the functions that need it.
-"""
+"""Backend resolution and ISA transpilation for hardware-backed sampling."""
 
 from __future__ import annotations
 

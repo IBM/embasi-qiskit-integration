@@ -22,12 +22,6 @@ import json
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
-# The sampler selector, shared by :func:`~embasi_qiskit_integration.circuit_run.
-# build_sampler` and the demo scripts.
-#
-# ``cli.py`` deliberately spells the same Literal out instead of importing this:
-# any import from this package executes ``circuit_run/__init__``, which pulls in
-# qiskit and more than doubles CLI startup. Keep the two in sync.
 SamplerKind = Literal["aer", "mock", "runtime"]
 
 

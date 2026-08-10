@@ -1,39 +1,7 @@
 # Copyright IBM Corp. 2026
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fermionic operator construction from active-space integrals.
-
-The single operator builder for the package: integrals -> ``FermionOperator``,
-normal-ordered, simplified, optionally diagonal-filtered, grouped by electronic
-structure, and relabeled into a canonical order. Circuit modules
-(:mod:`..sqdrift`) consume the result; the Jordan-Wigner mapping itself is the
-pass manager they run, not a separate stage here.
-
-``qiskit-fermions`` is not on PyPI and needs a Rust toolchain (see the README
-prerequisites and the ``fermions`` extra), so every import of it is lazy and this
-module is importable without it.
-
-Determinism
------------
-``QDriftTrotterization`` samples a group index ``k`` into an array whose
-index->group mapping is ``np.unique(groups)`` -- the *sorted group labels*. Those
-labels are assigned by ``group_terms_by_electronic_structure`` in a
-process-dependent order, so the same seeded draw maps to a different physical
-group across invocations: two rebuilds of one operator already diverge.
-:func:`_canonicalize_group_order` fixes this without touching the stock pass, by
-relabeling groups into a content-derived order before the operator is handed
-over.
-
-Diagonal-term filtering is applied *here*, before grouping and canonicalization,
-rather than by pruning the operator inside the qDRIFT pass. If the pass pruned
-instead, the canonical ranking would be computed over the *unfiltered* operator
-while the pass samples the *filtered* one, breaking the stable
-group->sample-index mapping that makes the seeded draw reproducible.
-
-This is separate from the pass's own ``filter_trivial`` option, which rejects
-individual *draws* that cannot change the occupation; that one is orthogonal and
-safe to use alongside this pruning (see :mod:`.sqdrift`).
-"""
+"""Fermionic operator construction from active-space integrals."""
 
 from __future__ import annotations
 

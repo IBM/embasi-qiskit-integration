@@ -1,22 +1,7 @@
 # Copyright IBM Corp. 2026
 # SPDX-License-Identifier: Apache-2.0
 
-"""Measurement-counts extraction from ``SamplerV2`` results, and count merging.
-
-One implementation shared by every sampler backend (Aer, IBM Runtime), so the
-Aer and hardware paths cannot drift apart in how they read a ``DataBin`` or name
-a classical register.
-
-A ``SamplerV2`` PUB result carries its measured bits in a ``BitArray`` on a
-classical register. ``measure_all()`` names that register ``meas``;
-:func:`find_meas_bitarray` prefers the known names and falls back to the sole
-public attribute for circuits using a custom one.
-
-A PUB may also carry *several* binding positions (a parameter-bindings array of
-shape ``(N, n_params)`` runs one circuit N times). :func:`counts_per_binding_from_pub_result`
-keeps those attributed one dict per binding;
-:func:`counts_from_pub_result` collapses them.
-"""
+"""Measurement-counts extraction from ``SamplerV2`` results, and count merging."""
 
 from __future__ import annotations
 
