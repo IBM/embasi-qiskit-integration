@@ -213,6 +213,30 @@ def test_filter_trivial_is_separate_from_filter_diagonal_terms(n2_ham):
 
 
 @requires_fermions
+def test_filter_trivial_defaults_to_where_occupation_is_visible(n2_ham):
+    """The pass can only filter draws when it can see the occupation.
+
+    ``filter_trivial`` compares a sampled term against the reference occupation,
+    which it reads from the ``InitializeModes`` gate. On a bare circuit there is
+    no such gate, so forcing it on is inert *and* makes qiskit warn -- hence the
+    default tracks ``include_initial_state`` and neither path warns.
+    """
+    import warnings
+
+    for include in (True, False):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            build_sqdrift_circuits(
+                n2_ham,
+                method="qdrift",
+                num_terms=10,
+                num_randomizations=1,
+                seed=42,
+                include_initial_state=include,
+            )
+
+
+@requires_fermions
 def test_sqdrift_records_initial_state_flag(n2_ham):
     """The metadata flag tells the run stage whether a prep is still needed."""
     baked = build_sqdrift_circuits(n2_ham, method="exact")

@@ -38,7 +38,7 @@ def build_sqdrift_circuits(
     num_randomizations: int = 10,
     time: float = 1.0,
     filter_diagonal_terms: bool = True,
-    filter_trivial: bool = True,
+    filter_trivial: bool | None = None,
     atol: float = 1e-16,
     seed: int | None = None,
     measure: bool = True,
@@ -66,6 +66,11 @@ def build_sqdrift_circuits(
             so it does not waste one of the ``num_terms`` slots. This is a
             distinct mechanism from ``filter_diagonal_terms``: that one prunes the
             operator up front, this one filters draws during sampling.
+
+            The pass can only filter when it can see the occupation, i.e. when the
+            reference state is inside the circuit. ``None`` (default) therefore
+            tracks ``include_initial_state``; forcing ``True`` on a bare circuit
+            has no effect and makes qiskit emit a ``UserWarning``.
         atol: tolerance for simplifying the normal-ordered operator.
         seed: base RNG seed. Randomization ``i`` uses ``seed + i`` for both the
             qDRIFT sampler and the transpiler, so each draw is independently
@@ -81,6 +86,12 @@ def build_sqdrift_circuits(
     """
     if method not in ("exact", "qdrift"):
         raise ValueError(f"unknown method {method!r}; use 'exact' or 'qdrift'")
+
+    # The qDRIFT pass filters a draw by comparing it against the occupation, which
+    # it can only read from an InitializeModes gate. On a bare circuit the option
+    # is inert and qiskit warns, so default it to wherever the reference state is.
+    if filter_trivial is None:
+        filter_trivial = include_initial_state
 
     from qiskit_fermions.circuit import FermionicCircuit
     from qiskit_fermions.circuit.library import Evolution, InitializeModes
