@@ -1,7 +1,27 @@
 # Copyright IBM Corp. 2026
 # SPDX-License-Identifier: Apache-2.0
 
-"""SqDRIFT ansatz circuits via ``qiskit-fermions`` (primary ansatz)."""
+"""SqDRIFT ansatz circuits via ``qiskit-fermions`` (primary ansatz).
+
+Construction mirrors the reference SqDRIFT step: one canonicalized grouped
+operator (see :mod:`.operator`), then per randomization a *fresh* circuit and a
+*fresh* ``seed``-seeded JW pass manager carrying ``QDriftTrotterization``, swept
+over ``time x num_terms``, with ``measure_all`` appended last.
+``build_sqdrift_circuits(method="qdrift", include_initial_state=False)``
+reproduces the reference's circuits exactly.
+
+Two capabilities go beyond it, both opt-in and both defaulted so the reference
+behaviour is what you get on the path that matters:
+
+- ``include_initial_state`` prepends the Hartree-Fock reference via
+  ``InitializeModes``. The reference always evolves the *vacuum*; passing
+  ``False`` (what :class:`~embasi_qiskit_integration.solvers.SQDSolver` does)
+  gives the identical bare circuit, leaving the determinant to the run stage.
+- ``method="exact"`` synthesises the full evolution with no qDRIFT sampling. The
+  reference has no such mode -- ``method="qdrift"`` is its behaviour. "exact" is
+  the deterministic reference path used for the frozen counts fixture and the
+  SQD-vs-FCI check.
+"""
 
 from __future__ import annotations
 
@@ -97,10 +117,14 @@ def build_sqdrift_circuits(
             tracks ``include_initial_state``; forcing ``True`` on a bare circuit
             has no effect and makes qiskit emit a ``UserWarning``.
         atol: tolerance for simplifying the normal-ordered operator.
-        seed: base RNG seed (default 42, as in the reference settings). Draw ``i``
-            of the flattened sweep uses ``seed + i`` for both the qDRIFT sampler
-            and the transpiler, so every circuit is an independently reproducible
-            draw. ``None`` leaves both unseeded (non-reproducible).
+        seed: base RNG seed (default 42, as in the reference settings).
+            Randomization ``i`` of each ``(time, num_terms)`` combination uses
+            ``seed + i`` for both the qDRIFT sampler and the transpiler, so each
+            draw is independently reproducible. The index restarts per combination,
+            so combinations sharing a randomization index share a draw -- this
+            matches the reference implementation and isolates the effect of
+            ``time``/``num_terms`` from sampling noise. ``None`` leaves both
+            unseeded (non-reproducible).
         measure: append ``measure_all()`` to each circuit.
         include_initial_state: prepare the HF reference inside the circuit
             (default). ``False`` emits the bare evolution, leaving the reference
@@ -162,16 +186,25 @@ def build_sqdrift_circuits(
             return generate_preset_jw_pass_manager()
         return generate_preset_jw_pass_manager(seed_transpiler=draw_seed)
 
-    def _draw_seed(index: int) -> int | None:
-        """Seed for draw ``index`` of the flattened sweep (None stays unseeded)."""
-        return None if seed is None else seed + index
+    def _draw_seed(randomization: int) -> int | None:
+        """Seed for randomization ``i``: ``seed + i`` (None stays unseeded).
+
+        The index is the randomization number *within* a ``(time, num_terms)``
+        combination, and restarts at 0 for each combination -- matching the
+        reference implementation, where every combination is a separate ``build()``
+        call over ``range(num_randomizations)``. So combinations that share a
+        randomization index also share a qDRIFT draw, which isolates the effect of
+        ``time``/``num_terms`` from sampling noise.
+        """
+        return None if seed is None else seed + randomization
 
     circuits = []
     if method == "exact":
         # One full-evolution circuit per time; num_terms/num_randomizations are
-        # qDRIFT-only knobs and do not apply.
-        for index, evolution_time in enumerate(times):
-            circuits.append(_pass_manager(_draw_seed(index)).run(_fresh_circuit(evolution_time)))
+        # qDRIFT-only knobs and do not apply. No sampling happens here, so the
+        # seed only feeds the transpiler and need not vary across times.
+        for evolution_time in times:
+            circuits.append(_pass_manager(_draw_seed(0)).run(_fresh_circuit(evolution_time)))
     else:
 
         def _run_one(evolution_time: float, n_terms: int, draw_seed: int | None) -> Any:
@@ -189,12 +222,12 @@ def build_sqdrift_circuits(
             )
             return pm.run(_fresh_circuit(evolution_time))
 
-        index = 0
         for evolution_time in times:
             for n_terms in term_counts:
-                for _ in range(num_randomizations):
-                    circuits.append(_run_one(evolution_time, n_terms, _draw_seed(index)))
-                    index += 1
+                # Seeds restart at `seed` for every combination, as in the
+                # reference implementation (one build() call per combination).
+                for randomization in range(num_randomizations):
+                    circuits.append(_run_one(evolution_time, n_terms, _draw_seed(randomization)))
 
     if measure:
         circuits = [qc.measure_all(inplace=False) for qc in circuits]

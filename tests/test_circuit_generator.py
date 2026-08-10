@@ -85,6 +85,93 @@ def test_sqdrift_qdrift_sweeps_time_by_num_terms(n2_ham):
 
 
 @requires_fermions
+def test_sqdrift_qdrift_matches_reference_construction(n2_ham):
+    """Our qDRIFT path reproduces the reference SqDRIFT recipe gate-for-gate.
+
+    The reference builds, per randomization: a fresh ``FermionicCircuit`` holding
+    only ``Evolution`` (vacuum -- no ``InitializeModes``), run through a fresh
+    ``generate_preset_jw_pass_manager(seed_transpiler=rng_seed + i)`` whose
+    optimization stage is ``QDriftTrotterization(num_groups, rng=rng_seed + i)``,
+    with ``measure_all(inplace=False)`` appended afterwards.
+
+    Transcribed inline here and compared including rotation parameters, so a
+    divergence in construction order, seeding, or the operator would fail this.
+    """
+    from qiskit_fermions.circuit import FermionicCircuit
+    from qiskit_fermions.circuit.library import Evolution
+    from qiskit_fermions.transpiler import FermionicPassManager
+    from qiskit_fermions.transpiler.passes import QDriftTrotterization
+    from qiskit_fermions.transpiler.presets import generate_preset_jw_pass_manager
+
+    from embasi_qiskit_integration.circuit_generator.operator import build_canonical_operator
+
+    time, num_terms, n_rand, seed = 1.0, 10, 3, 42
+
+    normal, num_modes = build_canonical_operator(n2_ham, atol=1e-16, filter_diagonal_terms=True)
+
+    def reference_one(draw_seed: int):
+        pm = generate_preset_jw_pass_manager(seed_transpiler=draw_seed)
+        pm.optimization = FermionicPassManager([QDriftTrotterization(num_terms, rng=draw_seed)])
+        circ = FermionicCircuit(num_modes)
+        circ.append(Evolution(num_modes, normal, time), circ.modes)
+        return pm.run(circ)
+
+    reference = [reference_one(seed + i).measure_all(inplace=False) for i in range(n_rand)]
+    ours = build_sqdrift_circuits(
+        n2_ham,
+        method="qdrift",
+        time=time,
+        num_terms=num_terms,
+        num_randomizations=n_rand,
+        seed=seed,
+        include_initial_state=False,
+    )
+
+    def detailed(circuit) -> list:
+        """Gate name, qubit indices, and numeric parameters for every instruction."""
+        return [
+            (
+                instruction.operation.name,
+                tuple(q._index for q in instruction.qubits),
+                tuple(
+                    float(p) for p in instruction.operation.params if isinstance(p, (int, float))
+                ),
+            )
+            for instruction in circuit.data
+        ]
+
+    assert len(ours) == len(reference) == n_rand
+    for mine, theirs in zip(ours, reference, strict=True):
+        assert detailed(mine) == detailed(theirs)
+
+
+@requires_fermions
+def test_sqdrift_seeds_restart_per_sweep_combination(n2_ham):
+    """Randomization seeds restart at ``seed`` for every (time, num_terms) combo.
+
+    This matches the reference implementation, where each combination is its own
+    ``build()`` call over ``range(num_randomizations)``. The consequence is that
+    combinations sharing a randomization index share a qDRIFT draw, which isolates
+    the effect of time / num_terms from sampling noise. A flattened per-circuit
+    index would make every draw unique and diverge from the reference.
+    """
+    circuits = build_sqdrift_circuits(
+        n2_ham,
+        method="qdrift",
+        time=[1.0, 2.0],
+        num_terms=10,
+        num_randomizations=2,
+        seed=42,
+        include_initial_state=False,
+    )
+    assert len(circuits) == 4
+    # index 0/1 = time 1.0, index 2/3 = time 2.0
+    assert _op_signature(circuits[0]) == _op_signature(circuits[2])  # both randomization 0
+    assert _op_signature(circuits[1]) == _op_signature(circuits[3])  # both randomization 1
+    assert _op_signature(circuits[0]) != _op_signature(circuits[1])  # different draws
+
+
+@requires_fermions
 def test_sqdrift_time_accepts_scalar_or_sequence(n2_ham):
     """A scalar time and a length-1 sequence must build the same circuit."""
     scalar = build_sqdrift_circuits(n2_ham, method="exact", time=1.0, seed=42)
