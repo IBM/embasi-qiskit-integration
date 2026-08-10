@@ -388,6 +388,74 @@ def test_pbe_in_pbe_null_case_A_terms_reduce_to_fragment_hf_minus_pbe(
     assert energy.total - energy.e_low_total == pytest.approx(e_hf_a - e_pbe_a, abs=1e-6)
 
 
+def test_footing_shift_is_a_frame_correction_at_a_correlated_density(
+    adapter, orbitals_full
+):
+    """``e_high_A`` reconstructs independently on the ghosted-A frame -- WITH correlation.
+
+    The null-case test above pins γ̃^A = γ^A (correction = 0), so it never exercises
+    the footing rebasing at a density that carries correlation.  This one solves the
+    full A space with FCI, producing a genuinely correlated γ̃^A, and checks that the
+    adapter's ``e_high_A`` equals an *independent* construction that never touches
+    ``v_emb``, ``P_B``, or ``footing_shift``::
+
+        e_high_A  ==  E_nuc^A + tr[γ̃^A h_core^A] + 1/2 tr[γ̃^A G_HF^A[γ̃^A]]  +  E_corr
+
+    -- the correlated fragment energy on EmbASI's ghosted subsystem-A frame.  ``E_corr``
+    is the fragment correlation the solver captured, ``E_FCI - E_HF`` evaluated at FCI's
+    own 1-RDM in the downfolded active space.  Dropping the ``E_corr`` term makes the
+    right side a single-determinant HF energy and the identity fails by exactly the
+    correlation energy (~0.13 Ha here) -- a physics term, not a frame error.  This is
+    the decisive "correcting a frame vs absorbing an error" check: agreement to
+    round-off means the shift is a pure nuclear-frame translation reproduced from an
+    independent path, and any residual in a full run is downstream (active space), not
+    in the footing.
+    """
+    from pyscf import scf
+
+    from embasi_qiskit_integration.solvers import FCISolver
+
+    ham = adapter.embedded_hamiltonian(orbitals_full)
+    result = FCISolver().solve(ham)
+    energy = adapter.projection_energy(result, orbitals_full)
+
+    # Correlated AO density γ̃^A and the fragment correlation energy the solver added.
+    dm_hl = adapter.rdm1_ao(result.rdm1, orbitals_full)
+    d_act = np.asarray(result.rdm1)
+    h2 = np.asarray(ham.h2)
+    j = np.einsum("pqrs,rs->pq", h2, d_act)
+    k = np.einsum("prqs,rs->pq", h2, d_act)
+    e_hf_active_at_fci = float(
+        ham.e_core
+        + np.einsum("pq,qp->", np.asarray(ham.h1), d_act)
+        + 0.5 * np.einsum("pq,qp->", j - 0.5 * k, d_act)
+    )
+    e_corr = float(result.energy) - e_hf_active_at_fci
+    assert e_corr < -1e-3  # FCI is genuinely below HF here -> correlation is present
+
+    # Independent ghosted-A-frame reconstruction, no embedding operators involved.
+    mol_a = adapter.p.A_LL.atoms.calc.mol
+    hcore_a = np.asarray(mol_a.intor("int1e_kin") + mol_a.intor("int1e_nuc"))
+    enuc_a = float(mol_a.energy_nuc())
+    veff_hf_a = np.asarray(scf.RHF(mol_a).get_veff(mol_a, dm_hl))  # J - K/2 at γ̃^A
+    e_high_a_direct = float(
+        enuc_a
+        + np.einsum("ij,ji->", dm_hl, hcore_a)
+        + 0.5 * np.einsum("ij,ji->", dm_hl, veff_hf_a)
+        + e_corr
+    )
+    assert energy.e_high_A == pytest.approx(e_high_a_direct, abs=1e-6)
+
+    # And the shift is exactly its density-linear frame definition -- the constant
+    # nuclear piece plus a one-body trace against the fixed frame difference, with no
+    # two-electron contribution (the ERIs are frame-independent on a shared basis).
+    shift_recon = float(
+        (adapter.ints.energy_nuc() - enuc_a)
+        + np.einsum("ij,ji->", dm_hl, adapter.ints.hcore() - hcore_a)
+    )
+    assert energy.footing_shift == pytest.approx(shift_recon, abs=1e-9)
+
+
 # --------------------------------------------------------------------------- #
 # Density-fitted eri_mo agrees with the dense transform.
 # --------------------------------------------------------------------------- #
