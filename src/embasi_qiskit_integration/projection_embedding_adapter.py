@@ -85,7 +85,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 import scipy.linalg as sla
@@ -158,7 +158,9 @@ class PySCFIntegrals:
         self.mol = mf_hl.mol
         self._hf = mf_hl.mol.RHF()  # integral engine only; never kernel()'d
         self._density_fit = density_fit
-        self._df = None  # built lazily on first eri_mo call
+        # A pyscf.df.DF, built lazily on the first eri_mo call. PySCF is untyped,
+        # so this is Any rather than a precise DF type.
+        self._df: Any = None
 
     def overlap(self) -> np.ndarray:
         return np.asarray(self.mol.intor("int1e_ovlp"))
@@ -303,10 +305,11 @@ class ProjectionEmbeddingAdapter:
         self.mu = mu
         self._floor = env_eigenvalue_floor
 
-        self._dm_a = None  # γ^A  (localized, low level), AO, 2-occupancy
-        self._dm_b = None  # γ^B  (environment, frozen), AO
-        self._fock = None  # F_emb
-        self._s = None
+        # Populated by run_low_level(); None until then, hence the optional type.
+        self._dm_a: np.ndarray | None = None  # γ^A (localized, low level), AO, 2-occupancy
+        self._dm_b: np.ndarray | None = None  # γ^B (environment, frozen), AO
+        self._fock: np.ndarray | None = None  # F_emb
+        self._s: np.ndarray | None = None
 
     # ---------------- low-level embedding ---------------- #
     def run_low_level(self, dm_ab_in: np.ndarray | None = None) -> None:
@@ -352,6 +355,41 @@ class ProjectionEmbeddingAdapter:
                 f"used mu_val={float(mu_embasi):g}; the reconstructed P_B would "
                 "not match the projector inside F_emb"
             )
+
+    # ---------------- low-level state accessors ---------------- #
+    # ``_dm_a``/``_dm_b``/``_fock``/``_s`` are only populated by run_low_level().
+    # These accessors turn "used before the embedding ran" from an AttributeError
+    # on None deep inside a contraction into one clear message, and give the type
+    # checker the non-optional arrays the numerics below require.
+
+    def _require(self, value: np.ndarray | None, name: str) -> np.ndarray:
+        """Return ``value``, or explain that :meth:`run_low_level` has not run."""
+        if value is None:
+            raise RuntimeError(
+                f"{name} is not available yet: call run_low_level() before using "
+                "the embedding operators, orbitals, or energies"
+            )
+        return value
+
+    @property
+    def _s_arr(self) -> np.ndarray:
+        """The AO overlap matrix S (requires :meth:`run_low_level`)."""
+        return self._require(self._s, "the AO overlap matrix")
+
+    @property
+    def _dm_a_arr(self) -> np.ndarray:
+        """The localized subsystem-A density γ^A (requires :meth:`run_low_level`)."""
+        return self._require(self._dm_a, "the subsystem-A density")
+
+    @property
+    def _dm_b_arr(self) -> np.ndarray:
+        """The frozen environment density γ^B (requires :meth:`run_low_level`)."""
+        return self._require(self._dm_b, "the environment density")
+
+    @property
+    def _fock_arr(self) -> np.ndarray:
+        """The embedded Fock matrix F_emb (requires :meth:`run_low_level`)."""
+        return self._require(self._fock, "the embedded Fock matrix")
 
     @staticmethod
     def _as_ao_matrix(m) -> np.ndarray:
@@ -456,11 +494,11 @@ class ProjectionEmbeddingAdapter:
                     "restricted single-k downfold assumes real data"
                 )
             c = c.real
-        nao = self._s.shape[0]
+        nao = self._s_arr.shape[0]
         if c.shape[0] != nao and c.shape[1] == nao:
             c = c.T
         # Definitive check rather than a guess: C^T S C == 1
-        gram = c.T @ self._s @ c
+        gram = c.T @ self._s_arr @ c
         if not np.allclose(gram, np.eye(c.shape[1]), atol=1e-6):
             raise ValueError(
                 f"MO coefficients are not S-orthonormal (max deviation "
@@ -477,7 +515,7 @@ class ProjectionEmbeddingAdapter:
         # rebuild it as mu * S gamma^B S; mu itself is now cross-checked against
         # p.mu_val in run_low_level, but the assembly still assumes EmbASI's own
         # P_B has exactly this form -- exposing it would remove the assumption.
-        return self.mu * (self._s @ self._dm_b @ self._s)
+        return self.mu * (self._s_arr @ self._dm_b_arr @ self._s_arr)
 
     @property
     def h_emb(self) -> np.ndarray:
@@ -489,7 +527,7 @@ class ProjectionEmbeddingAdapter:
         it is correct today but any change to how EmbASI assembles ``F_emb``
         breaks it silently rather than loudly.
         """
-        return self._fock - self.ints.veff_hl(self._dm_a)
+        return self._fock_arr - self.ints.veff_hl(self._dm_a_arr)
 
     @property
     def v_emb(self) -> np.ndarray:
@@ -512,7 +550,7 @@ class ProjectionEmbeddingAdapter:
         Falls back to nothing: if ``mo_b_ll`` is unavailable the caller uses the
         full-basis path via ``restrict_to_a=False``.
         """
-        s = self._s
+        s = self._s_arr
         c_b = self.mo_b_ll  # (nao, n_occ_B), S-orthonormal
         # Project span(B) out in the S-metric: P = I - c_b c_b^T S.
         proj = np.eye(s.shape[0]) - c_b @ (c_b.T @ s)
@@ -526,7 +564,7 @@ class ProjectionEmbeddingAdapter:
         nonzero = w > 1e-8
         q = y @ u[:, nonzero] @ np.diag(1.0 / np.sqrt(w[nonzero]))
         # Small standard eigenproblem in the A basis (Q^T S Q = I by construction).
-        fs = q.T @ self._fock @ q
+        fs = q.T @ self._fock_arr @ q
         eps, cc = np.linalg.eigh(fs)
         return eps, q @ cc
 
@@ -568,7 +606,7 @@ class ProjectionEmbeddingAdapter:
         if restrict_to_a:
             eps, c = self._eigh_subsystem_a()
         else:
-            eps, c = sla.eigh(self._fock, self._s)
+            eps, c = sla.eigh(self._fock_arr, self._s_arr)
             keep = eps < self._floor  # level shift removes subsystem B
             eps, c = eps[keep], c[:, keep]
 
@@ -677,7 +715,7 @@ class ProjectionEmbeddingAdapter:
 
         leak = float(np.einsum("ij,ji->", dm_hl, p_b))
         e_high_a = float(result.energy) - np.einsum("ij,ji->", dm_hl, v_emb) - leak
-        correction = float(np.einsum("ij,ji->", dm_hl - self._dm_a, v_emb))
+        correction = float(np.einsum("ij,ji->", dm_hl - self._dm_a_arr, v_emb))
 
         # Rebase e_high_A onto E_low(A)'s (ghosted subsystem-A) nuclear footing.
         hcore_a, enuc_a = self._a_fragment_footing()
@@ -736,10 +774,10 @@ class ProjectionEmbeddingAdapter:
                 "Expose subsys_A_highlvl_totalen or the A-fragment "
                 "h_core/energy_nuc upstream for a backend-agnostic fix."
             ) from exc
-        if hcore_a.shape != self._s.shape:
+        if hcore_a.shape != self._s_arr.shape:
             raise ValueError(
                 f"subsystem-A h_core is {hcore_a.shape} but the supersystem basis "
-                f"is {self._s.shape}; the ghosted A mol and F_emb are on different "
+                f"is {self._s_arr.shape}; the ghosted A mol and F_emb are on different "
                 "bases (basis truncation not yet mapped, see run_low_level TODO)"
             )
         return hcore_a, enuc_a
@@ -796,12 +834,12 @@ class ProjectionEmbeddingAdapter:
         :meth:`run_low_level` before it reaches ``construct_embedded_fock``.
         """
         dm_hl = self.rdm1_ao(rdm1_active, orbitals)
-        self.run_low_level(dm_ab_in=dm_hl + self._dm_b)
+        self.run_low_level(dm_ab_in=dm_hl + self._dm_b_arr)
 
     # ---------------- checks ---------------- #
     def _validate_densities(self) -> None:
-        n_a = np.einsum("ij,ji->", self._dm_a, self._s)
-        n_b = np.einsum("ij,ji->", self._dm_b, self._s)
+        n_a = np.einsum("ij,ji->", self._dm_a_arr, self._s_arr)
+        n_b = np.einsum("ij,ji->", self._dm_b_arr, self._s_arr)
         if not np.isclose(round(n_a), n_a, atol=1e-6):
             raise ValueError(f"tr(γ^A S) = {n_a:.6f} is not integral")
         if not np.isclose(round(n_b), n_b, atol=1e-6):
@@ -809,7 +847,7 @@ class ProjectionEmbeddingAdapter:
 
     def _validate_span(self, c_occ: np.ndarray) -> None:
         """Occupied block of F_emb must span the same space as mo_coeffs_A_LL."""
-        overlap = self.mo_a_ll.T @ self._s @ c_occ
+        overlap = self.mo_a_ll.T @ self._s_arr @ c_occ
         sv = np.linalg.svd(overlap, compute_uv=False)
         if sv.min() < 1.0 - 1e-6:
             raise ValueError(

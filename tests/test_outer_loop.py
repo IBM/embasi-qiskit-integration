@@ -35,12 +35,14 @@ import pytest
 
 pyscf = pytest.importorskip("pyscf")
 
-from embasi_qiskit_integration.embedding import EmbeddingWorkflow
-from embasi_qiskit_integration.projection_embedding_adapter import (
+# Imported after the importorskip above, so the module skips cleanly without
+# pyscf rather than failing at import time -- hence the E402 waivers.
+from embasi_qiskit_integration.embedding import EmbeddingWorkflow  # noqa: E402
+from embasi_qiskit_integration.projection_embedding_adapter import (  # noqa: E402
     ProjectionEmbeddingAdapter,
     PySCFIntegrals,
 )
-from embasi_qiskit_integration.solvers import FCISolver
+from embasi_qiskit_integration.solvers import FCISolver  # noqa: E402
 
 
 class _FeedbackMockEmbedding:

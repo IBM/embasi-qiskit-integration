@@ -371,10 +371,18 @@ class EmbeddingWorkflow(BaseSettings):
             fragment_ao_indices,
         )
 
-        mol = emb.ints.mol
+        # ``mol`` is a PySCF-backend detail, not part of the AOIntegrals protocol
+        # (FHIaimsIntegrals has no Mole), so the concentric selector is only
+        # available on the PySCF path.
+        mol = getattr(emb.ints, "mol", None)
+        if mol is None:
+            raise ValueError(
+                "selector='concentric' needs the PySCF integral backend "
+                f"(no 'mol' on {type(emb.ints).__name__}); use selector='none'"
+            )
         active_after_sort = list(range(len(self.active_atoms)))
         frag_ao = fragment_ao_indices(mol, active_after_sort)
-        return concentric_selector(emb._s, frag_ao, max_virtual=self.n_virtual)
+        return concentric_selector(emb._s_arr, frag_ao, max_virtual=self.n_virtual)
 
     def _build_solver(self):
         from embasi_qiskit_integration.solvers import FCISolver, SQDSolver
