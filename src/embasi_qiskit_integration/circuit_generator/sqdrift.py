@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from embasi_qiskit_integration.circuit_generator.operator import (
@@ -17,6 +18,20 @@ from embasi_qiskit_integration.contract import EmbeddedHamiltonian
 def sqdrift_available() -> bool:
     """True if ``qiskit-fermions`` is importable in this environment."""
     return fermions_available()
+
+
+def _as_float_list(value: float | Sequence[float]) -> list[float]:
+    """Coerce a scalar or sequence of evolution times into a list of floats.
+
+    A bare ``1.0`` is accepted as ``[1.0]`` so existing scalar callers keep
+    working; the swept form is a sequence.
+    """
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    times = [float(t) for t in value]
+    if not times:
+        raise ValueError("time must contain at least one evolution time")
+    return times
 
 
 def _hf_occupation(norb: int, nelec: tuple[int, int]) -> list[bool]:
@@ -34,13 +49,13 @@ def build_sqdrift_circuits(
     ham: EmbeddedHamiltonian,
     *,
     method: str = "exact",
-    num_terms: int = 200,
-    num_randomizations: int = 10,
-    time: float = 1.0,
+    num_terms: int | Sequence[int] = (10, 15, 20),
+    num_randomizations: int = 500,
+    time: float | Sequence[float] = (1.0, 2.0, 3.0),
     filter_diagonal_terms: bool = True,
     filter_trivial: bool | None = None,
     atol: float = 1e-16,
-    seed: int | None = None,
+    seed: int | None = 42,
     measure: bool = True,
     include_initial_state: bool = True,
 ) -> list:
@@ -50,13 +65,23 @@ def build_sqdrift_circuits(
     carrying the Hamiltonian time-evolution, preceded by the HF reference unless
     ``include_initial_state=False``.
 
+    Defaults mirror the reference SqDRIFT settings (``time`` ``[1.0, 2.0, 3.0]``,
+    ``num_terms`` ``[10, 15, 20]``, ``num_randomizations`` 500, ``seed`` 42), so a
+    bare ``method="qdrift"`` call produces that full sweep: **4500 circuits**
+    (3 times x 3 term-counts x 500 randomizations). Narrow the axes for a smaller
+    budget -- ``SQDSolver`` does exactly that, pinning one ``(time, num_terms)``
+    pair and its own ``num_randomizations``.
+
     Args:
-        method: ``"exact"`` (single full-evolution circuit) or ``"qdrift"``
-            (ensemble of qDRIFT randomizations).
+        method: ``"exact"`` (one full-evolution circuit per ``time``) or
+            ``"qdrift"`` (ensemble over time x num_terms x randomizations).
         num_terms: qDRIFT term-groups per circuit (``method="qdrift"`` only).
-        num_randomizations: number of circuits to return (``method="qdrift"``;
-            ``"exact"`` always returns one circuit).
-        time: evolution time fed to the ``Evolution`` gate.
+            Scalar or sequence; a sequence is a sweep axis.
+        num_randomizations: randomizations per ``(time, num_terms)`` combination
+            (``method="qdrift"``; ``"exact"`` yields one circuit per ``time``).
+        time: evolution time(s) t for ``exp(-i t H)``, fed to the ``Evolution``
+            gate. Scalar or sequence; a sequence is a sweep axis, combined with
+            ``num_terms`` as a cartesian product.
         filter_diagonal_terms: drop occupation-diagonal terms that do not affect
             sampled bitstrings. Applied during operator construction, before
             grouping (see :mod:`.operator`).
@@ -72,9 +97,10 @@ def build_sqdrift_circuits(
             tracks ``include_initial_state``; forcing ``True`` on a bare circuit
             has no effect and makes qiskit emit a ``UserWarning``.
         atol: tolerance for simplifying the normal-ordered operator.
-        seed: base RNG seed. Randomization ``i`` uses ``seed + i`` for both the
-            qDRIFT sampler and the transpiler, so each draw is independently
-            reproducible. ``None`` leaves both unseeded (non-reproducible).
+        seed: base RNG seed (default 42, as in the reference settings). Draw ``i``
+            of the flattened sweep uses ``seed + i`` for both the qDRIFT sampler
+            and the transpiler, so every circuit is an independently reproducible
+            draw. ``None`` leaves both unseeded (non-reproducible).
         measure: append ``measure_all()`` to each circuit.
         include_initial_state: prepare the HF reference inside the circuit
             (default). ``False`` emits the bare evolution, leaving the reference
@@ -82,7 +108,8 @@ def build_sqdrift_circuits(
             ``metadata["initial_state_included"]``.
 
     Returns:
-        The generated circuits, in randomization order.
+        The generated circuits. Order is the flattened sweep: for each ``time``,
+        for each ``num_terms``, each randomization in turn.
     """
     if method not in ("exact", "qdrift"):
         raise ValueError(f"unknown method {method!r}; use 'exact' or 'qdrift'")
@@ -107,8 +134,16 @@ def build_sqdrift_circuits(
     )
     occ = _hf_occupation(ham.norb, ham.nelec)
 
-    def _fresh_circuit() -> Any:
-        """Build a fresh evolution circuit for one randomization.
+    # The operator depends only on (ham, atol, filter_diagonal_terms) -- `time`
+    # enters the Evolution gate and `num_terms` only the qDRIFT pass -- so one
+    # build above serves every combination of the sweep.
+    times = _as_float_list(time)
+    term_counts = [int(num_terms)] if isinstance(num_terms, int) else [int(n) for n in num_terms]
+    if not term_counts:
+        raise ValueError("num_terms must contain at least one term count")
+
+    def _fresh_circuit(evolution_time: float) -> Any:
+        """Build a fresh evolution circuit at ``evolution_time``.
 
         A new circuit (and its own metadata dict) per pass-manager run: sharing
         one circuit across randomizations lets qiskit passes leak metadata
@@ -118,7 +153,7 @@ def build_sqdrift_circuits(
         circ = FermionicCircuit(num_modes)
         if include_initial_state:
             circ.append(InitializeModes(occ), circ.modes)
-        circ.append(Evolution(num_modes, normal, time), circ.modes)
+        circ.append(Evolution(num_modes, normal, evolution_time), circ.modes)
         return circ
 
     def _pass_manager(draw_seed: int | None) -> Any:
@@ -127,11 +162,19 @@ def build_sqdrift_circuits(
             return generate_preset_jw_pass_manager()
         return generate_preset_jw_pass_manager(seed_transpiler=draw_seed)
 
+    def _draw_seed(index: int) -> int | None:
+        """Seed for draw ``index`` of the flattened sweep (None stays unseeded)."""
+        return None if seed is None else seed + index
+
+    circuits = []
     if method == "exact":
-        circuits = [_pass_manager(seed).run(_fresh_circuit())]
+        # One full-evolution circuit per time; num_terms/num_randomizations are
+        # qDRIFT-only knobs and do not apply.
+        for index, evolution_time in enumerate(times):
+            circuits.append(_pass_manager(_draw_seed(index)).run(_fresh_circuit(evolution_time)))
     else:
 
-        def _run_one(draw_seed: int | None) -> Any:
+        def _run_one(evolution_time: float, n_terms: int, draw_seed: int | None) -> Any:
             """Build one randomization with its own seeded pass manager.
 
             ``filter_trivial`` filters the pass's own *draws*; the occupation-
@@ -142,11 +185,16 @@ def build_sqdrift_circuits(
             """
             pm = _pass_manager(draw_seed)
             pm.optimization = FermionicPassManager(
-                [QDriftTrotterization(num_terms, filter_trivial=filter_trivial, rng=draw_seed)]
+                [QDriftTrotterization(n_terms, filter_trivial=filter_trivial, rng=draw_seed)]
             )
-            return pm.run(_fresh_circuit())
+            return pm.run(_fresh_circuit(evolution_time))
 
-        circuits = [_run_one(None if seed is None else seed + i) for i in range(num_randomizations)]
+        index = 0
+        for evolution_time in times:
+            for n_terms in term_counts:
+                for _ in range(num_randomizations):
+                    circuits.append(_run_one(evolution_time, n_terms, _draw_seed(index)))
+                    index += 1
 
     if measure:
         circuits = [qc.measure_all(inplace=False) for qc in circuits]

@@ -50,20 +50,54 @@ def test_hf_circuit_bitstring(n2_ham):
 
 
 @requires_fermions
-def test_sqdrift_exact_single_circuit(n2_ham):
-    circuits = build_sqdrift_circuits(n2_ham, method="exact")
-    assert len(circuits) == 1
-    assert circuits[0].num_qubits == 2 * n2_ham.norb
+def test_sqdrift_exact_one_circuit_per_time(n2_ham):
+    """``exact`` yields one full-evolution circuit per requested time."""
+    # Default time is the 3-element sweep [1.0, 2.0, 3.0].
+    assert len(build_sqdrift_circuits(n2_ham, method="exact")) == 3
+
+    single = build_sqdrift_circuits(n2_ham, method="exact", time=1.0)
+    assert len(single) == 1
+    assert single[0].num_qubits == 2 * n2_ham.norb
+
+    assert len(build_sqdrift_circuits(n2_ham, method="exact", time=[0.5, 1.0])) == 2
 
 
 @requires_fermions
-def test_sqdrift_qdrift_ensemble(n2_ham):
+def test_sqdrift_qdrift_sweeps_time_by_num_terms(n2_ham):
+    """qDRIFT fans out over time x num_terms x randomizations."""
     circuits = build_sqdrift_circuits(
-        n2_ham, method="qdrift", num_terms=10, num_randomizations=3, seed=42
+        n2_ham, method="qdrift", time=1.0, num_terms=10, num_randomizations=3, seed=42
     )
     assert len(circuits) == 3
     for qc in circuits:
         assert qc.num_qubits == 2 * n2_ham.norb
+
+    # 2 times x 2 term-counts x 2 randomizations = 8
+    swept = build_sqdrift_circuits(
+        n2_ham,
+        method="qdrift",
+        time=[0.5, 1.0],
+        num_terms=[8, 10],
+        num_randomizations=2,
+        seed=42,
+    )
+    assert len(swept) == 8
+
+
+@requires_fermions
+def test_sqdrift_time_accepts_scalar_or_sequence(n2_ham):
+    """A scalar time and a length-1 sequence must build the same circuit."""
+    scalar = build_sqdrift_circuits(n2_ham, method="exact", time=1.0, seed=42)
+    listed = build_sqdrift_circuits(n2_ham, method="exact", time=[1.0], seed=42)
+    assert _op_signature(scalar[0]) == _op_signature(listed[0])
+
+
+@requires_fermions
+def test_sqdrift_rejects_empty_sweep_axes(n2_ham):
+    with pytest.raises(ValueError, match="at least one evolution time"):
+        build_sqdrift_circuits(n2_ham, method="exact", time=[])
+    with pytest.raises(ValueError, match="at least one term count"):
+        build_sqdrift_circuits(n2_ham, method="qdrift", time=1.0, num_terms=[])
 
 
 @requires_fermions

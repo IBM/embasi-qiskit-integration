@@ -43,9 +43,10 @@ class SolveCommand(BaseSettings):
     sampler: Literal["aer", "mock", "runtime"] = "aer"
     counts: str | None = None
     backend: str | None = None  # runtime backend name; else least-busy
-    optimization_level: int = 3  # runtime ISA-transpile level
-    shots: int = 100_000
-    seed: int | None = None
+    # Defaults mirror the reference workflow's run-step settings.
+    optimization_level: int = 1  # runtime ISA-transpile level (0-3)
+    shots: int = 10_000  # per circuit
+    seed: int = 42
     watch: bool = False
     timeout: float = 300.0
 
