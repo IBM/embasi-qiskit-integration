@@ -293,9 +293,7 @@ def test_projection_energy_reads_embasi_low_level(adapter, orbitals_full):
 # --------------------------------------------------------------------------- #
 # PbE total energy -- the physical null test.
 # --------------------------------------------------------------------------- #
-def test_pbe_in_pbe_null_case_A_terms_reduce_to_fragment_hf_minus_pbe(
-    adapter, orbitals_full
-):
+def test_pbe_in_pbe_null_case_A_terms_reduce_to_fragment_hf_minus_pbe(adapter, orbitals_full):
     """Full A space, γ̃^A = γ^A: the A-level terms cancel down to HF - PBE.
 
     This is the decisive physics check the plumbing tests miss.  With the *full*
@@ -372,9 +370,7 @@ def test_pbe_in_pbe_null_case_A_terms_reduce_to_fragment_hf_minus_pbe(
     enuc_a = float(mol_a.energy_nuc())
     veff_hf = scf.RHF(mol_a).get_veff(mol_a, dm_a)  # J - K/2
     e_hf_a = float(
-        enuc_a
-        + np.einsum("ij,ji->", dm_a, hcore_a)
-        + 0.5 * np.einsum("ij,ji->", dm_a, veff_hf)
+        enuc_a + np.einsum("ij,ji->", dm_a, hcore_a) + 0.5 * np.einsum("ij,ji->", dm_a, veff_hf)
     )
     # e_low_A is EmbASI's PBE energy_tot(γ^A) on that same ghosted mol; assert the
     # adapter reads exactly that (so the reference difference below is apples-to-
@@ -388,9 +384,7 @@ def test_pbe_in_pbe_null_case_A_terms_reduce_to_fragment_hf_minus_pbe(
     assert energy.total - energy.e_low_total == pytest.approx(e_hf_a - e_pbe_a, abs=1e-6)
 
 
-def test_footing_shift_is_a_frame_correction_at_a_correlated_density(
-    adapter, orbitals_full
-):
+def test_footing_shift_is_a_frame_correction_at_a_correlated_density(adapter, orbitals_full):
     """``e_high_A`` reconstructs independently on the ghosted-A frame -- WITH correlation.
 
     The null-case test above pins γ̃^A = γ^A (correction = 0), so it never exercises
