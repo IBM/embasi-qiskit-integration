@@ -66,7 +66,7 @@ print(res.energy)            # -108.9585095430 Ha; res.rdm1 / res.rdm2 populated
 ### 2. SQD with Aer (noiseless)
 
 ```python
-from embasi_qiskit_integration.sampling.aer import AerSampler
+from embasi_qiskit_integration.circuit_run.aer import AerSampler
 from embasi_qiskit_integration.solvers import SQDSolver
 
 # SQDSolver builds the SqDRIFT ansatz, samples it, and runs the SQD loop.
@@ -93,7 +93,7 @@ QiskitRuntimeService.save_account(channel="ibm_quantum_platform", token="<IBM_TO
 or export `QISKIT_IBM_TOKEN` in your environment. Then swap in `RuntimeSampler`:
 
 ```python
-from embasi_qiskit_integration.sampling.runtime import RuntimeSampler
+from embasi_qiskit_integration.circuit_run.runtime import RuntimeSampler
 from embasi_qiskit_integration.solvers import SQDSolver
 
 sampler = RuntimeSampler()                          # least-busy real backend
@@ -103,9 +103,28 @@ res = SQDSolver(sampler, shots=100_000).solve(ham)
 ```
 
 `RuntimeSampler` resolves a backend from `QiskitRuntimeService` (an explicit
-`backend=`, else `least_busy`), transpiles the circuit to that backend's ISA with
-`optimization_level` (default **3**), and submits via `SamplerV2` — no other code
-changes. Note that a real device queues jobs, so a full SQD run can take a while.
+`backend=`, else `least_busy`), transpiles the circuits to that backend's ISA with
+`optimization_level` (default **3**), and submits them as a single `SamplerV2`
+job — no other code changes. Note that a real device queues jobs, so a full SQD
+run can take a while.
+
+To rehearse the hardware path offline, name a simulated device — it resolves
+locally and needs no credentials:
+
+```python
+sampler = RuntimeSampler(backend="FakeManilaV2")
+```
+
+**On real hardware, enable measurement twirling** — it is off by default:
+
+```python
+sampler = RuntimeSampler(options={"twirling": {"enable_measure": True}})
+```
+
+Readout error is what this pipeline is least tolerant of: a flipped bit changes a
+determinant's Hamming weight, so SQD postselects that shot away entirely. That
+wastes shot budget *and* biases the recovered subspace, moving the energy rather
+than just its variance.
 
 Quick smoke test that credentials + submission work (a 2-qubit Bell circuit, no
 SQD):
@@ -167,14 +186,55 @@ be driven the way real EmbASI runs — under `mpirun` (needs the `embed` extra f
 mpirun -n 2 uv run python scripts/embedding_workflow.py --solver sqd
 ```
 
-See [`docs/api-pins.md`](docs/api-pins.md) for the resolved third-party API
-surface (qiskit-addon-sqd, ffsim, qiskit-fermions, EmbASI).
-
 ## Ansatz
 
-The primary sampling ansatz is **SqDRIFT** (`circuits/sqdrift.py`, via
-`qiskit-fermions`); the LUCJ ansatz is currently on hold. See `docs/api-pins.md`
-for the SqDRIFT synthesis details and caveats.
+The primary sampling ansatz is **SqDRIFT** (`circuit_generator/sqdrift.py`, via
+`qiskit-fermions`); the LUCJ ansatz is currently on hold.
+
+`method="qdrift"` produces an *ensemble* of randomized circuits instead of one
+exact-evolution circuit. Each is sampled at `shots` and the counts are pooled, so
+the total budget is `num_randomizations * shots` — at a fixed budget this is
+substantially more accurate than a single circuit:
+
+```python
+res = SQDSolver(AerSampler(), shots=5_000, method="qdrift", num_randomizations=4).solve(ham)
+```
+
+Seeded generation is reproducible across processes: randomization `i` is drawn
+with seed `seed + i`, and the Hamiltonian's term groups are relabelled into a
+canonical order so a given seed always maps to the same physical group.
+
+## Package layout
+
+The quantum path is split into two packages, so either half can be swapped out
+independently:
+
+| package | role |
+| --- | --- |
+| `circuit_generator/` | integrals → fermionic operator → mapped circuit (`operator.py`, `sqdrift.py`, `hf.py`) |
+| `circuit_run/` | circuits → measured counts (`prep.py`, `backend.py`, `counts.py`, and the samplers) |
+
+The seam between them is deliberate: the generator emits *bare* evolution
+circuits, and `circuit_run.prep.resolve_initial_state` picks the reference
+determinant and prepends it at run time. Precedence is an explicit
+`initial_state_bitstring`, else Hartree-Fock from the active-space electron
+counts; a circuit that already carries its own reference state (flagged in
+`metadata["initial_state_included"]`) is left alone.
+
+```python
+# sample a chosen determinant instead of the HF reference — no circuit rebuild
+# N2 CAS(8o,10e) is 5 alpha + 5 beta; this is its HF determinant written out:
+res = SQDSolver(AerSampler(), initial_state_bitstring="0001111100011111").solve(ham)
+```
+
+**Bit order:** the string is MSB-left (matching `get_counts()`), so its *last*
+character is qubit 0. Since the alpha block sits on the low qubits, the **rightmost
+`n_orbitals` characters are alpha** and the leftmost are beta — mirrored from how
+the string reads. A `n_alpha == n_beta` case looks the same either way, so the
+asymmetric example is the one to reason from: for `n_orbitals=8` with 5 alpha and
+3 beta, the determinant is `"0000011100011111"` (alpha on qubits 0–4, beta on
+8–10). Cross-check against `hf_prep_circuit` if unsure — a swapped block silently
+populates the wrong spin sector, and SQD will then postselect every shot away.
 
 ## Development
 

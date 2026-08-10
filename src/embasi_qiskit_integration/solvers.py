@@ -87,14 +87,25 @@ def cheap_ccsd_t2(ham: EmbeddedHamiltonian) -> np.ndarray:
 class SQDSolver(ActiveSpaceSolver):
     """Sample-based Quantum Diagonalization solver.
 
-    Builds the SqDRIFT sampling ansatz for the active-space Hamiltonian,
-    samples bitstrings with the injected ``sampler``, and runs the SQD driver to
-    recover the ground-state energy and RDMs.
+    Runs the full quantum path for an active-space Hamiltonian:
 
-    The ``sampler`` follows the :class:`~embasi_qiskit_integration.sampling.base.
-    BitstringSampler` protocol. A ``MockSampler`` replays frozen counts and
-    ignores the circuit (deterministic CI); Aer/Runtime samplers run the
-    transpiled circuit.
+    1. build the SqDRIFT ansatz as *bare* evolution circuits
+       (:mod:`~embasi_qiskit_integration.circuit_generator.sqdrift`),
+    2. resolve and prepend the reference determinant
+       (:mod:`~embasi_qiskit_integration.circuit_run.prep`),
+    3. sample the batch with the injected ``sampler``,
+    4. pool the counts and hand them to the SQD driver for the energy and RDMs.
+
+    The ``sampler`` follows the :class:`~embasi_qiskit_integration.circuit_run.
+    base.BitstringSampler` protocol. A ``MockSampler`` replays frozen counts and
+    declares ``requires_circuit = False``, so no circuit is built at all
+    (deterministic CI without the qiskit-fermions dependency); Aer/Runtime
+    samplers run the real circuits.
+
+    With ``method="qdrift"`` the ansatz is an *ensemble*: ``num_randomizations``
+    circuits are each sampled at ``shots`` and their counts pooled, so the total
+    shot budget is ``num_randomizations * shots``. The default of 1 keeps a single
+    circuit, matching the exact-evolution path.
     """
 
     def __init__(
@@ -103,7 +114,10 @@ class SQDSolver(ActiveSpaceSolver):
         *,
         shots: int = 100_000,
         ansatz: str = "sqdrift",
+        method: str = "exact",
         evolution_time: float = 1.0,
+        num_randomizations: int = 1,
+        initial_state_bitstring: str | None = None,
         samples_per_batch: int = 300,
         num_batches: int = 5,
         max_iterations: int = 5,
@@ -112,17 +126,23 @@ class SQDSolver(ActiveSpaceSolver):
         self.sampler = sampler
         self.shots = shots
         self.ansatz = ansatz
+        self.method = method
         self.evolution_time = evolution_time
+        self.num_randomizations = num_randomizations
+        self.initial_state_bitstring = initial_state_bitstring
         self.samples_per_batch = samples_per_batch
         self.num_batches = num_batches
         self.max_iterations = max_iterations
         self.seed = seed
 
     def solve(self, ham: EmbeddedHamiltonian) -> SolverResult:
+        from embasi_qiskit_integration.circuit_run import merge_counts
         from embasi_qiskit_integration.sqd.driver import run_sqd
 
-        circuit = self._build_and_prepare_circuit(ham)
-        counts = self.sampler.sample(circuit, self.shots, seed=self.seed)
+        circuits = self.build_circuits(ham)
+        counts_list = self.sampler.run(circuits, self.shots, seed=self.seed)
+        # Pool the ensemble into the single empirical distribution SQD consumes.
+        counts = merge_counts(counts_list)
 
         res = run_sqd(
             ham,
@@ -135,6 +155,8 @@ class SQDSolver(ActiveSpaceSolver):
         res.diagnostics.update(
             shots=self.shots,
             ansatz=self.ansatz,
+            method=self.method,
+            n_circuits=len(circuits),
             sampler=type(self.sampler).__name__,
             versions=collect_versions(),
             seed=self.seed,
@@ -142,14 +164,18 @@ class SQDSolver(ActiveSpaceSolver):
         )
         return res
 
-    def _build_and_prepare_circuit(self, ham: EmbeddedHamiltonian):
-        """Build the ansatz circuit, transpiled for a real sampler.
+    def build_circuits(self, ham: EmbeddedHamiltonian) -> list:
+        """Build the sampling circuits: bare ansatz + resolved initial state.
 
-        Returns ``None`` for a MockSampler (which ignores the circuit), avoiding
-        the qiskit-fermions dependency in pure-CI test runs.
+        Public so a caller can inspect, transpile or sample the exact circuits
+        :meth:`solve` would use without re-deriving them.
+
+        A sampler that declares ``requires_circuit = False`` (``MockSampler``)
+        gets a single ``None`` placeholder instead, so pure-replay runs never
+        import qiskit-fermions.
         """
-        if type(self.sampler).__name__ == "MockSampler":
-            return None
+        if not getattr(self.sampler, "requires_circuit", True):
+            return [None]
 
         if self.ansatz != "sqdrift":
             raise ValueError(
@@ -159,10 +185,38 @@ class SQDSolver(ActiveSpaceSolver):
         from qiskit import transpile
         from qiskit_aer import AerSimulator
 
-        from embasi_qiskit_integration.circuits.sqdrift import build_sqdrift_circuits
-
-        circuits = build_sqdrift_circuits(
-            ham, method="exact", time=self.evolution_time, seed=self.seed
+        from embasi_qiskit_integration.circuit_generator.sqdrift import build_sqdrift_circuits
+        from embasi_qiskit_integration.circuit_run.prep import (
+            compose_full_circuit,
+            resolve_initial_state,
         )
-        # Decompose the opaque fermionic gates so any statevector backend runs it.
-        return transpile(circuits[0], AerSimulator(), optimization_level=0)
+
+        # Bare evolution circuits: the reference determinant is chosen here, at
+        # run time, rather than baked in by the generator.
+        cores = build_sqdrift_circuits(
+            ham,
+            method=self.method,
+            time=self.evolution_time,
+            num_randomizations=self.num_randomizations,
+            seed=self.seed,
+            measure=False,
+            include_initial_state=False,
+        )
+
+        na, nb = ham.nelec
+        full = [
+            compose_full_circuit(
+                resolve_initial_state(
+                    num_qubits=core.num_qubits,
+                    initial_state_bitstring=self.initial_state_bitstring,
+                    n_alpha=na,
+                    n_beta=nb,
+                    n_orbitals=ham.norb,
+                    core=core,
+                ),
+                core,
+            )
+            for core in cores
+        ]
+        # Decompose the opaque fermionic gates so any statevector backend runs them.
+        return list(transpile(full, AerSimulator(), optimization_level=0))

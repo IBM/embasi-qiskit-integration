@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from embasi_qiskit_integration.hamiltonian import fcidump
-from embasi_qiskit_integration.sampling.base import MockSampler
+from embasi_qiskit_integration.circuit_run.base import MockSampler
 from embasi_qiskit_integration.sqd.driver import run_sqd
 
 

@@ -37,6 +37,9 @@ class SolveCommand(BaseSettings):
 
     directory: CliPositionalArg[str]
     solver: Literal["sqd", "fci"] = "sqd"
+    # Spelled out rather than importing circuit_run.SamplerKind: that package pulls
+    # in qiskit, which would more than double CLI startup (141ms -> 318ms measured)
+    # for a three-element alias. Keep in sync with circuit_run.base.SamplerKind.
     sampler: Literal["aer", "mock", "runtime"] = "aer"
     counts: str | None = None
     backend: str | None = None  # runtime backend name; else least-busy
@@ -87,27 +90,25 @@ class SolveCommand(BaseSettings):
         return SQDSolver(self._build_sampler(), shots=self.shots, seed=self.seed)
 
     def _build_sampler(self):
-        if self.sampler == "mock":
-            if not self.counts:
-                raise SystemExit("--sampler mock requires --counts <path>")
-            from embasi_qiskit_integration.sampling.base import MockSampler
+        """Construct the requested sampler via the shared dispatch.
 
-            return MockSampler(self.counts)
-        if self.sampler == "aer":
-            from embasi_qiskit_integration.sampling.aer import AerSampler
+        ``runtime`` uses configured IBM Quantum credentials and the least-busy
+        backend unless ``--backend`` names one. Dispatch errors are re-raised as
+        ``SystemExit`` so the CLI reports them as usage errors rather than a
+        traceback.
+        """
+        from embasi_qiskit_integration.circuit_run import build_sampler
 
-            return AerSampler()
-        if self.sampler == "runtime":
-            from embasi_qiskit_integration.sampling.runtime import RuntimeSampler
-
-            # Uses configured IBM Quantum credentials; least-busy backend unless
-            # --backend names one.
-            return RuntimeSampler(
+        try:
+            return build_sampler(
+                self.sampler,
+                counts=self.counts,
                 backend=self.backend,
                 optimization_level=self.optimization_level,
                 default_shots=self.shots,
             )
-        raise SystemExit(f"unknown sampler {self.sampler!r}")
+        except ValueError as exc:
+            raise SystemExit(f"--sampler {self.sampler!r}: {exc}") from exc
 
 
 class Cli(BaseSettings):

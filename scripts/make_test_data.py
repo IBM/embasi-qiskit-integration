@@ -111,13 +111,10 @@ class MakeTestData(BaseSettings):
 
     def _maybe_write_mock_counts(self, ham: EmbeddedHamiltonian) -> None:
         try:
-            from qiskit import transpile
-            from qiskit_aer import AerSimulator
-
-            from embasi_qiskit_integration.circuits.sqdrift import (
-                build_sqdrift_circuits,
-                sqdrift_available,
-            )
+            from embasi_qiskit_integration.circuit_generator.sqdrift import sqdrift_available
+            from embasi_qiskit_integration.circuit_run import merge_counts
+            from embasi_qiskit_integration.circuit_run.aer import AerSampler
+            from embasi_qiskit_integration.solvers import SQDSolver
         except ImportError as exc:
             print(f"Skipping mock_counts.json (quantum extras missing: {exc})")
             return
@@ -126,15 +123,21 @@ class MakeTestData(BaseSettings):
             print("Skipping mock_counts.json (qiskit-fermions not installed)")
             return
 
-        circuits = build_sqdrift_circuits(ham, method="exact", time=self.mock_counts_evolution_time)
-        sim = AerSimulator()
-        tqc = transpile(circuits[0], sim, optimization_level=0)
-        counts = (
-            sim.run(tqc, shots=self.mock_counts_shots, seed_simulator=self.mock_counts_aer_seed)
-            .result()
-            .get_counts()
+        # Generate through the same build -> prep -> sample path the solver uses,
+        # so the frozen fixture's provenance is the real pipeline.
+        solver = SQDSolver(
+            AerSampler(),
+            shots=self.mock_counts_shots,
+            evolution_time=self.mock_counts_evolution_time,
+            seed=self.mock_counts_aer_seed,
         )
-        counts = {k: int(v) for k, v in counts.items()}
+        counts = merge_counts(
+            solver.sampler.run(
+                solver.build_circuits(ham),
+                self.mock_counts_shots,
+                seed=self.mock_counts_aer_seed,
+            )
+        )
 
         path = self.data_dir / "mock_counts.json"
         with path.open("w") as fh:
