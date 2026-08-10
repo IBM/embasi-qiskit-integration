@@ -201,9 +201,6 @@ canonical order so a given seed always maps to the same physical group.
 
 ## Package layout
 
-[`docs/pipeline.html`](docs/pipeline.html) diagrams the whole flow — integrals →
-circuits → counts → energy — with usage snippets for each entry point.
-
 The quantum path is split into two packages, so either half can be swapped out
 independently:
 
