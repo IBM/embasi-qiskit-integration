@@ -60,10 +60,10 @@ def test_orthonormal_basis_ranks_virtuals_by_fragment_population():
 
     # Occupied block is always kept, in order.
     assert list(active[:n_occ]) == [0, 1]
-    # The first gap >= 0.1 from the top is w2->w3 (0.36) -- wait, that's the
-    # top pair; the ladder is 1.00, 0.64, 0.04, 0.00, so gaps are 0.36, 0.60,
-    # 0.04.  First gap >= gap_tol is after index 0 (0.36), keeping just v2.
-    assert set(active[n_occ:]) == {2}
+    # The ladder is 1.00, 0.64, 0.04, 0.00, so gaps are 0.36, 0.60, 0.04.  The
+    # *largest* gap >= gap_tol is after index 1 (0.60), so the tight shell is
+    # v2 and v3 (the first-gap rule would have kept just v2).
+    assert set(active[n_occ:]) == {2, 3}
 
 
 def test_gap_cut_keeps_the_tight_shell():

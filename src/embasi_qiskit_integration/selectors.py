@@ -44,11 +44,13 @@ def concentric_selector(
         fragment_ao: AO indices belonging to the active fragment atoms.  These
             define the concentric reference the virtuals are ranked against.
         gap_tol: minimum ``w_i - w_{i+1}`` (in fragment-population units) that
-            counts as a shell boundary.  The cut is taken at the *first* gap from
-            the top that exceeds this, so tightly-coupled virtuals are kept and
-            the long tail of fragment-orthogonal virtuals is dropped.  If no gap
-            exceeds ``gap_tol`` every virtual is kept (the selector refuses to
-            truncate on noise).
+            counts as a shell boundary.  The cut is taken at the *largest* gap
+            (among those exceeding this) from the top, so the whole tightly-
+            coupled shell is kept and the long tail of fragment-orthogonal
+            virtuals is dropped.  Cutting at the first qualifying gap instead
+            would slice off after the leading virtual whenever the top shell has
+            any internal jitter above ``gap_tol``.  If no gap exceeds ``gap_tol``
+            every virtual is kept (the selector refuses to truncate on noise).
         max_virtual: hard cap on the number of virtuals kept, applied after the
             gap cut (a solver-budget ceiling).  ``None`` for no cap.
         min_virtual: keep at least this many virtuals even if the first gap comes
@@ -77,12 +79,17 @@ def concentric_selector(
         w_sorted = w[order]
 
         # Largest gap from the top that clears the tolerance sets the shell edge.
+        # Cutting at the *first* qualifying gap slices off after the top virtual
+        # whenever the leading shell has any internal jitter above gap_tol (a
+        # dense shell of near-degenerate fragment weights), silently discarding
+        # the rest of that shell; the *largest* gap is the true shell boundary.
         gaps = w_sorted[:-1] - w_sorted[1:]
         keep = n_virt  # default: keep everything
         significant = np.nonzero(gaps >= gap_tol)[0]
         if significant.size:
             # +1: a gap after index i keeps virtuals 0..i inclusive.
-            keep = int(significant[0]) + 1
+            edge = int(significant[np.argmax(gaps[significant])])
+            keep = edge + 1
 
         keep = max(keep, min_virtual)
         if max_virtual is not None:
