@@ -49,6 +49,12 @@ def run_sqd(
 
     norb = ham.norb
     num_bits = 2 * norb
+    if not counts:
+        raise ValueError(
+            "counts is empty; SQD has nothing to diagonalize. Check that the "
+            "sampler actually ran (an empty circuit list yields no counts) and "
+            "that the circuits carry measurements."
+        )
     bit_array = BitArray.from_counts(counts, num_bits=num_bits)
 
     iteration_energies: list[float] = []

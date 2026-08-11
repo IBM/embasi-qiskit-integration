@@ -75,3 +75,49 @@ def test_result_written_atomically(tmp_path, n2_ham):
     back = ipc.read_result(tmp_path)
     assert back.energy == -1.0
     assert back.diagnostics["x"] == 1
+
+
+def test_documented_cli_flags_are_accepted(tmp_path):
+    """Every flag the README shows must actually parse.
+
+    pydantic-settings derives flag names verbatim from the field names, so they use
+    *underscores* -- ``--optimization_level``, not ``--optimization-level``. The
+    hyphenated spelling is rejected with exit code 2, and the README had shipped
+    exactly that for ``--optimization-level``. This pins the real spellings so the
+    docs and the parser cannot drift apart again.
+
+    Exit code 1 is the pass condition: parsing succeeded and the run then failed on
+    the empty job directory. Exit 2 means the parser rejected the flag.
+    """
+    from embasi_qiskit_integration.cli import main
+
+    base = ["solve", str(tmp_path), "--sampler", "mock", "--counts", "tests/data/mock_counts.json"]
+    documented = [
+        ["--optimization_level", "3"],
+        ["--measure_twirling", "false"],
+        ["--dynamical_decoupling", "true"],
+        ["--sampler_options", '{"twirling": {"num_randomizations": 64}}'],
+        ["--optimize", "false"],
+        ["--time_limit", "5.0"],
+        ["--workers", "0"],
+        ["--shots", "1000"],
+        ["--seed", "24"],
+        ["--enable_readout_characterisation", "false"],
+        ["--readout_error_threshold", "0.03"],
+    ]
+    for extra in documented:
+        assert main(base + extra) == 1, f"{extra[0]} was not accepted by the parser"
+
+
+def test_hyphenated_flag_spelling_is_rejected(tmp_path):
+    """Guards the assumption behind the test above: hyphens really do not work.
+
+    If pydantic-settings ever starts accepting both spellings this fails, and the
+    README could then use whichever reads better.
+    """
+    import pytest
+
+    from embasi_qiskit_integration.cli import main
+
+    with pytest.raises(SystemExit):
+        main(["solve", str(tmp_path), "--optimization-level", "3"])
