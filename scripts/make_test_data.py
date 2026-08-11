@@ -14,7 +14,7 @@ Configured via ``pydantic-settings`` — every knob is a CLI flag (and an
 committed data::
 
     python scripts/make_test_data.py
-    python scripts/make_test_data.py --bond-length 1.20 --ncas 6 --nelecas 6 \
+    python scripts/make_test_data.py --bond_length 1.20 --ncas 6 --nelecas 6 \
         --stem n2_6o6e
 """
 

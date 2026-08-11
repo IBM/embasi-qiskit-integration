@@ -5,7 +5,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
+
+# Two-qubit basis gates tried in order when reading per-edge gate errors; the
+# first one the target exposes wins (IBM devices differ across generations).
+_TWO_QUBIT_GATE_CANDIDATES: tuple[str, ...] = ("ecr", "cz", "cx")
 
 
 def require_runtime(what: str = "Backend resolution") -> None:
@@ -116,6 +121,160 @@ def prepare_isa(
     )
     # ``PassManager.run`` accepts a list and preserves order.
     return list(pass_manager.run(circuits))
+
+
+def build_pinned_pass_manager(
+    backend: Any, coupling_map: Any, initial_layout: Sequence[int]
+) -> Any:
+    """Build a pass manager pinned to ``initial_layout`` over a pruned coupling map.
+
+    This is the transpile half of noise-aware layout selection: once
+    :mod:`.characterisation` has measured the device and picked a chain, the
+    circuits must be placed on *that* chain rather than wherever the default layout
+    passes would put them.
+
+    Passes ``target=backend.target`` rather than ``backend=``. Supplying ``backend``
+    together with ``coupling_map`` makes qiskit emit a ``UserWarning`` and discard
+    the backend's gate durations and error rates; the target carries those while the
+    pruned coupling map still restricts routing, so both survive warning-free.
+
+    The post-optimization stage is replaced to match the reference:
+
+    - ``FoldRzzAngle`` is a *correctness* requirement, not an optimization, on
+      backends exposing fractional ``rzz``: the IBM ISA only accepts
+      ``Rzz(theta)`` for ``theta`` in ``[0, pi/2]``, and an out-of-range angle is
+      rejected at submission.
+    - ``Optimize1qGatesDecomposition`` and ``RemoveIdentityEquivalent`` then clean
+      up what folding leaves behind.
+    """
+    from qiskit.transpiler import PassManager
+    from qiskit.transpiler.passes import (
+        Optimize1qGatesDecomposition,
+        RemoveIdentityEquivalent,
+    )
+    from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+    from qiskit_ibm_runtime.transpiler.passes import FoldRzzAngle
+
+    target = getattr(backend, "target", None)
+    pass_manager = generate_preset_pass_manager(
+        target=target,
+        coupling_map=coupling_map,
+        initial_layout=list(initial_layout),
+    )
+    pass_manager.post_optimization = PassManager(
+        [
+            FoldRzzAngle(),
+            Optimize1qGatesDecomposition(target=target),
+            RemoveIdentityEquivalent(target=target),
+        ]
+    )
+    return pass_manager
+
+
+def read_noise_from_backend(backend: Any) -> dict[str, Any]:
+    """Extract per-qubit readout errors and per-edge 2q gate errors from ``backend``.
+
+    Values come back as plain dicts keyed by ``int`` qubit index or ``"u-v"`` edge
+    string, so the result is JSON-serialisable alongside the counts. A missing value
+    is *absent* rather than ``None``, so consumers never have to distinguish
+    "unknown" from "known but null".
+
+    This is the backend's *reported* calibration, which is what makes it cheap (no
+    job) but also potentially hours stale -- :mod:`.characterisation` measures the
+    same quantity live. Recorded either way as provenance for the run.
+    """
+    readout_error: dict[int, float] = {}
+    p01: dict[int, float] = {}
+    p10: dict[int, float] = {}
+    two_qubit_errors: dict[str, float] = {}
+    two_qubit_gate: str | None = None
+
+    properties = None
+    get_properties = getattr(backend, "properties", None)
+    if callable(get_properties):
+        try:
+            properties = get_properties()
+        except Exception:  # noqa: BLE001 - some fakes raise; fall back to empty
+            properties = None
+
+    if properties is not None:
+        n_qubits = getattr(backend, "num_qubits", None) or len(
+            getattr(properties, "qubits", []) or []
+        )
+        for qubit in range(n_qubits):
+            # Each of the three is read independently: a device may report the
+            # aggregate readout_error without the directional p01/p10 pair.
+            try:
+                readout_error[qubit] = float(properties.readout_error(qubit))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                p01[qubit] = float(properties.qubit_property(qubit, "prob_meas1_prep0")[0])
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                p10[qubit] = float(properties.qubit_property(qubit, "prob_meas0_prep1")[0])
+            except Exception:  # noqa: BLE001
+                pass
+
+    target = getattr(backend, "target", None)
+    if target is not None:
+        for name in _TWO_QUBIT_GATE_CANDIDATES:
+            if name in target.operation_names:
+                two_qubit_gate = name
+                try:
+                    for qargs, instruction_properties in target[name].items():
+                        if instruction_properties is None or instruction_properties.error is None:
+                            continue
+                        if len(qargs) != 2:
+                            continue
+                        u, v = int(qargs[0]), int(qargs[1])
+                        two_qubit_errors[f"{u}-{v}"] = float(instruction_properties.error)
+                except Exception:  # noqa: BLE001
+                    pass
+                break
+
+    return {
+        "readout_error": readout_error,
+        "p01": p01,
+        "p10": p10,
+        "two_qubit_gate": two_qubit_gate,
+        "two_qubit_errors": two_qubit_errors,
+    }
+
+
+def virtual_to_physical(transpiled_circuit: Any) -> dict[int, int]:
+    """Return a transpiled circuit's virtual-to-physical qubit mapping.
+
+    Note this is *not* needed to interpret sampled bitstrings: ``SamplerV2`` returns
+    counts in virtual/classical-bit order, so column ``i`` is virtual qubit ``i``
+    whatever the physical placement. Its use is keying per-qubit hardware noise data
+    back to the physical qubits the circuit actually ran on.
+    """
+    layout = getattr(transpiled_circuit, "layout", None)
+    if layout is None:
+        return {}
+    virtual_layout = layout.final_virtual_layout()
+    return {int(v._index): int(p) for v, p in virtual_layout.get_virtual_bits().items()}
+
+
+def edges_along_layout(layout_map: dict[int, int], noise: dict[str, Any]) -> dict[str, float]:
+    """Restrict ``noise['two_qubit_errors']`` to edges whose both ends are on the layout.
+
+    Args:
+        layout_map: virtual-to-physical mapping from :func:`virtual_to_physical`.
+        noise: the dict returned by :func:`read_noise_from_backend`.
+    """
+    physical = set(layout_map.values())
+    selected: dict[str, float] = {}
+    for key, value in (noise.get("two_qubit_errors") or {}).items():
+        u_str, _, v_str = key.partition("-")
+        if not v_str:
+            continue
+        u, v = int(u_str), int(v_str)
+        if u in physical and v in physical:
+            selected[key] = value
+    return selected
 
 
 def _is_fake_provider_name(backend_name: str) -> bool:

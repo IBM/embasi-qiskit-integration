@@ -89,3 +89,56 @@ def test_no_spurious_symmetry_warning(rng):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         EmbeddedHamiltonian(h1=h1, h2=h2, e_core=0.0, nelec=(2, 2))
+
+
+# ----- particle-number check on a solver result ------------------------------- #
+
+
+def _diagonal_result(occupations: list[float]) -> SolverResult:
+    """A ``SolverResult`` whose rdm1 has the given orbital occupations."""
+    return SolverResult(energy=-1.0, rdm1=np.diag(occupations))
+
+
+def test_check_particle_number_accepts_a_consistent_rdm():
+    """A correct RDM passes and reports its (tiny) deviation."""
+    result = _diagonal_result([2.0, 2.0, 1.0])
+    assert result.check_particle_number((3, 2)) == pytest.approx(0.0)
+    # The total may be given directly instead of as a spin pair.
+    assert result.check_particle_number(5) == pytest.approx(0.0)
+
+
+def test_check_particle_number_rejects_the_wrong_sector():
+    """A whole-electron discrepancy must raise, not pass quietly.
+
+    The trace of a spin-summed 1-RDM *is* the particle number, so this catches a
+    solver that returned an RDM for a different sector than the Hamiltonian
+    describes. It matters because the RDM is fed back into the next embedding
+    cycle's density, so an unchecked error propagates while the printed energies
+    still look plausible.
+    """
+    result = _diagonal_result([2.0, 2.0, 1.0])  # 5 electrons
+    with pytest.raises(ValueError, match="wrong particle-number sector"):
+        result.check_particle_number((3, 3))  # expected 6
+
+    # The message quantifies the miss, so a log is enough to diagnose it.
+    with pytest.raises(ValueError, match=r"off by \+?-1"):
+        result.check_particle_number(6)
+
+
+def test_check_particle_number_tolerance_is_configurable():
+    """``atol`` admits noise but not a whole electron at the default."""
+    result = _diagonal_result([2.0, 2.0, 0.999_999_9])
+    # Within the default tolerance.
+    assert abs(result.check_particle_number(5)) < 1e-6
+    # A deliberately loose tolerance accepts a real discrepancy...
+    off = _diagonal_result([2.0, 2.0, 0.5])
+    assert off.check_particle_number(5, atol=1.0) == pytest.approx(-0.5)
+    # ...but the default does not.
+    with pytest.raises(ValueError):
+        off.check_particle_number(5)
+
+
+def test_check_particle_number_rejects_a_non_square_rdm():
+    result = SolverResult(energy=-1.0, rdm1=np.zeros((2, 3)))
+    with pytest.raises(ValueError, match="square"):
+        result.check_particle_number(2)

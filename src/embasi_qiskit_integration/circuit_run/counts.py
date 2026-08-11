@@ -10,7 +10,10 @@ from itertools import product
 from typing import Any
 
 # Classical-register names tried in order. ``measure_all()`` emits ``meas``;
-# ``measure_active()`` and hand-built circuits commonly use ``c``/``c0``.
+# ``measure_active()`` and hand-built circuits commonly use ``c``/``c0``. A circuit
+# naming its register anything else still works via the single-register fallback in
+# :func:`find_meas_bitarray` -- this list only decides which name wins when a
+# ``DataBin`` carries several.
 _CLASSICAL_REGISTER_CANDIDATES = ("meas", "c", "c0")
 
 

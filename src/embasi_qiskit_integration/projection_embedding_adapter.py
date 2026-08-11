@@ -626,6 +626,13 @@ class ProjectionEmbeddingAdapter:
             # Δσ_i^2 = σ_i^2 - σ_{i+1}^2, exactly as the paper picks the occupied
             # A space, making n_virtual inferable up to a tolerance.
             active = np.asarray(selector(c, eps, n_occ), dtype=int)
+            if n_frozen_occ:
+                active = active[active >= n_frozen_occ]
+                if active.size == 0:
+                    raise ValueError(
+                        f"n_frozen_occ={n_frozen_occ} froze every orbital the selector "
+                        "kept, leaving an empty active space"
+                    )
         else:
             active = np.arange(n_frozen_occ, n_occ + n_virt)
 

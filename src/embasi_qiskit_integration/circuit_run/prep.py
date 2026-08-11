@@ -112,20 +112,31 @@ def resolve_initial_state(
 
     Args:
         num_qubits: width of the core circuit the prep will be composed with.
-        initial_state_bitstring: explicit determinant, MSB-left.
+        initial_state_bitstring: explicit determinant, MSB-left. Assumed to be
+            expressed in the core's own (possibly permuted) mode order -- it is
+            applied verbatim, *not* mapped through ``permutation``.
         n_alpha: alpha electrons (HF fallback).
         n_beta: beta electrons (HF fallback).
         n_orbitals: spatial orbitals (HF fallback); ``2 * n_orbitals`` must equal
             ``num_qubits``.
         permutation: optional mode relabeling, forwarded to
-            :func:`hf_prep_circuit`.
-        core: the core circuit, consulted only for its metadata flag.
+            :func:`hf_prep_circuit`. When omitted it is taken from
+            ``core.metadata["permutation"]``, so a relabeled core automatically
+            gets the matching reference state; pass a value explicitly to override,
+            or ``[0, 1, ..., num_qubits - 1]`` to force the identity.
+        core: the core circuit, consulted for its metadata (the
+            ``initial_state_included`` flag and the mode ``permutation``).
 
     Raises:
         ValueError: if the bitstring length disagrees with ``num_qubits``, or if
             no source yields a prep circuit.
     """
-    if core is not None and bool((core.metadata or {}).get("initial_state_included")):
+    core_metadata = (core.metadata or {}) if core is not None else {}
+
+    if permutation is None:
+        permutation = core_metadata.get("permutation")
+
+    if bool(core_metadata.get("initial_state_included")):
         # Prepending anything here would double-apply the reference state.
         if initial_state_bitstring is not None:
             # Warn rather than silently sample a different determinant than asked:
@@ -159,14 +170,24 @@ def resolve_initial_state(
 
 
 def compose_full_circuit(
-    prep: QuantumCircuit, core: QuantumCircuit, add_measure_all: bool = True
+    prep: QuantumCircuit, core: QuantumCircuit, measure: bool = True
 ) -> QuantumCircuit:
     """Compose ``prep`` then ``core`` on a fresh register, optionally measuring.
 
+    ``measure`` defaults to True because the measurement is expected to be
+    added *here* rather than by the generator: a caller composing a core must have
+    built it with ``build_sqdrift_circuits(measure=False)`` (which is what
+    :class:`~embasi_qiskit_integration.solvers.SQDSolver` does). Composing an
+    already-measured core without passing ``measure=False`` would append a
+    second ``measure_all()``.
+
     Args:
         prep: the initial-state circuit (from :func:`resolve_initial_state`).
-        core: the ansatz/evolution circuit; its width must match ``prep``'s.
-        add_measure_all: append ``measure_all()`` to the composed circuit.
+        core: the ansatz/evolution circuit; its width must match ``prep``'s. Expected
+            to be unmeasured -- see above.
+        measure: append ``measure_all()`` to the composed circuit. Named to match
+            ``build_sqdrift_circuits(measure=...)``, which controls the same choice
+            at generation time.
 
     Raises:
         ValueError: if ``prep`` and ``core`` have different widths.
@@ -178,6 +199,6 @@ def compose_full_circuit(
     full = QuantumCircuit(core.num_qubits, name=core.name or "full")
     full.compose(prep, inplace=True)
     full.compose(core, inplace=True)
-    if add_measure_all:
+    if measure:
         full.measure_all()
     return full

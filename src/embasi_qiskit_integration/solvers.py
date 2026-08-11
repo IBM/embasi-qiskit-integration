@@ -15,6 +15,10 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 from embasi_qiskit_integration._versions import collect_versions
+
+# Only probes importability (find_spec) -- pulls in neither pyomo nor
+# qiskit-fermions, so the classical/mock paths stay dependency-free.
+from embasi_qiskit_integration.circuit_generator.relabel import relabel_available
 from embasi_qiskit_integration.contract import EmbeddedHamiltonian, SolverResult
 
 
@@ -106,6 +110,13 @@ class SQDSolver(ActiveSpaceSolver):
     circuits are each sampled at ``shots`` and their counts pooled, so the total
     shot budget is ``num_randomizations * shots``. The default of 1 keeps a single
     circuit, matching the exact-evolution path.
+
+    ``optimize`` (default True) lets the generator
+    relabel the fermionic modes to shorten each circuit. That makes every circuit
+    sample in its *own* permuted mode order, which this class handles end to end:
+    the reference determinant is prepared in the permuted order, and each
+    circuit's counts are mapped back to the original order *before* the ensemble
+    is pooled. ``workers`` shards circuit construction across processes.
     """
 
     def __init__(
@@ -123,6 +134,9 @@ class SQDSolver(ActiveSpaceSolver):
         num_batches: int = 5,
         max_iterations: int = 5,
         seed: int | None = None,
+        optimize: bool | None = None,
+        time_limit: float = 10.0,
+        workers: int = 1,
     ):
         self.sampler = sampler
         self.shots = shots
@@ -136,13 +150,20 @@ class SQDSolver(ActiveSpaceSolver):
         self.num_batches = num_batches
         self.max_iterations = max_iterations
         self.seed = seed
+        self.optimize = relabel_available() if optimize is None else optimize
+        self.time_limit = time_limit
+        self.workers = workers
+        self._permutations: list[list[int] | None] = []
 
     def solve(self, ham: EmbeddedHamiltonian) -> SolverResult:
-        from embasi_qiskit_integration.circuit_run import merge_counts
+        from embasi_qiskit_integration.circuit_run import merge_counts, unpermute_counts_list
         from embasi_qiskit_integration.sqd.driver import run_sqd
 
         circuits = self.build_circuits(ham)
         counts_list = self.sampler.run(circuits, self.shots, seed=self.seed)
+
+        # Undo each circuit's mode relabeling BEFORE pooling
+        counts_list = unpermute_counts_list(counts_list, self._permutations)
         # Pool the ensemble into the single empirical distribution SQD consumes.
         counts = merge_counts(counts_list)
 
@@ -163,6 +184,9 @@ class SQDSolver(ActiveSpaceSolver):
             versions=collect_versions(),
             seed=self.seed,
             fcidump_sha=ham.meta.get("sha"),
+            optimize=self.optimize,
+            n_permuted=sum(1 for p in self._permutations if p is not None),
+            workers=self.workers,
         )
         return res
 
@@ -172,11 +196,16 @@ class SQDSolver(ActiveSpaceSolver):
         Public so a caller can inspect, transpile or sample the exact circuits
         :meth:`solve` would use without re-deriving them.
 
+        Also records each circuit's mode permutation in ``self._permutations`` so
+        :meth:`solve` can undo the relabeling on the sampled counts.
+
         A sampler that declares ``requires_circuit = False`` (``MockSampler``)
         gets a single ``None`` placeholder instead, so pure-replay runs never
         import qiskit-fermions.
         """
         if not getattr(self.sampler, "requires_circuit", True):
+            # Replayed counts are already in the original mode order.
+            self._permutations = [None]
             return [None]
 
         if self.ansatz != "sqdrift":
@@ -198,7 +227,7 @@ class SQDSolver(ActiveSpaceSolver):
         # Every sweep axis is pinned to a single value here: a solver call wants a
         # definite ensemble size (num_randomizations), not the generator's default
         # time x num_groups sweep, which would build thousands of circuits per solve.
-        cores = build_sqdrift_circuits(
+        result = build_sqdrift_circuits(
             ham,
             method=self.method,
             time=self.evolution_time,
@@ -207,9 +236,23 @@ class SQDSolver(ActiveSpaceSolver):
             seed=self.seed,
             measure=False,
             include_initial_state=False,
+            optimize=self.optimize,
+            time_limit=self.time_limit,
+            workers=self.workers,
         )
+        self._permutations = list(result.permutations)
+
+        if self.initial_state_bitstring is not None and result.any_permuted:
+            raise ValueError(
+                "initial_state_bitstring cannot be combined with optimize=True: the "
+                "relabeled circuits sample in a permuted mode order, so the explicit "
+                "determinant would be applied to the wrong modes. Pass optimize=False "
+                "to keep the original mode order, or leave initial_state_bitstring "
+                "unset to use the Hartree-Fock reference (which is permuted to match)."
+            )
 
         na, nb = ham.nelec
+
         full = [
             compose_full_circuit(
                 resolve_initial_state(
@@ -222,7 +265,7 @@ class SQDSolver(ActiveSpaceSolver):
                 ),
                 core,
             )
-            for core in cores
+            for core in result.circuits
         ]
         # Decompose the opaque fermionic gates so any statevector backend runs them.
         return list(transpile(full, AerSimulator(), optimization_level=0))

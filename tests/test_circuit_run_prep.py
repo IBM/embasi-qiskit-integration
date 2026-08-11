@@ -183,7 +183,7 @@ def test_compose_applies_prep_before_core():
     prep = bitstring_prep_circuit("01")
     core = QuantumCircuit(2)
     core.h(1)
-    full = compose_full_circuit(prep, core, add_measure_all=False)
+    full = compose_full_circuit(prep, core, measure=False)
     names = [instruction.operation.name for instruction in full.data]
     assert names == ["x", "h"]
 
@@ -195,10 +195,59 @@ def test_compose_adds_measure_all_by_default():
 
 
 def test_compose_can_skip_measurement():
-    full = compose_full_circuit(QuantumCircuit(2), QuantumCircuit(2), add_measure_all=False)
+    full = compose_full_circuit(QuantumCircuit(2), QuantumCircuit(2), measure=False)
     assert full.num_clbits == 0
 
 
 def test_compose_rejects_width_mismatch():
     with pytest.raises(ValueError, match="must match"):
         compose_full_circuit(QuantumCircuit(2), QuantumCircuit(3))
+
+
+def test_permutation_is_read_from_core_metadata():
+    """A relabeled core must get its reference determinant in the permuted order.
+
+    The generator records the applied permutation on the circuit, so a caller that
+    does not know the core was optimized still gets a matching prep -- forgetting it
+    would prepare the determinant on the wrong modes.
+    """
+    permutation = [3, 0, 5, 1, 4, 2]
+    core = QuantumCircuit(6)
+    core.metadata = {"initial_state_included": False, "permutation": permutation}
+
+    from_metadata = resolve_initial_state(
+        num_qubits=6, n_alpha=1, n_beta=1, n_orbitals=3, core=core
+    )
+    explicit = hf_prep_circuit(6, 3, 1, 1, permutation=permutation)
+    unpermuted = hf_prep_circuit(6, 3, 1, 1)
+
+    assert _x_qubits(from_metadata) == _x_qubits(explicit)
+    # And it genuinely differs from the unpermuted prep, so the test has teeth.
+    assert _x_qubits(from_metadata) != _x_qubits(unpermuted)
+
+
+def test_explicit_permutation_overrides_core_metadata():
+    """An explicitly passed permutation wins over the circuit's recorded one."""
+    core = QuantumCircuit(6)
+    core.metadata = {"permutation": [3, 0, 5, 1, 4, 2]}
+
+    identity = resolve_initial_state(
+        num_qubits=6,
+        n_alpha=1,
+        n_beta=1,
+        n_orbitals=3,
+        core=core,
+        permutation=[0, 1, 2, 3, 4, 5],
+    )
+
+    assert _x_qubits(identity) == _x_qubits(hf_prep_circuit(6, 3, 1, 1))
+
+
+def test_core_without_permutation_metadata_is_unpermuted():
+    """An unrelabeled core (permutation None) must get the plain HF prep."""
+    core = QuantumCircuit(6)
+    core.metadata = {"initial_state_included": False, "permutation": None}
+
+    resolved = resolve_initial_state(num_qubits=6, n_alpha=1, n_beta=1, n_orbitals=3, core=core)
+
+    assert _x_qubits(resolved) == _x_qubits(hf_prep_circuit(6, 3, 1, 1))

@@ -10,7 +10,11 @@ once, or the ``QISKIT_IBM_TOKEN`` env var).
 
 from __future__ import annotations
 
+import logging
+
 from embasi_qiskit_integration.circuit_run.base import SamplerMixin
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeSampler(SamplerMixin):
@@ -28,6 +32,18 @@ class RuntimeSampler(SamplerMixin):
             (0-3; default 3, the most aggressive optimization).
         default_shots: shot budget when ``sample`` is called without ``shots``.
         options: ``SamplerOptions`` (or dict) forwarded to ``SamplerV2``.
+        enable_readout_characterisation: measure the device's per-qubit readout
+            error before submitting and pin the best 1-D chain, instead of letting
+            the transpiler place the circuit against the backend's reported
+            calibration (see :mod:`.characterisation` and :mod:`.layout`). Costs one
+            extra short job. Off by default, and refused on a simulated backend,
+            whose "measured" error is only its configured noise model.
+        readout_error_threshold: readout-error ceiling for a usable qubit; relaxed
+            automatically when pruning at it leaves no chain wide enough.
+        n_rand_twirl: twirling randomizations in the characterisation job.
+        n_shots_per_twirl: shots per randomization.
+        hot_coupler_ps: append ``xslow`` postselection re-measurements to the
+            characterisation program.
 
     .. important::
        **Real hardware runs should enable measurement twirling**, which is not on by
@@ -57,6 +73,11 @@ class RuntimeSampler(SamplerMixin):
         optimization_level: int = 3,
         default_shots: int = 100_000,
         options=None,
+        enable_readout_characterisation: bool = False,
+        readout_error_threshold: float = 0.03,
+        n_rand_twirl: int = 300,
+        n_shots_per_twirl: int = 25,
+        hot_coupler_ps: bool = False,
     ):
         self.backend_name = backend
         self._service = service
@@ -65,6 +86,15 @@ class RuntimeSampler(SamplerMixin):
         self.optimization_level = optimization_level
         self.default_shots = default_shots
         self.options = options
+        self.enable_readout_characterisation = enable_readout_characterisation
+        self.readout_error_threshold = readout_error_threshold
+        self.n_rand_twirl = n_rand_twirl
+        self.n_shots_per_twirl = n_shots_per_twirl
+        self.hot_coupler_ps = hot_coupler_ps
+        # Provenance of the last run: the chosen layout and its score, the avoided
+        # qubits, the backend's reported noise, and the per-edge errors along the
+        # layout actually used. Populated by :meth:`run`.
+        self.hardware_characterisation: dict | None = None
 
     def resolve_backend(self, *, num_qubits: int | None = None):
         """Resolve the backend to run on (cached on this instance after the first call).
@@ -88,6 +118,64 @@ class RuntimeSampler(SamplerMixin):
         self._service = service
         return self._backend_obj
 
+    def _characterise(self, backend, circuits: list) -> dict | None:
+        """Measure the device's readout error and pick a layout, or return ``None``.
+
+        Returns ``None`` -- leaving :meth:`run` on the default-layout transpile --
+        when characterisation is off, when ``samplomatic`` is unavailable, or when
+        the backend is a local simulator. The last case is a refusal rather than an
+        attempt: a ``Fake*`` device's "measured" readout error is whatever its noise
+        model was configured with, so pruning on it would dress a fixed model up as
+        a measurement and could reject qubits on a device that has none.
+
+        A characterisation failure is logged and falls back rather than aborting the
+        run: the default layout still produces valid (if noisier) counts, whereas
+        raising would throw away a queued job's worth of work.
+        """
+        if not self.enable_readout_characterisation:
+            return None
+
+        from embasi_qiskit_integration.circuit_run.backend import _is_fake_backend
+        from embasi_qiskit_integration.circuit_run.characterisation import (
+            characterise_readout,
+            samplomatic_available,
+        )
+
+        if _is_fake_backend(backend):
+            logger.warning(
+                "Skipping readout characterisation on simulated backend %r: its "
+                "readout error is a configured noise model, not a measurement.",
+                getattr(backend, "name", backend),
+            )
+            return None
+
+        if not samplomatic_available():
+            logger.warning(
+                "Skipping readout characterisation: the optional 'samplomatic' "
+                "package is not installed; using a default-layout transpile."
+            )
+            return None
+
+        required_size = max(qc.num_qubits for qc in circuits)
+        try:
+            return characterise_readout(
+                backend=backend,
+                qubit_layout=list(range(backend.num_qubits)),
+                required_size=required_size,
+                n_rand_twirl=self.n_rand_twirl,
+                n_shots_per_twirl=self.n_shots_per_twirl,
+                hot_coupler_ps=self.hot_coupler_ps,
+                readout_error_threshold=self.readout_error_threshold,
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back rather than lose the run
+            logger.warning(
+                "Readout characterisation failed (%s: %s); falling back to a "
+                "default-layout transpile.",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
     def run(
         self, circuits: list, shots: int | None = None, *, seed: int | None = None
     ) -> list[dict[str, int]]:
@@ -97,7 +185,13 @@ class RuntimeSampler(SamplerMixin):
         carries every circuit -- so a large ensemble costs one submission rather
         than one per circuit.
         """
-        from embasi_qiskit_integration.circuit_run.backend import prepare_isa, require_runtime
+        from embasi_qiskit_integration.circuit_run.backend import (
+            edges_along_layout,
+            prepare_isa,
+            read_noise_from_backend,
+            require_runtime,
+            virtual_to_physical,
+        )
         from embasi_qiskit_integration.circuit_run.counts import (
             counts_per_binding_from_pub_result,
         )
@@ -110,17 +204,40 @@ class RuntimeSampler(SamplerMixin):
             return []
 
         backend = self.resolve_backend(num_qubits=max(qc.num_qubits for qc in circuits))
+        readout_characterisation = self._characterise(backend, list(circuits))
 
-        # Real backends only accept circuits in their ISA. ``seed`` cannot make
-        # hardware *sampling* reproducible, but it does pin the transpiler's
-        # stochastic layout/routing passes -- which matter at optimization_level 3,
-        # since a different physical layout means different noise.
-        isa_circuits = prepare_isa(
-            list(circuits),
-            backend,
-            optimization_level=self.optimization_level,
-            seed_transpiler=seed,
-        )
+        if readout_characterisation is not None:
+            # Place the circuits on the measured-best chain, over the pruned map.
+            from qiskit.transpiler import CouplingMap
+
+            from embasi_qiskit_integration.circuit_run.backend import (
+                build_pinned_pass_manager,
+            )
+
+            pass_manager = build_pinned_pass_manager(
+                backend,
+                CouplingMap(readout_characterisation["coupling_map_pruned"]),
+                readout_characterisation["best_layout"],
+            )
+            isa_circuits = list(pass_manager.run(list(circuits)))
+        else:
+            isa_circuits = prepare_isa(
+                list(circuits),
+                backend,
+                optimization_level=self.optimization_level,
+                seed_transpiler=seed,
+            )
+
+        # Record what the run actually used, for provenance alongside the counts.
+        noise = read_noise_from_backend(backend)
+        layout_map = virtual_to_physical(isa_circuits[0]) if isa_circuits else {}
+        self.hardware_characterisation = {
+            "backend": getattr(backend, "name", None),
+            "readout_characterisation": readout_characterisation,
+            "readout_info": noise,
+            "layout_virtual_to_physical": {str(k): str(v) for k, v in layout_map.items()},
+            "two_qubit_errors_on_layout": edges_along_layout(layout_map, noise),
+        }
 
         sampler = RuntimeSamplerV2(mode=backend, options=self.options)
         result = sampler.run(isa_circuits, shots=shots).result()

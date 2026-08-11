@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -109,11 +110,33 @@ def _canonicalize_group_order(operator: Any) -> Any:
     return operator.__class__.from_terms_with_groups(relabeled_terms)
 
 
+_OPERATOR_CACHE: dict[tuple[Any, float, bool], tuple[Any, int]] = {}
+
+
+def _cache_key(ham: EmbeddedHamiltonian, atol: float, filter_diagonal_terms: bool) -> tuple:
+    """Content-derived cache key for :func:`build_canonical_operator`.
+
+    The Hamiltonian arrives in memory rather than as a file, so the key is derived
+    from its content: the integrals' bytes hashed together with
+    ``norb``/``nelec``/``e_core``. Two distinct Hamiltonians can only collide if
+    their integrals are bit-identical, in which case they build the same operator
+    anyway.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    for array in (np.ascontiguousarray(ham.h1), np.ascontiguousarray(ham.h2)):
+        digest.update(str(array.dtype).encode())
+        digest.update(str(array.shape).encode())
+        digest.update(array.tobytes())
+    digest.update(repr((ham.norb, tuple(ham.nelec), float(ham.e_core))).encode())
+    return (digest.hexdigest(), float(atol), bool(filter_diagonal_terms))
+
+
 def build_canonical_operator(
     ham: EmbeddedHamiltonian,
     *,
     atol: float = 1e-16,
     filter_diagonal_terms: bool = True,
+    use_cache: bool = True,
 ) -> tuple[Any, int]:
     """Build the canonicalized, grouped Hamiltonian the SqDRIFT pipeline samples.
 
@@ -134,11 +157,22 @@ def build_canonical_operator(
         atol: Tolerance for simplifying the normal-ordered operator.
         filter_diagonal_terms: Remove diagonal (number-operator) terms before
             grouping, yielding more expressive circuits.
+        use_cache: Memoize the result per process in :data:`_OPERATOR_CACHE`,
+            keyed on the Hamiltonian's content plus the two options that affect
+            it. Defaults to True; pass False to force a rebuild.
 
     Returns:
         ``(operator, num_modes)`` with ``num_modes == 2 * ham.norb``.
     """
     _require_fermions()
+
+    # Only hash the integrals when the cache is actually in play.
+    key = _cache_key(ham, atol, filter_diagonal_terms) if use_cache else None
+    if key is not None:
+        cached = _OPERATOR_CACHE.get(key)
+        if cached is not None:
+            return cached
+
     from qiskit_fermions.operators import FermionOperator
     from qiskit_fermions.operators.terms.filtering import (
         filter_diagonal_terms as _filter_diagonal_terms,
@@ -170,4 +204,7 @@ def build_canonical_operator(
 
     # Relabel groups into a canonical, run-invariant order so seeded qDRIFT
     # sampling is reproducible across process invocations.
-    return _canonicalize_group_order(normal), num_modes
+    built = (_canonicalize_group_order(normal), num_modes)
+    if key is not None:
+        _OPERATOR_CACHE[key] = built
+    return built
