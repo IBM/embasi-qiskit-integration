@@ -296,12 +296,21 @@ counts = sampler.run(result.circuits, shots)
 counts = unpermute_counts_list(counts, result.permutations)   # required!
 ```
 
-The permutation is canonicalized rather than taken from the solver: the
-excitation-span MILP is degenerate and HiGHS is not a pure function of the model
-(the same model solved repeatedly in one process returned one optimum twice, then
-a different one), so a seeded run would otherwise not be reproducible. Requesting
-`optimize=True` without the `relabel` extra raises instead of silently producing
-unpermuted circuits.
+By default the permutation is whatever the MILP solver returned, applied in a
+single pass chain. **That is not reproducible**: the excitation-span model is
+degenerate and HiGHS is not a pure function of it — solving one model repeatedly in
+a single process returned one optimum five times and then a different one (depths
+382 vs 368). Since the permutation is undone on the counts, that instability
+reaches the pooled distribution. Pass `canonical_permutation=True` to derive the
+permutation from a fixed candidate set instead, at the cost of a second
+pass-manager run per randomization:
+
+```python
+build_sqdrift_circuits(ham, method="qdrift", canonical_permutation=True)
+```
+
+Requesting `optimize=True` without the `relabel` extra raises instead of silently
+producing unpermuted circuits.
 
 ### Parallel generation (`workers`)
 

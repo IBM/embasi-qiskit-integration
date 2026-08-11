@@ -63,15 +63,6 @@ def counts_per_binding_from_pub_result(pub_result: Any) -> list[dict[str, int]]:
     return [_normalize(bit_array.get_counts(loc=index)) for index in indices]
 
 
-def counts_from_pub_result(pub_result: Any) -> dict[str, int]:
-    """Return the counts of a PUB result, pooled across all binding positions.
-
-    Convenience for the single-binding case; for a multi-binding PUB prefer
-    :func:`counts_per_binding_from_pub_result` to keep per-binding attribution.
-    """
-    return merge_counts(counts_per_binding_from_pub_result(pub_result))
-
-
 def merge_counts(counts_list: Iterable[Mapping[str, int]]) -> dict[str, int]:
     """Pool several ``{bitstring: count}`` dicts by summing per bitstring.
 

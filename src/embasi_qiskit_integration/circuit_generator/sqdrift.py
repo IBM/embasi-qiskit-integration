@@ -136,6 +136,7 @@ def build_sqdrift_circuits(
     include_initial_state: bool = True,
     optimize: bool = True,
     time_limit: float = 10.0,
+    canonical_permutation: bool = False,
     workers: int = 1,
 ) -> SqdriftBuildResult:
     """Build SqDRIFT sampling circuits for ``ham``.
@@ -198,18 +199,10 @@ def build_sqdrift_circuits(
             (default). ``False`` emits the bare evolution, leaving the reference
             state to the run stage; either way the choice is recorded in
             ``metadata["initial_state_included"]``.
-        optimize: append ``RelabelModes`` to the pass chain (default True, as in
-            reordering modes to minimize the excitation span and
-            so shorten the circuit. The permutation actually applied is reported
-            per circuit in the result and mirrored into
-            ``metadata["permutation"]``.
-
-            Costs a second pass-manager run per randomization: the permutation is
-            solved on a probe pass, canonicalized (see
-            :func:`canonicalize_permutation`), then applied explicitly, which is
-            what makes a seeded build reproducible despite the MILP solver's
-            instability. Circuits built with ``optimize=True`` are therefore not
-            bit-comparable against a build that took the solver's own ordering.
+        optimize: append ``RelabelModes`` to the pass chain (default True),
+            reordering modes to minimize the excitation span and so shorten the
+            circuit. The permutation actually applied is reported per circuit in the
+            result and mirrored into ``metadata["permutation"]``.
 
             **The caller must undo it on the sampled counts** -- a relabeled
             circuit measures in the permuted mode order, so raw counts put
@@ -220,6 +213,22 @@ def build_sqdrift_circuits(
             circuits.
         time_limit: wall-clock limit (seconds) for each ``RelabelModes`` solve.
             A draw whose solve times out or is infeasible is kept unpermuted.
+        canonical_permutation: derive each draw's permutation from a fixed candidate
+            set instead of using the one the MILP solver returned
+            (:func:`canonicalize_permutation`).
+
+            ``False`` (default) applies the solver's own ordering in a single pass
+            chain. ``True`` costs a second pass-manager run per randomization and
+            makes a seeded build **reproducible**, which the default is not: HiGHS is
+            not a pure function of this degenerate model -- solving one model
+            repeatedly in a single process was observed to return one optimum twice
+            and then a different one, and the alternatives are not interchangeable
+            (observed refined scores ``(6, 126)`` vs ``(7, 146)``; depths 346 vs
+            274). Since the permutation must be undone on the counts, that
+            instability propagates into the pooled distribution.
+
+            Set it when you need byte-identical circuits across runs; leave it off
+            for the standard single-solve behaviour.
         workers: processes to shard the randomizations across. ``1`` (default)
             builds in-process. Higher values split each combination's
             randomizations into contiguous seed-chunks, one per worker, and build
@@ -276,6 +285,7 @@ def build_sqdrift_circuits(
         include_initial_state=include_initial_state,
         optimize=optimize,
         time_limit=time_limit,
+        canonical_permutation=canonical_permutation,
     )
 
     if method == "exact":
@@ -327,6 +337,7 @@ class _BuildSpec:
     include_initial_state: bool
     optimize: bool
     time_limit: float
+    canonical_permutation: bool
 
 
 def _plan_tasks(
@@ -547,24 +558,46 @@ def _build_chunk(
             return None
         return canonicalize_permutation(solved, collector.excitations)
 
+    def _build_one(n_groups: int, draw_seed: int | None, evolution_time: float) -> Any:
+        """Synthesise one randomization's circuit.
+
+        Two shapes, selected by ``canonical_permutation``:
+
+        - **Default (False).** A single pass manager whose optimization stage is
+          ``[QDriftTrotterization, RelabelModes(solver=...)]``, taking whatever
+          permutation the solver returns. One solve, one synthesis.
+        - **True.** Solve on a probe pass, canonicalize the result, then synthesise
+          by relabeling with that fixed permutation. Two pass-manager runs, and the
+          circuit becomes a pure function of the seed -- see
+          :func:`canonicalize_permutation` for why the solver's own pick is not.
+        """
+        pm = _pass_manager(draw_seed)
+        passes = _sampling_passes(n_groups, draw_seed)
+
+        if not spec.optimize:
+            if passes:
+                pm.optimization = FermionicPassManager(passes)
+            return pm.run(_fresh_circuit(evolution_time))
+
+        if not spec.canonical_permutation:
+            passes.append(RelabelModes(solver=NativeHighsSolverAdapter(time_limit=spec.time_limit)))
+            pm.optimization = FermionicPassManager(passes)
+            return pm.run(_fresh_circuit(evolution_time))
+
+        permutation = _solve_permutation(n_groups, draw_seed, evolution_time)
+        if permutation is not None:
+            # No solver runs in this pass, so the synthesised circuit is a pure
+            # function of the seed and the permutation just pinned down.
+            passes.append(RelabelModes(permutation=permutation))
+        if passes:
+            pm.optimization = FermionicPassManager(passes)
+        return pm.run(_fresh_circuit(evolution_time))
+
     result = SqdriftBuildResult(num_modes=num_modes, optimize_requested=spec.optimize)
     for evolution_time, n_groups in combos:
         for randomization in rand_range:
             draw_seed = _draw_seed(randomization)
-            permutation = (
-                _solve_permutation(n_groups, draw_seed, evolution_time) if spec.optimize else None
-            )
-
-            pm = _pass_manager(draw_seed)
-            passes = _sampling_passes(n_groups, draw_seed)
-            if permutation is not None:
-                # Relabel with the explicit, canonicalized permutation: no solver
-                # runs here, so the synthesised circuit is a pure function of the
-                # seed and the permutation we just pinned down.
-                passes.append(RelabelModes(permutation=permutation))
-            if passes:
-                pm.optimization = FermionicPassManager(passes)
-            circuit = pm.run(_fresh_circuit(evolution_time))
+            circuit = _build_one(n_groups, draw_seed, evolution_time)
 
             result.circuits.append(circuit)
             result.permutations.append(_extract_permutation(circuit, num_modes))

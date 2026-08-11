@@ -24,11 +24,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `metadata["permutation"]` so the reference determinant is prepared in the
   matching order — relabeling is therefore transparent to `SQDSolver` callers, and
   the SQD energy is unchanged while the circuits get shorter.
-- The permutation is canonicalized (`canonicalize_permutation`) rather than taken
-  from the MILP solver: the excitation-span model is degenerate and HiGHS is not a
-  pure function of it (one model solved repeatedly in a single process returned one
-  optimum twice, then a different one), which would make a seeded run
-  irreproducible.
+- `canonical_permutation` (default **False**) selects how the mode permutation is
+  obtained. The default applies the MILP solver's own ordering in one pass chain.
+  Setting it True derives the permutation from a fixed candidate set instead
+  (`canonicalize_permutation`), costing a second pass-manager run per randomization
+  but making a seeded build reproducible — which the default is not, because the
+  excitation-span model is degenerate and HiGHS is not a pure function of it
+  (solving one model repeatedly in a single process returned one optimum five times
+  and then a different one; depths 382 vs 368). Since the permutation is undone on
+  the counts, that instability reaches the pooled distribution. Also exposed as
+  `SQDSolver(canonical_permutation=...)`.
 - Parallel SqDRIFT generation: `build_sqdrift_circuits(workers=N)` (and
   `SQDSolver(workers=N)` / `--workers`) shards each combination's randomizations
   into contiguous seed-chunks across processes, byte-identical to the sequential
@@ -121,6 +126,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   The prototype consequently honours its `--seed` (it previously hard-coded
   `seed_simulator=42`); pass `--seed 42` to reproduce earlier output.
 
+### Removed
+- Three definitions that were never called anywhere: `circuit_run.layout.plot_layout`
+  (a gate-map debugging aid that would have raised `ImportError`, since matplotlib is
+  not a dependency), `circuit_run.counts.counts_from_pub_result` (a one-line wrapper
+  whose own docstring steered callers to the per-binding version) and `ipc.is_rank0`
+  (`rank0_solve` does its own rank check). `circuit_generator.lucj` is deliberately
+  kept as a reference placeholder for the deferred LUCJ ansatz.
+
 ### Fixed
 - **Breaking (minor):** `compose_full_circuit`'s `add_measure_all` parameter is now
   called `measure`, matching `build_sqdrift_circuits(measure=...)` which controls the
@@ -183,10 +196,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `resolve_initial_state` now warns instead of silently discarding an explicit
   `initial_state_bitstring` when the core circuit already carries its own
   reference state.
-- `_canonicalize_group_order` reads group weights from upstream's
-  `group_weights()` rather than recomputing them, fixing a `ValueError` when group
-  labels are non-contiguous and keeping the ranking aligned with the qDRIFT pass
-  by construction. Numerically identical on existing paths.
+- `_canonicalize_group_order` computes its per-group tie-break weight with an
+  explicit `np.add.at` / `np.unique` reduction, falling back to `group_weights()`
+  only when the group labels are non-contiguous — the one case where that reduction
+  raises `ValueError`, since `num_groups()` is the largest label plus one. The
+  fallback therefore never changes an ordering the reduction could have produced.
 - `RuntimeSampler` now passes `seed` through to the ISA transpile, making
   hardware layout selection reproducible (the parameter was previously dead).
 - `AerSampler` pins the simulation method (default `"statevector"`) instead of

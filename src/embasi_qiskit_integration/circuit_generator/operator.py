@@ -58,6 +58,36 @@ def fermionic_op_from_integrals(ham: EmbeddedHamiltonian):
         return FermionOperator.from_fcidump(fc), 2 * fc.norb
 
 
+def _group_weights(operator: Any) -> np.ndarray:
+    """Aggregated per-group weight used to break ties in the canonical group order.
+
+    The quantity is the same one ``QDriftTrotterization`` samples with: the sum of
+    ``|coeff|`` within a group, divided by that group's term count.
+
+    It is computed with an explicit ``np.add.at`` / ``np.unique`` reduction rather
+    than read from ``operator.group_weights()``, because the resulting *ordering*
+    has to be reproducible across implementations -- this weight is the tie-breaker
+    in :func:`_canonicalize_group_order`'s sort key, so a different-but-equivalent
+    weight vector silently permutes the groups a seeded qDRIFT draw lands on.
+
+    The reduction has one failure mode: ``num_groups()`` is the largest label plus
+    one, so with a non-contiguous label set the per-label sums and the
+    ``np.unique`` counts differ in length and the division raises ``ValueError``
+    (verified). That case falls back to ``group_weights()``, which reports ``0.0``
+    for an unused label. The fallback only triggers where the explicit reduction
+    cannot produce an answer at all, so it never changes an ordering that the
+    reduction could have computed.
+    """
+    groups = operator.groups
+    weights = np.zeros((operator.num_groups(),))
+    np.add.at(weights, groups, np.abs(operator.get_coeffs()))
+    counts = np.unique(groups, return_counts=True)[1]
+    if counts.size == weights.size:
+        weights /= counts
+        return weights
+    return np.asarray(operator.group_weights())
+
+
 def _canonicalize_group_order(operator: Any) -> Any:
     """Return a copy of ``operator`` with groups relabeled into a canonical order.
 
@@ -65,10 +95,9 @@ def _canonicalize_group_order(operator: Any) -> Any:
     map to the same physical group -- but ``group_terms_by_electronic_structure``
     assigns labels in a process-dependent order. We recompute a stable rank per
     group from its own term structure (:func:`term_sort_key`) plus its aggregated
-    weight -- read from the same ``group_weights()`` accessor the pass itself
-    samples, quantized via :func:`complex_sort_key` so float jitter cannot reorder
-    groups -- then remap every term's group tag to that rank and rebuild via
-    ``from_terms_with_groups``.
+    weight (:func:`_group_weights`, quantized via :func:`complex_sort_key` so float
+    jitter cannot reorder groups), then remap every term's group tag to that rank
+    and rebuild via ``from_terms_with_groups``.
 
     When the operator carries no groups (defensive -- the SqDRIFT pipeline always
     groups first), the flat term order is canonicalized instead via the native
@@ -87,14 +116,7 @@ def _canonicalize_group_order(operator: Any) -> Any:
             ),
         )
 
-    # Aggregated per-group weight, read from the same native accessor
-    # ``QDriftTrotterization`` samples with (``np.array(hamil.group_weights())``):
-    # sum of |coeff| within a group, divided by that group's term count. Taking it
-    # from upstream rather than recomputing it keeps the ranking aligned with the
-    # pass by construction, and handles a group index no term carries (weight 0.0)
-    # -- which a hand-rolled ``np.add.at`` / ``np.unique`` reduction cannot, since
-    # those two disagree in length whenever the labels are non-contiguous.
-    weights = np.asarray(operator.group_weights())
+    weights = _group_weights(operator)
 
     # Both ``group_weights()`` and ``split_out_groups()`` are indexed by raw group
     # label and length ``num_groups()``, so they line up; unused labels appear as

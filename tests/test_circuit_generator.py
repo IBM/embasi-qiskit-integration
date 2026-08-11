@@ -507,14 +507,14 @@ def test_optimize_produces_permutations_and_shortens_circuits(n2_ham):
 @requires_fermions
 @requires_relabel
 def test_optimize_permutation_is_reproducible(n2_ham):
-    """The same seeded draw must yield the same permutation, every time.
+    """``canonical_permutation=True`` makes a seeded draw yield the same permutation.
 
-    This does not hold for the raw solver output: the excitation-span MILP is
-    degenerate and HiGHS is not a pure function of the model (solving one model
-    repeatedly in a single process returned one optimum twice, then a different
-    one). The permutation has to be undone on the sampled counts, so an unstable
-    one would make a seeded run irreproducible -- hence
-    ``canonicalize_permutation``, which this pins.
+    This does not hold for the raw solver output, which is what the default uses:
+    the excitation-span MILP is degenerate and HiGHS is not a pure function of the
+    model -- solving one model repeatedly in a single process was observed to return
+    one optimum five times and then a different one (depths 382 vs 368). Since the
+    permutation has to be undone on the sampled counts, that instability reaches the
+    pooled distribution, so the flag exists to remove it.
     """
     kwargs = {
         "method": "qdrift",
@@ -523,6 +523,7 @@ def test_optimize_permutation_is_reproducible(n2_ham):
         "num_randomizations": 2,
         "seed": 42,
         "include_initial_state": False,
+        "canonical_permutation": True,
     }
     runs = [build_sqdrift_circuits(n2_ham, **kwargs).permutations for _ in range(3)]
     assert runs[0] == runs[1] == runs[2]
@@ -763,12 +764,14 @@ def test_relabeled_circuits_are_only_usable_after_undoing_the_permutation(n2_ham
 
     assert in_sector(restored_counts) == pytest.approx(1.0)
 
-    # Note the sector check alone would NOT catch the bug: relabeling permutes
-    # modes across the two spin blocks but this draw keeps most weight in the
-    # (na, nb) sector anyway, so raw counts look ~95% "valid" while being the wrong
-    # determinants entirely. Only the distribution comparison above exposes it --
-    # which is why the un-permutation has to be structural rather than validated.
-    assert in_sector(raw_counts) > 0.5
+    # Deliberately NO assertion on in_sector(raw_counts). How much of the raw
+    # distribution lands in the (na, nb) sector depends on which permutation the
+    # solver returned -- observed anywhere from 0.3% to 95% across runs on this same
+    # draw. That is itself the point: a spin-sector or Hamming-weight sanity check
+    # cannot be relied on to catch un-permuted counts, because a permutation that
+    # happens to preserve the sector passes it while still yielding entirely the
+    # wrong determinants. The total-variation comparison above is what exposes the
+    # bug, which is why the un-permutation is structural rather than validated.
 
 
 def test_resolve_workers_treats_zero_as_one_per_cpu():
@@ -937,3 +940,139 @@ def test_solver_report_is_not_logged_at_info():
 
     at_info = [r.getMessage() for r in records if r.levelno >= logging.INFO]
     assert not at_info, f"HiGHS report leaked at INFO: {at_info[:3]}"
+
+
+@requires_fermions
+@requires_relabel
+def test_default_optimize_solves_once_per_randomization(n2_ham):
+    """The default relabel path runs exactly one solve per draw.
+
+    That single-solve shape (qDRIFT then a solving ``RelabelModes``) is what makes a
+    circuit comparable with any other implementation of the same recipe. It is
+    asserted by counting solver constructions rather than by circuit equality,
+    because the solver is not deterministic on this MILP (see
+    ``test_optimize_permutation_is_reproducible``): two runs of *identical* code can
+    return different equal-objective optima, so a gate-for-gate assertion would be
+    flaky through no fault of the code.
+    """
+    from embasi_qiskit_integration.circuit_generator import sqdrift as sqdrift_module
+
+    constructed = []
+    real_adapter = sqdrift_module.NativeHighsSolverAdapter
+
+    def _counting_adapter(*args, **kwargs):
+        constructed.append(1)
+        return real_adapter(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sqdrift_module, "NativeHighsSolverAdapter", _counting_adapter)
+        build_sqdrift_circuits(
+            n2_ham,
+            method="qdrift",
+            time=1.0,
+            num_groups=10,
+            num_randomizations=2,
+            seed=42,
+            include_initial_state=False,
+        )
+
+    assert len(constructed) == 2, f"expected one solve per draw, got {len(constructed)}"
+
+
+@requires_fermions
+@requires_relabel
+def test_canonical_permutation_costs_an_extra_solve_pass(n2_ham):
+    """``canonical_permutation=True`` adds a probe pass per randomization.
+
+    The probe is what learns *whether* the draw can be relabeled at all; the
+    permutation is then canonicalized and applied without a solver, so the second
+    pass-manager run constructs no adapter.
+    """
+    from embasi_qiskit_integration.circuit_generator import sqdrift as sqdrift_module
+
+    constructed = []
+    real_adapter = sqdrift_module.NativeHighsSolverAdapter
+
+    def _counting_adapter(*args, **kwargs):
+        constructed.append(1)
+        return real_adapter(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sqdrift_module, "NativeHighsSolverAdapter", _counting_adapter)
+        result = build_sqdrift_circuits(
+            n2_ham,
+            method="qdrift",
+            time=1.0,
+            num_groups=10,
+            num_randomizations=2,
+            seed=42,
+            include_initial_state=False,
+            canonical_permutation=True,
+        )
+
+    # Still one solve per draw (the probe), and the circuits are relabeled.
+    assert len(constructed) == 2
+    assert result.num_permutations_found == 2
+
+
+@requires_fermions
+def test_group_weights_match_the_explicit_reduction_when_labels_are_contiguous():
+    """The tie-break weight uses the explicit reduction, not ``group_weights()``.
+
+    The weight breaks ties in the canonical group order, so which formula computes it
+    decides which physical group a seeded qDRIFT draw lands on. The explicit
+    ``np.add.at`` / ``np.unique`` reduction is therefore the reference, and this pins
+    that ours reproduces it exactly.
+    """
+    import numpy as np
+    from qiskit_fermions.operators import FermionOperator
+
+    from embasi_qiskit_integration.circuit_generator.operator import _group_weights
+
+    operator = FermionOperator.from_terms_with_groups(
+        [
+            ([(True, 0), (False, 0)], 1.0, 0),
+            ([(True, 1), (False, 1)], 2.0, 1),
+            ([(True, 2), (False, 2)], 3.0, 0),
+        ]
+    )
+    groups = operator.groups
+    expected = np.zeros((operator.num_groups(),))
+    np.add.at(expected, groups, np.abs(operator.get_coeffs()))
+    expected /= np.unique(groups, return_counts=True)[1]
+
+    assert np.array_equal(_group_weights(operator), expected)
+
+
+@requires_fermions
+def test_group_weights_fall_back_when_labels_are_non_contiguous():
+    """A label no term carries makes the explicit reduction impossible, not wrong.
+
+    ``num_groups()`` is the largest label + 1, so the per-label sums and the
+    ``np.unique`` counts differ in length and the division raises ``ValueError``.
+    That case -- and only that case -- falls back to ``group_weights()``, so the
+    fallback can never change an ordering the reduction could have produced.
+    """
+    import numpy as np
+    from qiskit_fermions.operators import FermionOperator
+
+    from embasi_qiskit_integration.circuit_generator.operator import _group_weights
+
+    # Labels 0 and 5 used; 1-4 carry no term.
+    operator = FermionOperator.from_terms_with_groups(
+        [
+            ([(True, 0), (False, 0)], 1.0, 0),
+            ([(True, 1), (False, 1)], 2.0, 5),
+            ([(True, 2), (False, 2)], 3.0, 0),
+        ]
+    )
+
+    # The explicit reduction genuinely cannot run here.
+    with pytest.raises(ValueError):
+        groups = operator.groups
+        weights = np.zeros((operator.num_groups(),))
+        np.add.at(weights, groups, np.abs(operator.get_coeffs()))
+        weights /= np.unique(groups, return_counts=True)[1]
+
+    # Ours returns the upstream weights instead of raising.
+    assert np.asarray(_group_weights(operator)).shape == (operator.num_groups(),)

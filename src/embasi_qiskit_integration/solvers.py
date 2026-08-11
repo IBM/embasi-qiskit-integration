@@ -136,6 +136,7 @@ class SQDSolver(ActiveSpaceSolver):
         seed: int | None = None,
         optimize: bool | None = None,
         time_limit: float = 10.0,
+        canonical_permutation: bool = False,
         workers: int = 1,
     ):
         self.sampler = sampler
@@ -152,6 +153,10 @@ class SQDSolver(ActiveSpaceSolver):
         self.seed = seed
         self.optimize = relabel_available() if optimize is None else optimize
         self.time_limit = time_limit
+        # Forwarded to the generator: False (default) uses the MILP solver's own
+        # permutation, True derives a reproducible one at the cost of a second
+        # pass-manager run per randomization. See build_sqdrift_circuits.
+        self.canonical_permutation = canonical_permutation
         self.workers = workers
         self._permutations: list[list[int] | None] = []
 
@@ -238,6 +243,7 @@ class SQDSolver(ActiveSpaceSolver):
             include_initial_state=False,
             optimize=self.optimize,
             time_limit=self.time_limit,
+            canonical_permutation=self.canonical_permutation,
             workers=self.workers,
         )
         self._permutations = list(result.permutations)
