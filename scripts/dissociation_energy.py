@@ -1,12 +1,12 @@
 # Copyright IBM Corp. 2026
 # SPDX-License-Identifier: Apache-2.0
-"""Direct (Eq. 19) embedding interaction energy for an s26 dimer, in kJ/mol.
+"""Direct (Eq. 19) embedding dissociation energy for an s26 dimer, in kJ/mol.
 
 Runs the projection-embedding workflow (:class:`EmbeddingWorkflow`) at a *frozen*
-dimer geometry and forms the interaction energy the way the paper's Eq. 19 does --
-**directly, on the complete embedding totals**::
+dimer geometry and forms the dissociation energy (``ΔE_dissoc``) the way the
+paper's Eq. 19 does -- **directly, on the complete embedding totals**::
 
-    ΔE_int = E_emb(dimer) - E_emb(monoA) - E_emb(monoB)
+    ΔE_dissoc = E_emb(dimer) - E_emb(monoA) - E_emb(monoB)
 
 For the methanol homodimer (``--s26_index 22``, the default) the two monomers are
 geometrically identical, so ``E_emb(monoB) == E_emb(monoA)`` and this is
@@ -19,7 +19,7 @@ Why direct, and why bare monomers
 ``E_high(A)`` already footing-rebased onto ``E_low(A)``'s ghosted-A nuclear frame).
 Differenced directly, the low-level pieces telescope to the pure low-level
 supermolecular binding -- for PBE this is the ``~-40.25 kJ/mol`` bracket --
-**at the level of totals**, so the interaction energy is size-consistent by
+**at the level of totals**, so the dissociation energy is size-consistent by
 construction with no polarization-multiplicity bookkeeping and no counterpoise
 apparatus.  A standalone free-PBE bracket (:meth:`_free_pbe`) is computed
 independently as the size-consistency check -- it never touches the embedding, so
@@ -36,7 +36,7 @@ partner, :meth:`_dimer_active`).
 
 Paths, routed on the high-level METHOD and (for HF) the solver
 --------------------------------------------------------------
-* **DFT-in-DFT** (the default and the *supported* interaction-energy path; any
+* **DFT-in-DFT** (the default and the *supported* dissociation-energy path; any
   density-functional ``--xc_hl`` such as PBE0/PBE).  The workflow takes paper Eq. 2:
   a Kohn-Sham energy at the embedded density, **no active space, no selector, no
   n_virtual, no solver** -- nothing to tune, and nothing to mismatch between the two
@@ -56,10 +56,10 @@ Paths, routed on the high-level METHOD and (for HF) the solver
   *fragment-coupling* active spaces.
 
 (A CCSD-over-full-A "CCSD-in-PBE" path was explored as a would-be *correlated*
-interaction-energy reference for the SQD path -- a ~3.4 kJ/mol effect the reference
-table below does not contain.  Its assembled ``ΔE_int`` was never made size-consistent
-for the two-fragment subsystem A, so the path was removed; the diagnosis is preserved
-in ``CCSD_IN_PBE_DIAGNOSIS.html``.  Do not reintroduce it.)
+dissociation-energy reference for the SQD path -- a ~3.4 kJ/mol effect the reference
+table below does not contain.  Its assembled ``ΔE_dissoc`` was never made
+size-consistent for the two-fragment subsystem A, so the path was removed; the
+diagnosis is preserved in ``CCSD_IN_PBE_DIAGNOSIS.html``.  Do not reintroduce it.)
 
 Reference table (all 6-31G, same basis as here so basis incompleteness cancels
 out of the ΔE comparison entirely -- these are NOT complete-basis targets):
@@ -68,7 +68,7 @@ out of the ΔE comparison entirely -- these are NOT complete-basis targets):
 
 The acceptance target for the DEFAULT (PBE0-in-PBE) run is the full-PBE0 number,
 **ΔE_PBE0 = -39.06 kJ/mol**: DFT-in-DFT reproduces it up to the projection-embedding
-error (measured ~+0.3 kJ/mol residual on this system, i.e. ΔE_int ~ -38.8).  The
+error (measured ~+0.3 kJ/mol residual on this system, i.e. ΔE_dissoc ~ -38.8).  The
 ``-39.25`` entry is the full PBE0-in-PBE literature value and itself carries that
 embedding error relative to -39.06; it is quoted for context, not as the target.
 
@@ -77,8 +77,9 @@ Two built-in checks fall out of the direct construction:
 * **Free-PBE bracket** ``E(dimer) - E(monoA) - E(monoB)`` from a **standalone**
   ``xc_ll`` SCF on each leg (:meth:`_free_pbe`), which never touches the embedding
   and is therefore **cycle-invariant**.  It must reproduce the pure low-level
-  binding: for PBE, ``-40.25 kJ/mol`` at contact and **exactly 0.000** at far
-  separation, to ~0.01.  This is *the* size-consistency check -- independent of
+  binding: for PBE, ``-40.25 kJ/mol`` at contact and **0.000** at far
+  separation (non-interacting fragments), to ~0.01.  This is *the*
+  size-consistency check -- independent of
   the high level and of the fragment definition, and valid at any ``max_cycles``.
   It uses ``E(A)+E(B)``, not ``2*E(A)``: the two s26[22] methanols differ by
   0.016 A in internal bond lengths (worth +0.074 kJ/mol at 6-31G, +3.67 at
@@ -88,17 +89,19 @@ Two built-in checks fall out of the direct construction:
   bracket ONLY at ``max_cycles=1`` and drifts above it under self-consistent
   feedback by design (paper §2.2), so it is NOT a size-consistency check.
 * **PBE-in-PBE control** (``--xc_hl PBE``): the high and low functionals coincide,
-  so the embedding is a no-op on the energy -- ``Δ_HL`` is **0 exactly** on every
-  leg and ``ΔE_int`` equals the ``-40.18`` bracket.  This is the paper's Fig. 3B
-  cancellation reproduced end to end, and the strongest single check here.
+  so the embedding is analytically a no-op on the energy -- ``Δ_HL`` vanishes on
+  every leg (to a ~1e-6 kJ/mol residual, the paper's Fig. 3B ``ΔΔE_dissoc``, not a
+  literal machine zero) and ``ΔE_dissoc`` equals the ``-40.18`` bracket.  This is
+  the paper's Fig. 3B cancellation reproduced end to end, and the strongest single
+  check here.
 
 Usage::
 
-    uv run python scripts/interaction_energy.py                 # PBE0-in-PBE (DFT-in-DFT) -> ~-38.8
-    uv run python scripts/interaction_energy.py --xc_hl PBE      # PBE-in-PBE control -> -40.18
+    uv run python scripts/dissociation_energy.py                 # PBE0-in-PBE (DFT-in-DFT) -> ~-38.8
+    uv run python scripts/dissociation_energy.py --xc_hl PBE      # PBE-in-PBE control -> -40.18
     # WF-in-DFT (HF + active-space correlation); FCI is the reference SQD must match:
-    uv run python scripts/interaction_energy.py --xc_hl HF --solver fci --selector concentric
-    uv run python scripts/interaction_energy.py --xc_hl HF --solver sqd --sampler aer --selector concentric
+    uv run python scripts/dissociation_energy.py --xc_hl HF --solver fci --selector concentric
+    uv run python scripts/dissociation_energy.py --xc_hl HF --solver sqd --sampler aer --selector concentric
 
 Every other embedding knob (basis, xc, mu, active space, solver, sampler, ...) is
 accepted and forwarded verbatim to each sub-run.  The WF-path knobs are inert on the
@@ -107,6 +110,20 @@ DFT-in-DFT path.
 Heterodimers (two *different* monomers) are not supported yet.
 ``--assume_symmetric false`` still raises rather than silently computing a wrong
 number.
+
+The equation and figure references above ("paper Eq. 2/19", "§2.2", "Fig. 3B")
+are to the EmbASI framework paper: G. Bramley, P. Stishenko, O. van Vuren,
+V. Blum, A. J. Logsdail, "A General Pythonic Framework for DFT-in-DFT and
+WF-in-DFT Embedding", ChemRxiv (2025), preprint,
+doi:10.26434/chemrxiv-2025-c23jf.
+
+Terminology follows the paper: Eq. 19 is the dimer **dissociation energy**
+``ΔE_dissoc = E(1,2) − E(1) − E(2)`` (here with ``E(1)+E(2)`` for inequivalent
+monomers, or ``2*E(A)`` for a homodimer).  One fidelity note: the PBE-in-PBE
+cancellation is an **analytic identity** (``Δ_HL`` vanishes when high == low),
+but the paper's Fig. 3B ``ΔΔE_dissoc`` plots the numerical residual as negligible
+(~1e-6 kJ/mol), not a literal machine zero -- so the code speaks of an analytic
+zero with a ~1e-6 residual, never an exact one.
 """
 
 from __future__ import annotations
@@ -120,10 +137,10 @@ from embasi_qiskit_integration.embedding import EmbeddingWorkflow
 _HA2KJMOL = 2625.4996394799
 
 
-class InteractionEnergy(BaseSettings):
+class DissociationEnergy(BaseSettings):
     """Difference a dimer embedding against its two monomers, directly (Eq. 19)."""
 
-    model_config = SettingsConfigDict(env_prefix="EQI_INT_", cli_parse_args=True)
+    model_config = SettingsConfigDict(env_prefix="EQI_DISSOC_", cli_parse_args=True)
 
     # --- system (mirrors EmbeddingWorkflow; forwarded to each sub-run) --- #
     s26_index: int = 22  # methanol dimer in the s26 set
@@ -259,7 +276,7 @@ class InteractionEnergy(BaseSettings):
         (``ProjectionEnergy.total``), the low-level energy of the whole host at the
         embedded density (``ProjectionEnergy.e_low_total``), and their difference
         ``Δ_HL = total - e_low_total`` (the high-vs-low fragment correction).  The
-        direct interaction energy differences the ``total`` legs; the ``e_low_total``
+        direct dissociation energy differences the ``total`` legs; the ``e_low_total``
         and ``Δ_HL`` legs are surfaced only as the built-in bracket / control checks.
 
         ``active_fragment_sizes`` is this leg's per-fragment partition for the
@@ -292,7 +309,7 @@ class InteractionEnergy(BaseSettings):
     def cli_cmd(self) -> None:
         if not self.assume_symmetric:
             raise NotImplementedError(
-                "heterodimer interaction energy is not supported yet.  Under the "
+                "heterodimer dissociation energy is not supported yet.  Under the "
                 "direct (Eq. 19) formula the second monomer needs its own bare "
                 "embedding total E_emb(monoB) on atoms[n:]; it is simply not wired "
                 "up here.  Run with --assume_symmetric (the default) for a homodimer "
@@ -304,7 +321,7 @@ class InteractionEnergy(BaseSettings):
         mono_sizes = self._fragment_sizes(self.active_atoms)
         is_wf = self.xc_hl.strip().upper() == "HF"
 
-        print("\n==================== INTERACTION ENERGY setup ====================")
+        print("\n==================== DISSOCIATION ENERGY setup ====================")
         print(f"  fragment (monomer) = {self.active_atoms}   dimer high-level = {dimer_active}")
         print(f"  xc_hl={self.xc_hl}  xc_ll={self.xc_ll}  basis={self.basis}")
         if is_wf:
@@ -322,7 +339,7 @@ class InteractionEnergy(BaseSettings):
                     "test proved is NON-nested across the two legs."
                 )
                 print(
-                    "  ***          The interaction energy will not be trustworthy; "
+                    "  ***          The dissociation energy will not be trustworthy; "
                     "use --selector concentric."
                 )
             print(
@@ -334,7 +351,7 @@ class InteractionEnergy(BaseSettings):
                 "  path=DFT-in-DFT (Eq. 2 embedded KS energy); "
                 "solver/selector/sampler are inert on this path"
             )
-        print("  ΔE_int = E_emb(dimer) - 2 E_emb(monoA)   (Eq. 19 direct, bare monomers)")
+        print("  ΔE_dissoc = E_emb(dimer) - 2 E_emb(monoA)   (Eq. 19 direct, bare monomers)")
 
         # --- complete embedding totals: dimer (both OH high-level) + bare monomer --- #
         e_dimer, elow_dimer, dhl_dimer = self._run(
@@ -350,7 +367,7 @@ class InteractionEnergy(BaseSettings):
             tag="MONOMER (bare, isolated fragment)",
         )
 
-        # --- direct interaction energy (homodimer: monoB == monoA) --- #
+        # --- direct dissociation energy (homodimer: monoB == monoA) --- #
         de_ha = e_dimer - 2.0 * e_mono
         de_kjmol = de_ha * _HA2KJMOL
 
@@ -381,11 +398,11 @@ class InteractionEnergy(BaseSettings):
         elow_drift = (elow_dimer - 2.0 * elow_mono) * _HA2KJMOL
         dhl_residual = (dhl_dimer - 2.0 * dhl_mono) * _HA2KJMOL  # -> 0 for PBE-in-PBE
 
-        print("\n==================== INTERACTION ENERGY (Eq. 19 direct) ====================")
+        print("\n==================== DISSOCIATION ENERGY (Eq. 19 direct) ====================")
         print(f"  E_emb(dimer)  = {e_dimer:.6f} Ha  (E_low_total = {elow_dimer:.6f})")
         print(f"  E_emb(monoA)  = {e_mono:.6f} Ha  (= E_emb(monoB), homodimer)")
         print("  ---------------------------------------------------------------------------")
-        print("  ΔE_int = E_emb(dimer) - 2 E_emb(monoA)")
+        print("  ΔE_dissoc = E_emb(dimer) - 2 E_emb(monoA)")
         print(f"         = {e_dimer:.6f} - 2 * {e_mono:.6f}")
         print("  ---------------------------------------------------------------------------")
         print(
@@ -398,7 +415,7 @@ class InteractionEnergy(BaseSettings):
         )
         print(
             f"    Δ_HL(d) - 2 Δ_HL(m)                      = {dhl_residual:8.3f} kJ/mol"
-            f"   [PBE-in-PBE control: exactly 0]"
+            f"   [PBE-in-PBE control: analytic 0, ~1e-6 residual (Fig. 3B)]"
         )
         print("  ---------------------------------------------------------------------------")
         if is_wf:
@@ -410,17 +427,18 @@ class InteractionEnergy(BaseSettings):
             target_note = "[target ΔE_PBE = -40.18]"
         else:
             target_note = f"[target ΔE_{self.xc_hl} = -39.06]"
-        print(f"    ΔE_int = {de_ha:.6f} Ha = {de_kjmol:.3f} kJ/mol   {target_note}")
+        print(f"    ΔE_dissoc = {de_ha:.6f} Ha = {de_kjmol:.3f} kJ/mol   {target_note}")
         print("  ---------------------------------------------------------------------------")
         print("  The free-PBE bracket is the built-in size-consistency check: a STANDALONE")
         print("  xc_ll SCF on each leg (never touches the embedding), so it is cycle-invariant.")
         print("  It must match the pure-PBE supermolecular binding (-40.25 kJ/mol at 6-31G,")
-        print("  using E(A)+E(B) not 2*E(A)) and go to EXACTLY 0 at far separation.  The")
+        print("  using E(A)+E(B) not 2*E(A)) and go to 0 at far separation.  The")
         print("  e_low_total drift line above is E_low at the fed-back density -- it equals the")
         print("  free bracket ONLY at max_cycles=1 and drifts under feedback by design (§2.2);")
         print("  it is a diagnostic, NOT a size-consistency check.  For --xc_hl PBE the")
-        print("  embedding is a no-op (Δ_HL = 0 exactly) and ΔE_int equals the bracket -- the")
-        print("  paper's Fig. 3B cancellation.  For --xc_hl PBE0 (default) the target is the")
+        print("  embedding is analytically a no-op (Δ_HL vanishes to ~1e-6 kJ/mol) and")
+        print("  ΔE_dissoc equals the bracket -- the paper's Fig. 3B cancellation.  For")
+        print("  --xc_hl PBE0 (default) the target is the")
         print("  full-PBE0 number -39.06; DFT-in-DFT reproduces it up to the ~0.3 kJ/mol")
         print("  projection-embedding error.")
         print(
@@ -435,7 +453,7 @@ class InteractionEnergy(BaseSettings):
 
 
 def main() -> None:
-    CliApp.run(InteractionEnergy)
+    CliApp.run(DissociationEnergy)
 
 
 if __name__ == "__main__":

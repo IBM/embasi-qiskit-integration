@@ -229,15 +229,19 @@ embedding flow against **real EmbASI** — EmbASI low-level embedding → extrac
 active-space Hamiltonian → solve with SQD/FCI → assemble the
 projection-based-embedding energy → feed the 1-RDM back. It drives a live
 `embasi.embedding.ProjectionEmbedding` (methanol monomer, OH active fragment,
-PBE-in-PBE, sto-3g), so it needs EmbASI installed (see below).
+HF-in-PBE, sto-3g), so it needs EmbASI installed (see below).
 
-It defaults to the SQD pipeline:
+By default it takes the **WF-in-DFT** path (`--xc_hl HF`: an HF mean field plus an
+active-space quantum solve, with the `concentric` selector), so the default run
+genuinely exercises the SQD pipeline. A Kohn-Sham `--xc_hl` (PBE0/PBE) instead
+routes DFT-in-DFT, where the solver and selector are inert.
 
 ```bash
-uv run python scripts/embedding_workflow.py                        # sqd + aer (default)
+uv run python scripts/embedding_workflow.py                        # WF-in-DFT: sqd + aer (default)
 uv run python scripts/embedding_workflow.py --sampler runtime      # sqd on hardware
 uv run python scripts/embedding_workflow.py --handoff two-process  # file handoff
-uv run python scripts/embedding_workflow.py --solver fci           # classical reference
+uv run python scripts/embedding_workflow.py --solver fci           # classical FCI reference
+uv run python scripts/embedding_workflow.py --xc_hl PBE0           # DFT-in-DFT (solver inert)
 ```
 
 It is MPI-safe (the solve runs on rank 0 and the result is broadcast), so it can
@@ -411,6 +415,28 @@ to exercise the real embedding backend.
    Without a completed FHI-aims embedding run the real-EmbASI smoke test skips
    itself with an explanatory message; with the driver in place it exercises the
    extraction/feedback path against live EmbASI matrices.
+
+## References & citation
+
+This library couples the **EmbASI** projection-based embedding framework to the
+Qiskit SQD stack. The embedding formalism — the DFT-in-DFT and WF-in-DFT energy
+expressions, the level-shift projector, and the reference results this package's
+docstrings cite as "the paper" (Eq. 2, 6, 8, 19; §2.2; Fig. 3B) — is described
+in:
+
+> G. Bramley, P. Stishenko, O. van Vuren, V. Blum, and A. J. Logsdail,
+> *A General Pythonic Framework for DFT-in-DFT and WF-in-DFT Embedding*,
+> ChemRxiv (2025), preprint. DOI: [10.26434/chemrxiv-2025-c23jf](https://doi.org/10.26434/chemrxiv-2025-c23jf).
+
+If you use this integration, please cite the EmbASI paper above. The projection /
+level-shift embedding scheme it implements originates with:
+
+> F. R. Manby, M. Stella, J. D. Goodpaster, and T. F. Miller III,
+> *A Simple, Exact Density-Functional-Theory Embedding Scheme*,
+> J. Chem. Theory Comput. **8**, 2564–2568 (2012).
+> DOI: [10.1021/ct300544e](https://doi.org/10.1021/ct300544e).
+
+EmbASI itself is developed at <https://github.com/tamm-cci/EmbASI>.
 
 ## License
 

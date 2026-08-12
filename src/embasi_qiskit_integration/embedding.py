@@ -56,6 +56,20 @@ inline with ``TODO(embasi-api)`` and summarised in the docstring atop
 
 Open-shell / unrestricted embedding is a deferred package rewrite (separate
 alpha/beta orbital sets, ``(h1a, h1b)``, SQD spin-symmetry).
+
+References
+----------
+"The paper" throughout this package -- its Eq. 2 (DFT-in-DFT), Eq. 6 (level
+shift), Eq. 8 (WF-in-DFT assembly), Eq. 19 (dissociation energy), §2.2 and
+Fig. 3B -- is the EmbASI framework paper:
+
+    G. Bramley, P. Stishenko, O. van Vuren, V. Blum, A. J. Logsdail, "A General
+    Pythonic Framework for DFT-in-DFT and WF-in-DFT Embedding", ChemRxiv (2025),
+    preprint, doi:10.26434/chemrxiv-2025-c23jf.
+
+The projection / level-shift embedding scheme it implements originates with
+F. R. Manby, M. Stella, J. D. Goodpaster, T. F. Miller III, J. Chem. Theory
+Comput. 8, 2564 (2012), doi:10.1021/ct300544e.
 """
 
 from __future__ import annotations
@@ -112,13 +126,19 @@ class EmbeddingWorkflow(BaseSettings):
     active_atoms: list[int] = [1, 5]  # O and its hydroxyl H -> the OH fragment
     basis: str = "sto-3g"  # matches the EmbASI developers' example
     xc_ll: str = "PBE"
-    xc_hl: str = "PBE"
+    # HF high level -> the WF-in-DFT path (the SQD integration this package is
+    # about).  A KS ``xc_hl`` (e.g. PBE/PBE0) instead routes DFT-in-DFT, where the
+    # solver never runs; the dissociation-energy driver overrides this per run.
+    xc_hl: str = "HF"
     mu: float = 1.0e6  # level-shift parameter, paper Eq. 6
 
     # --- active space: solver budget only, not embedding physics --- #
     n_frozen_occ: int = 0
     n_virtual: int | None = None  # None -> every virtual of subsystem A
-    selector: Literal["none", "concentric"] = "none"
+    # Concentric by default so the WF-in-DFT path keeps a nested, size-consistent
+    # active-virtual space (an energy-ordered "none" cut is non-nested across legs);
+    # a single-fragment ``active_fragment_sizes`` reproduces the plain concentric cut.
+    selector: Literal["none", "concentric"] = "concentric"
     # How the active atoms partition into PHYSICAL fragments, as consecutive
     # counts in the order they appear in ``active_atoms`` (which the reorder keeps
     # leading, ascending).  ``None`` (default) -> one fragment (current behaviour).
@@ -159,7 +179,7 @@ class EmbeddingWorkflow(BaseSettings):
         """Run the full embedding pipeline and return its ``ProjectionEnergy``.
 
         ``cli_cmd`` (the pydantic-settings entry point) just calls this; callers
-        that need the energy back -- e.g. an interaction-energy driver that
+        that need the energy back -- e.g. a dissociation-energy driver that
         differences a dimer against its monomers -- can call it directly and use
         the returned :class:`ProjectionEnergy`.  Pass ``log`` to redirect the
         console output (default: print on rank 0).
@@ -221,7 +241,7 @@ class EmbeddingWorkflow(BaseSettings):
         solver, and never feeds a correlated density back.  It self-consistently
         relaxes the high-level KS density of subsystem A inside the frozen
         embedding potential and assembles the same :class:`ProjectionEnergy`
-        breakdown, so an interaction-energy driver consumes both paths identically.
+        breakdown, so a dissociation-energy driver consumes both paths identically.
 
         This is the correctness baseline: on s26[22] it reproduces PBE0-in-PBE to
         within the embedding error of the full PBE0 number, and the PBE-in-PBE

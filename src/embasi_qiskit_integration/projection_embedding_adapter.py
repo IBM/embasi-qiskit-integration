@@ -12,6 +12,13 @@ orthonormal orbital set from the embedded Fock, and downfolds CASCI-style.
     F_emb  =  h_core + v_emb[γ^A, γ^B] + P_B  +  G_HL[γ^A]        (paper Eq. 4-5)
     h_emb  =  F_emb - G_HL[γ^A]              <- what the solver's h1 comes from
 
+"The paper" (Eq. 2, 4-6, 8, 19; §2.2; Fig. 3B) is the EmbASI framework paper:
+G. Bramley, P. Stishenko, O. van Vuren, V. Blum, A. J. Logsdail, "A General
+Pythonic Framework for DFT-in-DFT and WF-in-DFT Embedding", ChemRxiv (2025),
+preprint, doi:10.26434/chemrxiv-2025-c23jf.  The projection / level-shift scheme
+it implements originates with Manby, Stella, Goodpaster & Miller III, J. Chem.
+Theory Comput. 8, 2564 (2012), doi:10.1021/ct300544e.
+
 Two distinct effective potentials
 ---------------------------------
 ``G_HL`` above must match whatever ``calc_base_hl`` is (KS or HF), because it is
@@ -782,7 +789,7 @@ class ProjectionEmbeddingAdapter:
            ``E_low(AB) - E_low(A) + E_high(A) + correction``.
 
         Returns the same :class:`ProjectionEnergy` breakdown as the WF path, so the
-        driver and the interaction-energy bracket consume both identically.
+        driver and the dissociation-energy bracket consume both identically.
         """
         gtilde, _niter, _ddm = self._embedded_ks_scf(max_iter=max_iter, tol=tol)
 
