@@ -22,8 +22,8 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, CliApp, SettingsConfigDict
 
+from embasi_qiskit_integration.circuit_run.base import MockSampler
 from embasi_qiskit_integration.hamiltonian import fcidump
-from embasi_qiskit_integration.sampling.base import MockSampler
 from embasi_qiskit_integration.solvers import FCISolver
 from embasi_qiskit_integration.sqd.driver import run_sqd
 
@@ -76,19 +76,21 @@ class SqdPrototype(BaseSettings):
 
     def _sample_counts(self, ham) -> tuple[dict[str, int], str]:
         """Return (counts, source): Aer over SqDRIFT if available, else replay."""
-        from embasi_qiskit_integration.circuits.sqdrift import sqdrift_available
+        from embasi_qiskit_integration.circuit_generator.sqdrift import sqdrift_available
 
         if sqdrift_available():
-            from qiskit import transpile
-            from qiskit_aer import AerSimulator
+            from embasi_qiskit_integration.circuit_run import merge_counts
+            from embasi_qiskit_integration.circuit_run.aer import AerSampler
+            from embasi_qiskit_integration.solvers import SQDSolver
 
-            from embasi_qiskit_integration.circuits.sqdrift import build_sqdrift_circuits
-
-            circuits = build_sqdrift_circuits(ham, method="exact", time=self.evolution_time)
-            sim = AerSimulator()
-            tqc = transpile(circuits[0], sim, optimization_level=0)
-            counts = sim.run(tqc, shots=self.shots, seed_simulator=42).result().get_counts()
-            return {k: int(v) for k, v in counts.items()}, "aer+sqdrift"
+            # Drive the same build -> prep -> sample path the solver uses, so this
+            # demo exercises the real pipeline rather than a parallel copy of it.
+            solver = SQDSolver(
+                AerSampler(), shots=self.shots, evolution_time=self.evolution_time, seed=self.seed
+            )
+            circuits = solver.build_circuits(ham)
+            counts = merge_counts(solver.sampler.run(circuits, self.shots, seed=self.seed))
+            return counts, "aer+sqdrift"
 
         counts = MockSampler(self.data_dir / "mock_counts.json").sample(
             circuit=None, shots=self.shots

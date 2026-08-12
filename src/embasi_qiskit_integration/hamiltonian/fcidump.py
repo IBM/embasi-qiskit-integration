@@ -3,12 +3,17 @@
 
 """FCIDUMP + ``.npz`` sidecar read/write for :class:`EmbeddedHamiltonian`.
 
-FCIDUMP is a lossy carrier for our contract: it stores ``h1``/``h2``/``e_core``
-and the *total* electron count, but not the ``(n_alpha, n_beta)`` split
-unambiguously in general, nor the free-form ``meta`` provenance. We therefore
-write a ``.npz`` sidecar with the same stem that carries ``e_core``, ``nelec``
-and ``meta`` authoritatively; the FCIDUMP remains the source of truth for the
-integrals themselves.
+FCIDUMP is a lossy carrier for our contract: it stores ``h1``/``h2``/``e_core``,
+the total electron count and ``MS2``, but not the free-form ``meta`` provenance.
+We therefore write a ``.npz`` sidecar with the same stem that carries ``e_core``,
+``nelec`` and ``meta`` authoritatively; the FCIDUMP remains the source of truth
+for the integrals themselves.
+
+``MS2`` is written unsigned, as the ecosystem expects, so it pins ``|n_alpha -
+n_beta|`` but not which spin is in excess. A sidecar-less read therefore recovers
+the split exactly for a closed shell and *refuses to guess* for an open one,
+rather than silently returning the alpha-rich reading (see
+:func:`_nelec_from_header`).
 """
 
 from __future__ import annotations
@@ -36,8 +41,6 @@ def write(ham: EmbeddedHamiltonian, path: str | Path) -> None:
     path = Path(path)
     norb = ham.norb
     na, nb = ham.nelec
-    # ms = n_alpha - n_beta (2*S_z); pyscf writes this as the MS2 header field.
-    ms = na - nb
     pyscf_fcidump.from_integrals(
         str(path),
         ham.h1,
@@ -45,7 +48,6 @@ def write(ham: EmbeddedHamiltonian, path: str | Path) -> None:
         norb,
         (na, nb),
         nuc=ham.e_core,
-        ms=ms,
     )
 
     meta_json = json.dumps(ham.meta, default=_json_default)
@@ -81,7 +83,7 @@ def read(path: str | Path) -> EmbeddedHamiltonian:
             meta = json.loads(str(npz["meta_json"]))
     else:
         e_core = float(data.get("ECORE", 0.0))
-        nelec = _nelec_from_header(int(data["NELEC"]), int(data.get("MS2", 0)))
+        nelec = _nelec_from_header(int(data["NELEC"]), int(data.get("MS2", 0)), path)
         meta = {}
 
     nelec_pair: tuple[int, int] = (int(nelec[0]), int(nelec[1]))
@@ -89,11 +91,36 @@ def read(path: str | Path) -> EmbeddedHamiltonian:
     return EmbeddedHamiltonian(h1=h1, h2=h2, e_core=e_core, nelec=nelec_pair, meta=meta)
 
 
-def _nelec_from_header(nelec_total: int, ms2: int) -> tuple[int, int]:
-    """(NELEC, MS2=n_a-n_b) -> (n_alpha, n_beta)."""
-    na = (nelec_total + ms2) // 2
-    nb = nelec_total - na
-    return (na, nb)
+def _nelec_from_header(nelec_total: int, ms2: int, path: Path) -> tuple[int, int]:
+    """``(NELEC, MS2)`` -> ``(n_alpha, n_beta)``, taking MS2 as ``n_alpha - n_beta``.
+
+    ``MS2`` is conventionally written unsigned (see :func:`write`), so a non-zero
+    value is genuinely ambiguous: ``MS2=1`` with ``NELEC=3`` fits both ``(2, 1)``
+    and ``(1, 2)``. Rather than silently assume the alpha-rich reading -- which
+    would return the wrong spin sector for half of all open-shell inputs, with a
+    plausible-looking energy and nothing to flag it -- this raises and points at the
+    sidecar that records the split authoritatively.
+
+    A negative ``MS2`` is accepted (some writers do emit one) and taken at face
+    value, since it is then unambiguous.
+    """
+    if ms2 == 0:
+        # Closed shell (or an equal-spin open shell): unambiguous.
+        return (nelec_total // 2, nelec_total - nelec_total // 2)
+
+    if ms2 < 0:
+        na = (nelec_total + ms2) // 2
+        return (na, nelec_total - na)
+
+    alpha_rich = (nelec_total + ms2) // 2
+    raise ValueError(
+        f"{path.name} has MS2={ms2} (NELEC={nelec_total}) and no .npz sidecar, so the "
+        f"(n_alpha, n_beta) split is ambiguous: both ({alpha_rich}, "
+        f"{nelec_total - alpha_rich}) and ({nelec_total - alpha_rich}, {alpha_rich}) "
+        "match this header, because MS2 is written unsigned. Provide the sidecar "
+        f"({_sidecar_path(path).name}, written by this module's `write`), or construct "
+        "the EmbeddedHamiltonian directly with the intended nelec."
+    )
 
 
 def _json_default(obj: object) -> object:

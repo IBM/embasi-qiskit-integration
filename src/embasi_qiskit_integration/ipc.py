@@ -30,15 +30,6 @@ RESULT_NAME = "result.npz"
 ERROR_NAME = "result.ERROR"
 
 
-def is_rank0() -> bool:
-    """True on MPI rank 0, or when mpi4py is unavailable (single process)."""
-    try:
-        from mpi4py import MPI
-    except ImportError:
-        return True
-    return MPI.COMM_WORLD.Get_rank() == 0
-
-
 def rank0_solve(solver, ham: EmbeddedHamiltonian) -> SolverResult:
     """Run ``solver.solve(ham)`` on rank 0 and broadcast the result.
 

@@ -23,12 +23,12 @@ embedding_workflow.py`` is a thin entry point that imports and runs it::
     uv run python scripts/embedding_workflow.py
     uv run python scripts/embedding_workflow.py --solver fci
     uv run python scripts/embedding_workflow.py --sampler runtime --shots 200000
-    uv run python scripts/embedding_workflow.py --n-virtual 4 --n-frozen-occ 1
+    uv run python scripts/embedding_workflow.py --n_virtual 4 --n_frozen_occ 1
     uv run python scripts/embedding_workflow.py --handoff two-process
-    uv run python scripts/embedding_workflow.py --max-cycles 20 --mix-alpha 0.5
+    uv run python scripts/embedding_workflow.py --max_cycles 20 --mix_alpha 0.5
 
 By default the *full* subsystem-A space is correlated, which is the WF-in-DFT
-problem the EmbASI paper solves.  ``--n-frozen-occ`` and ``--n-virtual`` exist
+problem the EmbASI paper solves.  ``--n_frozen_occ`` and ``--n_virtual`` exist
 only to fit a solver budget; nothing in the embedding implies an active space.
 For SQD on hardware you will want both.
 
@@ -66,6 +66,7 @@ from typing import Literal
 import numpy as np
 from pydantic_settings import BaseSettings, CliApp, SettingsConfigDict
 
+from embasi_qiskit_integration.circuit_run.base import SamplerKind
 from embasi_qiskit_integration.contract import SolverResult
 from embasi_qiskit_integration.projection_embedding_adapter import (
     ProjectionEmbeddingAdapter,
@@ -130,6 +131,8 @@ class EmbeddingWorkflow(BaseSettings):
     density_fit: bool = False  # density-fit the active-space ERIs
     df_auxbasis: str | None = None  # fitting auxbasis; None -> PySCF default
 
+    rdm_trace_tol: float = 1.0e-6
+
     # --- outer self-consistency loop --- #
     max_cycles: int = 15  # cap on feedback cycles (1 -> single pass)
     e_tol: float = 1.0e-6  # |ΔE_total| convergence threshold (Ha)
@@ -141,7 +144,7 @@ class EmbeddingWorkflow(BaseSettings):
     # --- solver / sampling --- #
     solver: Literal["sqd", "fci"] = "sqd"
     handoff: Literal["in-process", "two-process"] = "in-process"
-    sampler: Literal["aer", "mock", "runtime"] = "aer"
+    sampler: SamplerKind = "aer"
     backend: str | None = None  # runtime backend name; else least-busy
     optimization_level: int = 3  # runtime ISA-transpile level
     shots: int = 100_000
@@ -279,9 +282,10 @@ class EmbeddingWorkflow(BaseSettings):
             log(f"   {orbitals}")
             if selector is not None:
                 n_kept_virt = orbitals.n_active_orbitals - (orbitals.n_occ - orbitals.inactive.size)
+                budget = "" if self.n_virtual is None else f" (cap {self.n_virtual})"
                 log(
-                    f"   selector=concentric picked {n_kept_virt} virtuals "
-                    "(--n_virtual is advisory when a selector is set)"
+                    f"   selector=concentric picked {n_kept_virt} virtuals{budget}; "
+                    f"n_frozen_occ={self.n_frozen_occ} frozen"
                 )
             elif self.solver == "sqd" and self.n_virtual is None:
                 log(
@@ -301,7 +305,11 @@ class EmbeddingWorkflow(BaseSettings):
                 f"   E_solver  = {result.energy:.6f} Ha "
                 f"(solver={result.diagnostics.get('solver', self.solver)})"
             )
-            log(f"   trace(rdm1) = {np.trace(result.rdm1):.4f} (expected {sum(ham.nelec)})")
+            deviation = result.check_particle_number(ham.nelec, atol=self.rdm_trace_tol)
+            log(
+                f"   trace(rdm1) = {np.trace(result.rdm1):.4f} "
+                f"(expected {sum(ham.nelec)}, off by {deviation:+.1e})"
+            )
 
             log(f"== Step 4: assemble the projection-based-embedding energy =={tag}")
             energy = emb.projection_energy(result, orbitals)
@@ -455,24 +463,17 @@ class EmbeddingWorkflow(BaseSettings):
         if self.solver == "fci":
             return FCISolver()
 
-        if self.sampler == "mock":
-            from embasi_qiskit_integration.sampling.base import MockSampler
+        from embasi_qiskit_integration.circuit_run import build_sampler
 
-            sampler = MockSampler(DATA_DIR / "mock_counts.json")
-        elif self.sampler == "runtime":
-            # Plug in real quantum hardware: uses configured IBM Quantum
-            # credentials, least-busy backend unless --backend names one.
-            from embasi_qiskit_integration.sampling.runtime import RuntimeSampler
-
-            sampler = RuntimeSampler(
-                backend=self.backend,
-                optimization_level=self.optimization_level,
-                default_shots=self.shots,
-            )
-        else:
-            from embasi_qiskit_integration.sampling.aer import AerSampler
-
-            sampler = AerSampler()
+        # ``runtime`` plugs in real quantum hardware: configured IBM Quantum
+        # credentials, least-busy backend unless --backend names one.
+        sampler = build_sampler(
+            self.sampler,
+            counts=str(DATA_DIR / "mock_counts.json"),
+            backend=self.backend,
+            optimization_level=self.optimization_level,
+            default_shots=self.shots,
+        )
         return SQDSolver(sampler, shots=self.shots, seed=self.seed)
 
     def _solve(self, ham, solver, *, rank, log) -> SolverResult:

@@ -7,7 +7,7 @@ The workflow itself now lives in the package as
 tests and the interaction-energy driver use it directly rather than loading this
 script by path).  This file just runs it::
 
-    uv run python scripts/embedding_workflow.py --solver fci --n-virtual 2
+    uv run python scripts/embedding_workflow.py --solver fci --n_virtual 2
 
 See ``embasi_qiskit_integration/embedding.py`` for the full flow description and
 the complete list of options.

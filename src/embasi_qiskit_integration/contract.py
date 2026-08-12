@@ -103,6 +103,46 @@ class SolverResult(BaseModel):
             return None
         return np.asarray(value)
 
+    def check_particle_number(self, nelec: tuple[int, int] | int, *, atol: float = 1e-6) -> float:
+        """Verify ``trace(rdm1)`` equals the electron count; return the deviation.
+
+        ``trace`` of a spin-summed one-particle RDM *is* the particle number, so a
+        mismatch means the solver returned an RDM for a different sector than the
+        Hamiltonian describes -- a wrong-but-plausible result. This matters beyond
+        one solve: the RDM is fed back into the next embedding cycle's density, so an
+        unchecked error propagates through the outer loop while every printed energy
+        still looks reasonable.
+
+        ``atol`` is loose enough to absorb the sampling noise of an SQD solve while
+        still catching a whole-electron discrepancy.
+
+        Args:
+            nelec: the expected count, as ``(n_alpha, n_beta)`` or a total.
+            atol: absolute tolerance on ``|trace(rdm1) - expected|``.
+
+        Returns:
+            The signed deviation ``trace(rdm1) - expected``, for logging.
+
+        Raises:
+            ValueError: if the deviation exceeds ``atol``, or ``rdm1`` is not square.
+        """
+        expected = float(sum(nelec)) if isinstance(nelec, tuple) else float(nelec)
+        rdm1 = np.asarray(self.rdm1)
+        if rdm1.ndim != 2 or rdm1.shape[0] != rdm1.shape[1]:
+            raise ValueError(f"rdm1 must be a square matrix, got shape {rdm1.shape}")
+
+        trace = float(np.trace(rdm1))
+        deviation = trace - expected
+        if abs(deviation) > atol:
+            raise ValueError(
+                f"trace(rdm1) = {trace:.6f} but the active space holds {expected:g} "
+                f"electrons (off by {deviation:+.2e}, tolerance {atol:g}). The solver "
+                "returned an RDM for the wrong particle-number sector; feeding it back "
+                "would corrupt the embedding density. Check the solver's bitstring "
+                "convention and its postselection."
+            )
+        return deviation
+
 
 def _has_eightfold_symmetry(h2: np.ndarray, atol: float) -> bool:
     """Check the real 8-fold symmetry of chemists'-notation integrals (pq|rs).

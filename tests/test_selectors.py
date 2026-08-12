@@ -220,3 +220,78 @@ def test_fragment_ao_indices_from_mock_mol():
 
     empty = fragment_ao_indices(_Mol(), [])
     assert empty.size == 0
+
+
+# ----- n_frozen_occ must survive a selector ---------------------------------- #
+
+
+def _stub_adapter(nao: int, n_occ: int, seed: int = 3):
+    """A ``ProjectionEmbeddingAdapter`` with only what ``build_orbitals`` reads.
+
+    ``build_orbitals`` needs the Fock/overlap matrices, the level-shift floor and
+    ``n_occ``; everything else on the adapter belongs to the live EmbASI embedding.
+    Subclassing to override the read-only properties keeps this independent of
+    EmbASI, which the full fixtures require.
+    """
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        ProjectionEmbeddingAdapter,
+    )
+
+    rng = np.random.default_rng(seed)
+    a = rng.normal(size=(nao, nao))
+    fock = a + a.T
+    overlap = np.eye(nao)
+
+    class _Stub(ProjectionEmbeddingAdapter):
+        _s_arr = property(lambda self: overlap)
+        _fock_arr = property(lambda self: fock)
+        mo_a_ll = property(lambda self: np.zeros((nao, n_occ)))
+
+        def _validate_span(self, coeff):  # needs the real embedding
+            return None
+
+    adapter = object.__new__(_Stub)
+    adapter._floor = np.inf  # keep every orbital
+    return adapter, overlap
+
+
+def test_n_frozen_occ_is_honoured_when_a_selector_is_set():
+    """A selector must not silently discard the occupied freeze.
+
+    Regression: ``n_frozen_occ`` was validated and then dropped whenever a selector
+    was passed, because the selector branch replaced the ``arange(n_frozen_occ, ...)``
+    that applied it. Selectors choose *virtuals* and return the occupied block
+    untouched by contract, so the freeze has to be applied after them.
+
+    The symptom was quiet: ``e_core`` and ``nelec`` stay mutually consistent, so
+    energies looked fine while the active space — and hence the qubit count the flag
+    exists to bound — was larger than requested.
+    """
+    adapter, overlap = _stub_adapter(nao=8, n_occ=3)
+    selector = concentric_selector(overlap, np.arange(4), max_virtual=2)
+
+    unfrozen = adapter.build_orbitals(n_frozen_occ=0, selector=selector, restrict_to_a=False)
+    frozen = adapter.build_orbitals(n_frozen_occ=2, selector=selector, restrict_to_a=False)
+
+    # The freeze removes exactly the two lowest occupied orbitals...
+    assert unfrozen.inactive.tolist() == []
+    assert frozen.inactive.tolist() == [0, 1]
+    # ...which is 4 fewer active electrons and 2 fewer active orbitals.
+    assert frozen.n_active_electrons == unfrozen.n_active_electrons - 4
+    assert frozen.n_active_orbitals == unfrozen.n_active_orbitals - 2
+    # The selector's virtual choice is untouched by the freeze.
+    assert [i for i in frozen.active if i >= 3] == [i for i in unfrozen.active if i >= 3]
+
+
+def test_freeze_that_empties_the_active_space_raises():
+    """Freezing everything the selector kept must fail loudly, not yield nothing."""
+    import pytest
+
+    adapter, _ = _stub_adapter(nao=8, n_occ=3)
+
+    with pytest.raises(ValueError, match="froze every orbital"):
+        adapter.build_orbitals(
+            n_frozen_occ=2,
+            selector=lambda coeff, energy, n_occ: np.array([0, 1]),
+            restrict_to_a=False,
+        )
