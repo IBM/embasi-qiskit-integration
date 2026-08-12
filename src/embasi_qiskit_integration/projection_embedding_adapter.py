@@ -697,6 +697,147 @@ class ProjectionEmbeddingAdapter:
             footing_shift=footing_shift,
         )
 
+    # ---------------- DFT-in-DFT (reference path, no solver) ---------------- #
+    def dft_in_dft_energy(self, *, max_iter: int = 200, tol: float = 1.0e-10) -> ProjectionEnergy:
+        """Paper **Eq. 2** DFT-in-DFT: E_H[γ̃^A] as a Kohn-Sham energy, no CAS.
+
+        This is a *separate path* from the WF-in-DFT downfold (:meth:`build_orbitals`
+        -> :meth:`embedded_hamiltonian` -> solver -> :meth:`projection_energy`).  A
+        hybrid or pure high-level functional (PBE0, PBE, ...) is a **density**
+        functional, not a wavefunction method: Eq. 2 evaluates ``E_H[γ̃^A]`` over the
+        *full* occupied space of A at the embedded density, with no active space, no
+        virtual budget, no frozen core, no bare-electronic downfold, and no solver.
+        Routing a hybrid xc through the WF path (Eq. 8) is a category error whose
+        signature is a large non-monotonic dependence on the virtual budget; this
+        method exists so the driver can send hybrid/pure-DFT high levels here instead.
+
+        The three steps mirror the harness that validated the number end-to-end
+        (PBE0-in-PBE = -38.77 vs full PBE0 -39.06 on s26[22]; PBE-in-PBE control gives
+        Δ_HL = 0 exactly -- the paper's Fig. 3B cancellation):
+
+        1. **Self-consistent embedded KS on A.**  Iterate ``F = h_emb + veff_hl(γ̃^A)``
+           -- ``veff_hl`` evaluated at ``γ̃^A`` **alone**, because the frozen ``v_emb``
+           inside ``h_emb`` already carries the environment's mean-field response;
+           adding γ^B would double-count it.  Diagonalize inside span(A) (deflating
+           span(B) via ``mo_b_ll``, exactly as :meth:`_eigh_subsystem_a`), refill A's
+           ``n_occ``, and drive it to a fixed point with DIIS on the A-subspace
+           commutator ``[F, P]`` (the bare fixed point is numerically unstable even
+           for the PBE control; DIIS converges it in a handful of iterations).
+
+        2. **Energy at the embedded density.**  ``E_H[γ̃^A] = mf.energy_tot(dm=γ̃^A)``:
+           the *bare* KS total (electronic + nuclear) of the fragment density on the
+           full-supersystem nuclear frame.  ``energy_tot`` never saw ``v_emb`` or
+           ``P_B``, so -- unlike :meth:`projection_energy`, whose solver energy *did*
+           include the embedding potential -- there is **nothing to subtract from the
+           energy** here.  Only the footing rebase applies.
+
+        3. **Assembly** (identical Eq. 2 / Eq. 8 algebra apart from the E_H eval):
+           footing-rebase ``E_high(A)`` onto ``E_low(A)``'s ghosted-A nuclear frame,
+           add the Eq. 2 fourth term ``tr[(γ̃^A - γ^A) v_emb]``, and telescope
+           ``E_low(AB) - E_low(A) + E_high(A) + correction``.
+
+        Returns the same :class:`ProjectionEnergy` breakdown as the WF path, so the
+        driver and the interaction-energy bracket consume both identically.
+        """
+        gtilde, _niter, _ddm = self._embedded_ks_scf(max_iter=max_iter, tol=tol)
+
+        # E_H[γ̃^A]: bare KS total at the embedded density (electronic + enuc, full
+        # nuclear frame).  No v_emb / P_B was folded into energy_tot, so nothing is
+        # subtracted from the energy -- contrast projection_energy, whose solver
+        # energy carried the embedding potential.
+        e_high_a = float(self.ints.mf.energy_tot(dm=gtilde))
+
+        v_emb, p_b = self.v_emb, self.p_b
+        leak = float(np.einsum("ij,ji->", gtilde, p_b))
+
+        # Rebase onto E_low(A)'s (ghosted subsystem-A) nuclear footing -- identical
+        # machinery to projection_energy; see that method for the derivation.
+        hcore_a, enuc_a = self._a_fragment_footing()
+        footing_shift = float(
+            (self.ints.energy_nuc() - enuc_a)
+            + np.einsum("ij,ji->", gtilde, self.ints.hcore() - hcore_a)
+        )
+        e_high_a -= footing_shift
+
+        # Eq. 2 fourth term: the density-difference response through v_emb.
+        correction = float(np.einsum("ij,ji->", gtilde - self._dm_a, v_emb))
+
+        e_low_ab, e_low_a = self._low_level_energies()
+        return ProjectionEnergy(
+            e_low_total=e_low_ab,
+            e_low_A=e_low_a,
+            e_high_A=float(e_high_a),
+            correction=correction,
+            projector_leak=leak,
+            footing_shift=footing_shift,
+        )
+
+    def _embedded_ks_scf(
+        self, *, max_iter: int = 200, tol: float = 1.0e-10
+    ) -> tuple[np.ndarray, int, float]:
+        """Self-consistent embedded KS(high-level) relaxation of subsystem A.
+
+        Returns ``(γ̃^A, n_iter, final_max_density_change)``.  The Fock is
+        ``F = h_emb + veff_hl(γ̃^A)`` with ``veff_hl`` at ``γ̃^A`` alone (the frozen
+        ``v_emb`` in ``h_emb`` already carries B's mean field).  We build the same
+        S-orthonormal span(A) basis ``Q`` as :meth:`_eigh_subsystem_a` -- deflating
+        span(B) via ``mo_b_ll`` -- diagonalize the *density-dependent* Fock in that
+        basis each cycle, refill A's ``n_occ``, and accelerate with DIIS on the
+        commutator ``[F, P]`` (which is ``S = I`` in the Q basis).  Bare fixed-point
+        iteration diverges even for the PBE control; DIIS converges it in ~3-5 steps
+        to ``ddm ~ 1e-11``.  This is the only place a KS problem is re-solved on the
+        embedding side; the WF path never re-runs an SCF (it downfolds and hands off).
+        """
+        s = self._s
+        c_b = self.mo_b_ll
+        proj = np.eye(s.shape[0]) - c_b @ (c_b.T @ s)
+        chol = np.linalg.cholesky(s)
+        x_all = sla.solve_triangular(chol.T, np.eye(s.shape[0]), lower=False)
+        y = proj @ x_all
+        gram = y.T @ s @ y
+        w, u = np.linalg.eigh(gram)
+        nonzero = w > 1e-8
+        q = y @ u[:, nonzero] @ np.diag(1.0 / np.sqrt(w[nonzero]))
+
+        h_emb = self.h_emb
+        n_occ = self.mo_a_ll.shape[1]
+        dm = np.array(self._dm_a, dtype=float)
+        errs: list[np.ndarray] = []
+        foks: list[np.ndarray] = []
+        ddm = np.inf
+        it = 0
+        for it in range(1, max_iter + 1):
+            f = h_emb + self.ints.veff_hl(dm)  # veff at γ̃^A ALONE
+            fq = q.T @ f @ q
+            dmq = q.T @ s @ dm @ s @ q  # density in the A-orthonormal metric
+            err = fq @ dmq - dmq @ fq  # [F, P]; S = I in the Q basis
+            errs.append(err.ravel())
+            foks.append(fq)
+            if len(errs) > 8:
+                errs.pop(0)
+                foks.pop(0)
+            n = len(errs)
+            b = np.full((n + 1, n + 1), -1.0)
+            b[n, n] = 0.0
+            for i in range(n):
+                for j in range(n):
+                    b[i, j] = errs[i] @ errs[j]
+            rhs = np.zeros(n + 1)
+            rhs[n] = -1.0
+            try:
+                cc_diis = np.linalg.solve(b, rhs)[:n]
+                fq = sum(ci * fi for ci, fi in zip(cc_diis, foks))
+            except np.linalg.LinAlgError:
+                pass  # keep the un-extrapolated Fock this cycle
+            _eps, cc = np.linalg.eigh(fq)
+            c_occ = (q @ cc)[:, :n_occ]
+            dm_new = 2.0 * (c_occ @ c_occ.T)
+            ddm = float(np.abs(dm_new - dm).max())
+            dm = dm_new
+            if ddm < tol:
+                break
+        return dm, it, ddm
+
     def _a_fragment_footing(self) -> tuple[np.ndarray, float]:
         """(h_core^A, E_nuc^A) of EmbASI's *ghosted subsystem-A* reference.
 

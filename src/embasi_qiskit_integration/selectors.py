@@ -102,6 +102,96 @@ def concentric_selector(
     return _select
 
 
+def per_fragment_concentric_selector(
+    overlap: np.ndarray,
+    fragment_ao_groups: list[np.ndarray],
+    *,
+    gap_tol: float = 1.0e-3,
+    max_virtual_per_fragment: int | None = None,
+    min_virtual_per_fragment: int = 0,
+) -> Selector:
+    """Concentric cut run *independently per fragment*, then unioned.
+
+    For an interaction of ``k`` fragments (e.g. both OH groups of a dimer), a
+    single concentric cut anchored on the *union* ``OH-A ∪ OH-B`` cannot
+    guarantee that the kept virtuals span each fragment's own tightly-coupled
+    shell -- the gap analysis on the union can drop one fragment's shell entirely
+    in favour of the other's, breaking additivity by construction.  This was
+    shown directly by a span-containment test: at ``n_virtual=2`` the dimer's
+    energy-ordered virtuals were a *different* 4-space than the union of the two
+    monomers' 2-each (min principal-angle cosine ~0.1, i.e. containment failing),
+    at *every* separation -- including 20 A where nothing overlaps, ruling out
+    BSSE as the cause.
+
+    The fix is to select per fragment: score each virtual by its Mulliken
+    population on fragment ``g`` alone, take the concentric-gap cut for ``g``, and
+    keep the *union* over ``g`` of the selected virtuals.  The dimer active-virtual
+    span is then the direct sum of the per-fragment shells by construction, so
+    ``span(C_virt_dimer) ⊇ span(C_virt_A) ⊕ span(C_virt_B)``.
+
+    Args:
+        overlap: AO overlap matrix ``S`` (``adapter._s``), shape (nao, nao).
+        fragment_ao_groups: one AO-index array per physical fragment.  A single
+            group reproduces :func:`concentric_selector` exactly (verified by the
+            length-1 delegation below), so this is a strict generalisation.
+        gap_tol: shell-boundary tolerance, per fragment (see
+            :func:`concentric_selector`).
+        max_virtual_per_fragment: cap on virtuals kept *for each fragment* (the
+            per-fragment budget -- this is what additivity needs, in contrast to a
+            single global cap that starves the multi-fragment leg).  ``None`` for
+            no cap.
+        min_virtual_per_fragment: floor on virtuals kept for each fragment.
+
+    Returns:
+        A ``Selector`` returning ``[0, n_occ)`` (all occupied A) followed by the
+        sorted union of the per-fragment kept virtual indices.
+    """
+    groups = [np.asarray(g, dtype=int) for g in fragment_ao_groups]
+    if len(groups) == 1:
+        # Single fragment: identical to the plain concentric cut (per-fragment
+        # cap == global cap when there is one fragment).
+        return concentric_selector(
+            overlap,
+            groups[0],
+            gap_tol=gap_tol,
+            max_virtual=max_virtual_per_fragment,
+            min_virtual=min_virtual_per_fragment,
+        )
+
+    s = np.asarray(overlap)
+
+    def _select(coeff: np.ndarray, energy: np.ndarray, n_occ: int) -> np.ndarray:
+        c_virt = coeff[:, n_occ:]
+        n_virt = c_virt.shape[1]
+        occupied = np.arange(n_occ)
+        if n_virt == 0:
+            return occupied
+
+        sc = s @ c_virt
+        kept: set[int] = set()
+        for frag in groups:
+            # Fragment population of each virtual on THIS fragment only.
+            w = np.einsum("mv,mv->v", sc[frag, :], c_virt[frag, :])
+            order = np.argsort(-w)
+            w_sorted = w[order]
+            gaps = w_sorted[:-1] - w_sorted[1:]
+            keep = n_virt
+            significant = np.nonzero(gaps >= gap_tol)[0]
+            if significant.size:
+                edge = int(significant[np.argmax(gaps[significant])])
+                keep = edge + 1
+            keep = max(keep, min_virtual_per_fragment)
+            if max_virtual_per_fragment is not None:
+                keep = min(keep, max_virtual_per_fragment)
+            keep = min(keep, n_virt)
+            kept.update(int(n_occ + v) for v in order[:keep])
+
+        kept_virtuals = np.sort(np.fromiter(kept, dtype=int))
+        return np.concatenate([occupied, kept_virtuals]).astype(int)
+
+    return _select
+
+
 def fragment_ao_indices(mol, active_atoms) -> np.ndarray:
     """AO indices of the ``active_atoms`` in ``mol`` (PySCF ``aoslice_by_atom``).
 

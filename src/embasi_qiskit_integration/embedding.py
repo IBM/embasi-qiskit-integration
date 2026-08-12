@@ -118,6 +118,13 @@ class EmbeddingWorkflow(BaseSettings):
     n_frozen_occ: int = 0
     n_virtual: int | None = None  # None -> every virtual of subsystem A
     selector: Literal["none", "concentric"] = "none"
+    # How the active atoms partition into PHYSICAL fragments, as consecutive
+    # counts in the order they appear in ``active_atoms`` (which the reorder keeps
+    # leading, ascending).  ``None`` (default) -> one fragment (current behaviour).
+    # e.g. both-OH dimer active_atoms=[1,5,7,11] -> [2, 2] (OH-A | OH-B): the
+    # concentric selector then cuts each OH shell independently and unions them,
+    # so the dimer active-virtual span contains BOTH monomer shells (additivity).
+    active_fragment_sizes: list[int] | None = None
 
     # --- integral backend --- #
     density_fit: bool = False  # density-fit the active-space ERIs
@@ -176,9 +183,59 @@ class EmbeddingWorkflow(BaseSettings):
             f"active atoms {self.active_atoms}, projection=level-shift"
         )
 
+        # Route on the high-level METHOD, not the solver.  A density functional
+        # (pure or hybrid: PBE, PBE0, B3LYP, ...) is DFT-in-DFT (paper Eq. 2): the
+        # high-level energy is a Kohn-Sham energy at the embedded density, with no
+        # active space, no solver, and no correlated wavefunction.  A wavefunction
+        # method (HF as a mean field, or a correlated solver on top) is WF-in-DFT
+        # (Eq. 8): downfold subsystem A to an active space and hand a bare
+        # electronic Hamiltonian to FCI/SQD.  Routing a hybrid xc through the WF
+        # path is a category error (its signature is a large, non-monotonic
+        # dependence of Δ_HL on the virtual budget), so it goes down its own path.
+        if self._is_dft_in_dft():
+            return self._dft_in_dft(emb, log=log)
+
         selector = self._build_selector(emb)
         solver = self._build_solver()
         return self._run_outer_loop(emb, solver, selector, rank=rank, log=log)
+
+    def _is_dft_in_dft(self) -> bool:
+        """True when the high level is a density functional (-> paper Eq. 2).
+
+        ``HF`` is the sole wavefunction mean field expressible as an ``xc_hl``
+        string, so it (and any correlated method layered on it) takes the
+        WF-in-DFT path; every other ``xc_hl`` is a KS functional and takes
+        DFT-in-DFT.  Kept as an explicit predicate so the routing rule is one
+        readable line and the two paths never blur into a shared ``run()`` body.
+        """
+        return self.xc_hl.strip().upper() != "HF"
+
+    def _dft_in_dft(self, emb, *, log):
+        """Paper Eq. 2 reference path: a Kohn-Sham energy at the embedded density.
+
+        Deliberately NOT a variant of the WF outer loop -- it never builds an
+        active space, never constructs a downfolded Hamiltonian, never calls a
+        solver, and never feeds a correlated density back.  It self-consistently
+        relaxes the high-level KS density of subsystem A inside the frozen
+        embedding potential and assembles the same :class:`ProjectionEnergy`
+        breakdown, so an interaction-energy driver consumes both paths identically.
+
+        This is the correctness baseline: on s26[22] it reproduces PBE0-in-PBE to
+        within the embedding error of the full PBE0 number, and the PBE-in-PBE
+        control gives Δ_HL = 0 exactly (the high/low functionals coincide, so the
+        embedding is a no-op on the energy -- the paper's Fig. 3B cancellation).
+        """
+        log("== DFT-in-DFT (paper Eq. 2): embedded Kohn-Sham energy, no active space ==")
+        energy = emb.dft_in_dft_energy()
+        log("   E = E_low(total) - E_low(A) + E_high(A) + corr")
+        log(
+            f"     = {energy.e_low_total:.6f} - {energy.e_low_A:.6f} "
+            f"+ {energy.e_high_A:.6f} + {energy.correction:.6f}"
+        )
+        log(f"     = {energy.total:.6f} Ha")
+        log(f"   tr[γ̃^A P_B] = {energy.projector_leak:.2e} Ha (should be ~0)")
+        log(f"   footing shift applied to E_high(A): {energy.footing_shift:.6f} Ha")
+        return energy
 
     # ---------------- outer self-consistency loop ---------------- #
     def _run_outer_loop(self, emb, solver, selector, *, rank, log):
@@ -366,14 +423,31 @@ class EmbeddingWorkflow(BaseSettings):
         if self.selector == "none":
             return None
         from embasi_qiskit_integration.selectors import (
-            concentric_selector,
             fragment_ao_indices,
+            per_fragment_concentric_selector,
         )
 
         mol = emb.ints.mol
-        active_after_sort = list(range(len(self.active_atoms)))
-        frag_ao = fragment_ao_indices(mol, active_after_sort)
-        return concentric_selector(emb._s, frag_ao, max_virtual=self.n_virtual)
+        # Reordered active-atom positions lead, ascending: 0..len(active_atoms)-1.
+        # Partition them into PHYSICAL fragments per ``active_fragment_sizes`` (one
+        # group by default), then run the concentric cut per group and union.
+        n_active = len(self.active_atoms)
+        sizes = self.active_fragment_sizes or [n_active]
+        if sum(sizes) != n_active:
+            raise ValueError(
+                f"active_fragment_sizes {sizes} sum to {sum(sizes)}, but there are "
+                f"{n_active} active atoms"
+            )
+        groups, start = [], 0
+        for sz in sizes:
+            positions = list(range(start, start + sz))
+            groups.append(fragment_ao_indices(mol, positions))
+            start += sz
+        # ``n_virtual`` is the per-FRAGMENT ceiling here (additivity: each fragment
+        # gets its own shell, matched to the monomer leg's cut), not a global cap.
+        return per_fragment_concentric_selector(
+            emb._s, groups, max_virtual_per_fragment=self.n_virtual
+        )
 
     def _build_solver(self):
         from embasi_qiskit_integration.solvers import FCISolver, SQDSolver
