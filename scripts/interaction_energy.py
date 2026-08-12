@@ -126,26 +126,26 @@ class InteractionEnergy(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="EQI_INT_", cli_parse_args=True)
 
     # --- system (mirrors EmbeddingWorkflow; forwarded to each sub-run) --- #
-    s26_index: int = 22                  # methanol dimer in the s26 set
-    monomer_n_atoms: int = 6             # atoms 0..N-1 are monomer A; the rest, B
-    active_atoms: list[int] = [1, 5]     # active fragment on monomer A (O + OH H)
+    s26_index: int = 22  # methanol dimer in the s26 set
+    monomer_n_atoms: int = 6  # atoms 0..N-1 are monomer A; the rest, B
+    active_atoms: list[int] = [1, 5]  # active fragment on monomer A (O + OH H)
     basis: str = "6-31G"
     xc_ll: str = "PBE"
     xc_hl: str = "PBE0"
     mu: float = 1.0e6
-    assume_symmetric: bool = True        # homodimer: E(B) == E(A); False -> unsupported
+    assume_symmetric: bool = True  # homodimer: E(B) == E(A); False -> unsupported
 
     # --- WF-in-DFT knobs (used only when xc_hl == HF; inert on DFT-in-DFT) --- #
     # These reach the number ONLY on the wavefunction path.  The concentric
     # selector is the default because the WF path requires it (energy-ordered cuts
     # are non-nested across the two differently-sized legs -- see module docstring).
-    solver: str = "sqd"                  # "sqd" | "fci"
-    selector: str = "concentric"         # "concentric" | "none"
-    n_virtual: int | None = None         # advisory when a selector is set
-    sampler: str = "aer"                 # "aer" | "mock" | "runtime" (SQD only)
+    solver: str = "sqd"  # "sqd" | "fci"
+    selector: str = "concentric"  # "concentric" | "none"
+    n_virtual: int | None = None  # advisory when a selector is set
+    sampler: str = "aer"  # "aer" | "mock" | "runtime" (SQD only)
     shots: int = 100_000
     seed: int = 24
-    max_cycles: int = 1                  # single pass: difference single totals
+    max_cycles: int = 1  # single pass: difference single totals
 
     # --------------------------------------------------------------- #
     # config forwarding / fragment bookkeeping
@@ -160,8 +160,18 @@ class InteractionEnergy(BaseSettings):
         (dimer vs monomer) and is set at each :meth:`_run` call site.
         """
         shared = [
-            "s26_index", "active_atoms", "basis", "xc_ll", "xc_hl", "mu",
-            "solver", "selector", "n_virtual", "sampler", "shots", "seed",
+            "s26_index",
+            "active_atoms",
+            "basis",
+            "xc_ll",
+            "xc_hl",
+            "mu",
+            "solver",
+            "selector",
+            "n_virtual",
+            "sampler",
+            "shots",
+            "seed",
             "max_cycles",
         ]
         return {k: getattr(self, k) for k in shared}
@@ -221,8 +231,10 @@ class InteractionEnergy(BaseSettings):
         mol = pyscf.M(atom=ase_atoms_to_pyscf(atoms), basis=self.basis)
         mf = mol.KS(xc=self.xc_ll)
         e = float(mf.kernel())
-        print(f"  free-PBE[{tag}] ({len(atoms)} atoms, {self.xc_ll}/{self.basis}) "
-              f"= {e:.8f} Ha  (converged={bool(mf.converged)})")
+        print(
+            f"  free-PBE[{tag}] ({len(atoms)} atoms, {self.xc_ll}/{self.basis}) "
+            f"= {e:.8f} Ha  (converged={bool(mf.converged)})"
+        )
         return e
 
     def _dimer_active(self) -> list[int]:
@@ -235,9 +247,7 @@ class InteractionEnergy(BaseSettings):
         keeps a single source of truth -- it cannot drift out of sync with
         ``monomer_n_atoms`` or the fragment definition.
         """
-        return list(self.active_atoms) + [
-            a + self.monomer_n_atoms for a in self.active_atoms
-        ]
+        return list(self.active_atoms) + [a + self.monomer_n_atoms for a in self.active_atoms]
 
     # --------------------------------------------------------------- #
     # embedding sub-runs
@@ -260,8 +270,11 @@ class InteractionEnergy(BaseSettings):
         wf = EmbeddingWorkflow(
             _cli_parse_args=False,
             n_atoms=n_atoms,
-            **{**self._forwarded(), "active_atoms": active_atoms,
-               "active_fragment_sizes": active_fragment_sizes},
+            **{
+                **self._forwarded(),
+                "active_atoms": active_atoms,
+                "active_fragment_sizes": active_fragment_sizes,
+            },
         )
         energy = wf.run()
         dhl = energy.total - energy.e_low_total
@@ -292,35 +305,47 @@ class InteractionEnergy(BaseSettings):
         is_wf = self.xc_hl.strip().upper() == "HF"
 
         print("\n==================== INTERACTION ENERGY setup ====================")
-        print(f"  fragment (monomer) = {self.active_atoms}   dimer high-level = "
-              f"{dimer_active}")
+        print(f"  fragment (monomer) = {self.active_atoms}   dimer high-level = {dimer_active}")
         print(f"  xc_hl={self.xc_hl}  xc_ll={self.xc_ll}  basis={self.basis}")
         if is_wf:
-            print(f"  path=WF-in-DFT (HF + active-space correlation)  solver={self.solver}"
-                  f"  selector={self.selector}")
-            print(f"  per-leg fragments: dimer={dimer_sizes}  monomer={mono_sizes}"
-                  + (f"  sampler={self.sampler} shots={self.shots}"
-                     if self.solver == "sqd" else ""))
+            print(
+                f"  path=WF-in-DFT (HF + active-space correlation)  solver={self.solver}"
+                f"  selector={self.selector}"
+            )
+            print(
+                f"  per-leg fragments: dimer={dimer_sizes}  monomer={mono_sizes}"
+                + (f"  sampler={self.sampler} shots={self.shots}" if self.solver == "sqd" else "")
+            )
             if self.selector == "none":
-                print("  *** WARNING: selector=none is the ENERGY-ORDERED cut the HF/FCI "
-                      "test proved is NON-nested across the two legs.")
-                print("  ***          The interaction energy will not be trustworthy; "
-                      "use --selector concentric.")
-            print("  NOTE: this is HF-in-PBE + correlation, a DIFFERENT quantity from the "
-                  "DFT-in-DFT PBE0 total; it need not equal -39.06/-38.77.")
+                print(
+                    "  *** WARNING: selector=none is the ENERGY-ORDERED cut the HF/FCI "
+                    "test proved is NON-nested across the two legs."
+                )
+                print(
+                    "  ***          The interaction energy will not be trustworthy; "
+                    "use --selector concentric."
+                )
+            print(
+                "  NOTE: this is HF-in-PBE + correlation, a DIFFERENT quantity from the "
+                "DFT-in-DFT PBE0 total; it need not equal -39.06/-38.77."
+            )
         else:
-            print("  path=DFT-in-DFT (Eq. 2 embedded KS energy); "
-                  "solver/selector/sampler are inert on this path")
+            print(
+                "  path=DFT-in-DFT (Eq. 2 embedded KS energy); "
+                "solver/selector/sampler are inert on this path"
+            )
         print("  ΔE_int = E_emb(dimer) - 2 E_emb(monoA)   (Eq. 19 direct, bare monomers)")
 
         # --- complete embedding totals: dimer (both OH high-level) + bare monomer --- #
         e_dimer, elow_dimer, dhl_dimer = self._run(
-            n_atoms=None, active_atoms=dimer_active,
+            n_atoms=None,
+            active_atoms=dimer_active,
             active_fragment_sizes=dimer_sizes,
             tag=f"DIMER (full system, both-OH high-level {dimer_active})",
         )
         e_mono, elow_mono, dhl_mono = self._run(
-            n_atoms=self.monomer_n_atoms, active_atoms=self.active_atoms,
+            n_atoms=self.monomer_n_atoms,
+            active_atoms=self.active_atoms,
             active_fragment_sizes=mono_sizes,
             tag="MONOMER (bare, isolated fragment)",
         )
@@ -338,14 +363,15 @@ class InteractionEnergy(BaseSettings):
         # SECOND monomer, atoms[monomer_n_atoms:], sliced by translating the mask
         # onto that fragment via _free_pbe's own slice below.
         print("\n  --- size-consistency anchor (standalone free-PBE, no embedding) ---")
-        efree_dimer = self._free_pbe(
-            atom_slice=slice(None), active_atoms=dimer_active, tag="dimer")
+        efree_dimer = self._free_pbe(atom_slice=slice(None), active_atoms=dimer_active, tag="dimer")
         efree_monoA = self._free_pbe(
-            atom_slice=slice(0, self.monomer_n_atoms),
-            active_atoms=self.active_atoms, tag="monoA")
+            atom_slice=slice(0, self.monomer_n_atoms), active_atoms=self.active_atoms, tag="monoA"
+        )
         efree_monoB = self._free_pbe(
             atom_slice=slice(self.monomer_n_atoms, None),
-            active_atoms=self.active_atoms, tag="monoB")
+            active_atoms=self.active_atoms,
+            tag="monoB",
+        )
         free_bracket = (efree_dimer - efree_monoA - efree_monoB) * _HA2KJMOL
 
         # --- non-ground-state drift diagnostic (NOT a size-consistency check) --- #
@@ -353,7 +379,7 @@ class InteractionEnergy(BaseSettings):
         # the free bracket ONLY at max_cycles=1 (fed-back density ~ PBE ground
         # state); under feedback it drifts by design.  Kept for insight, relabelled.
         elow_drift = (elow_dimer - 2.0 * elow_mono) * _HA2KJMOL
-        dhl_residual = (dhl_dimer - 2.0 * dhl_mono) * _HA2KJMOL     # -> 0 for PBE-in-PBE
+        dhl_residual = (dhl_dimer - 2.0 * dhl_mono) * _HA2KJMOL  # -> 0 for PBE-in-PBE
 
         print("\n==================== INTERACTION ENERGY (Eq. 19 direct) ====================")
         print(f"  E_emb(dimer)  = {e_dimer:.6f} Ha  (E_low_total = {elow_dimer:.6f})")
@@ -362,16 +388,24 @@ class InteractionEnergy(BaseSettings):
         print("  ΔE_int = E_emb(dimer) - 2 E_emb(monoA)")
         print(f"         = {e_dimer:.6f} - 2 * {e_mono:.6f}")
         print("  ---------------------------------------------------------------------------")
-        print(f"    free-PBE bracket  E(d) - E(mA) - E(mB)   = {free_bracket:8.3f} kJ/mol"
-              f"   [SIZE-CONSISTENCY CHECK: PBE ref -40.25; standalone, cycle-invariant]")
-        print(f"    e_low_total drift E_low(d) - 2 E_low(m)  = {elow_drift:8.3f} kJ/mol"
-              f"   [non-ground-state drift diagnostic; = free bracket ONLY at max_cycles=1]")
-        print(f"    Δ_HL(d) - 2 Δ_HL(m)                      = {dhl_residual:8.3f} kJ/mol"
-              f"   [PBE-in-PBE control: exactly 0]")
+        print(
+            f"    free-PBE bracket  E(d) - E(mA) - E(mB)   = {free_bracket:8.3f} kJ/mol"
+            f"   [SIZE-CONSISTENCY CHECK: PBE ref -40.25; standalone, cycle-invariant]"
+        )
+        print(
+            f"    e_low_total drift E_low(d) - 2 E_low(m)  = {elow_drift:8.3f} kJ/mol"
+            f"   [non-ground-state drift diagnostic; = free bracket ONLY at max_cycles=1]"
+        )
+        print(
+            f"    Δ_HL(d) - 2 Δ_HL(m)                      = {dhl_residual:8.3f} kJ/mol"
+            f"   [PBE-in-PBE control: exactly 0]"
+        )
         print("  ---------------------------------------------------------------------------")
         if is_wf:
-            target_note = (f"[WF-in-DFT ({self.solver.upper()}): HF + active-space "
-                           f"correlation; reference is the FCI run on this active space]")
+            target_note = (
+                f"[WF-in-DFT ({self.solver.upper()}): HF + active-space "
+                f"correlation; reference is the FCI run on this active space]"
+            )
         elif self.xc_hl.upper() == "PBE":
             target_note = "[target ΔE_PBE = -40.18]"
         else:
@@ -389,10 +423,14 @@ class InteractionEnergy(BaseSettings):
         print("  paper's Fig. 3B cancellation.  For --xc_hl PBE0 (default) the target is the")
         print("  full-PBE0 number -39.06; DFT-in-DFT reproduces it up to the ~0.3 kJ/mol")
         print("  projection-embedding error.")
-        print("  References (6-31G, same basis => basis cancels): ΔE_PBE=-40.18/-40.25*, "
-              "ΔE_PBE0=-39.06, ΔE_PBE0-in-PBE=-39.25 kJ/mol.")
-        print("    (*-40.18 is 2*E(A); -40.25 is the true E(A)+E(B) with the 0.074 kJ/mol "
-              "monomer inequivalence.)")
+        print(
+            "  References (6-31G, same basis => basis cancels): ΔE_PBE=-40.18/-40.25*, "
+            "ΔE_PBE0=-39.06, ΔE_PBE0-in-PBE=-39.25 kJ/mol."
+        )
+        print(
+            "    (*-40.18 is 2*E(A); -40.25 is the true E(A)+E(B) with the 0.074 kJ/mol "
+            "monomer inequivalence.)"
+        )
         print("=============================================================================")
 
 
