@@ -40,8 +40,8 @@ pytestmark = [pytest.mark.embasi]
 _HA2KJMOL = 2625.4996394799
 S26_METHANOL = 22
 MONOMER_N_ATOMS = 6
-DIMER_ACTIVE = [1, 5, 7, 11]   # both OH groups (monomer fragment [1,5] mirrored)
-MONO_ACTIVE = [1, 5]           # single OH fragment on the isolated monomer
+DIMER_ACTIVE = [1, 5, 7, 11]  # both OH groups (monomer fragment [1,5] mirrored)
+MONO_ACTIVE = [1, 5]  # single OH fragment on the isolated monomer
 
 # PBE-in-PBE is a no-op embedding, so the functional-difference term Δ_HL must be
 # ZERO exactly (up to SCF/round-off noise).  1e-3 kJ/mol is ~4e-7 Ha -- far inside
@@ -89,9 +89,7 @@ def _leg(*, n_atoms, active_atoms, xc_hl):
 def _interaction(*, xc_hl):
     """(ΔE_int, low-level bracket, Δ_HL residual) in kJ/mol via Eq. 19 direct."""
     e_dim, elow_dim, dhl_dim = _leg(n_atoms=None, active_atoms=DIMER_ACTIVE, xc_hl=xc_hl)
-    e_mon, elow_mon, dhl_mon = _leg(
-        n_atoms=MONOMER_N_ATOMS, active_atoms=MONO_ACTIVE, xc_hl=xc_hl
-    )
+    e_mon, elow_mon, dhl_mon = _leg(n_atoms=MONOMER_N_ATOMS, active_atoms=MONO_ACTIVE, xc_hl=xc_hl)
     de = (e_dim - 2.0 * e_mon) * _HA2KJMOL
     bracket = (elow_dim - 2.0 * elow_mon) * _HA2KJMOL
     dhl_residual = (dhl_dim - 2.0 * dhl_mon) * _HA2KJMOL
