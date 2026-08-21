@@ -27,6 +27,14 @@ embedding_workflow.py`` is a thin entry point that imports and runs it::
     uv run python scripts/embedding_workflow.py --handoff two-process
     uv run python scripts/embedding_workflow.py --max_cycles 20 --mix_alpha 0.5
 
+The default system is the built-in s26 methanol monomer.  ``--xyz`` runs the same
+flow on your own geometry instead, taking the net charge from the file's
+``smiles=``/``charge=`` metadata (see
+:mod:`embasi_qiskit_integration.molecule.geometry`); ``--active_atoms`` then indexes
+into *that* file's atom order::
+
+    uv run python scripts/embedding_workflow.py --xyz mol.xyz --active_atoms '[1,5]'
+
 By default the *full* subsystem-A space is correlated, which is the WF-in-DFT
 problem the EmbASI paper solves.  ``--n_frozen_occ`` and ``--n_virtual`` exist
 only to fit a solver budget; nothing in the embedding implies an active space.
@@ -75,7 +83,7 @@ Comput. 8, 2564 (2012), doi:10.1021/ct300544e.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from pydantic_settings import BaseSettings, CliApp, SettingsConfigDict
@@ -121,6 +129,8 @@ class EmbeddingWorkflow(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="EQI_EMB_", cli_parse_args=True)
 
     # --- embedding system (mirrors the EmbASI PySCF example) --- #
+    xyz: Path | None = None
+    charge: int | None = None  # override the charge derived from the .xyz metadata
     s26_index: int = 22  # methanol dimer in the s26 set
     n_atoms: int | None = 6  # first N atoms -> monomer; None for the dimer
     active_atoms: list[int] = [1, 5]  # O and its hydroxyl H -> the OH fragment
@@ -197,6 +207,8 @@ class EmbeddingWorkflow(BaseSettings):
             log(f"[running under MPI with {size} ranks; solve is on rank 0]")
 
         log("== Step 1: EmbASI low-level projection embedding ==")
+        source = f"xyz={self.xyz}" if self.xyz is not None else f"s26[{self.s26_index}]"
+        log(f"   geometry: {source}")
         emb = self._build_adapter(parallel=size > 1)
         log(
             f"   {self.xc_hl}-in-{self.xc_ll} / {self.basis}, "
@@ -410,13 +422,10 @@ class EmbeddingWorkflow(BaseSettings):
     def _build_adapter(self, *, parallel: bool) -> ProjectionEmbeddingAdapter:
         """Set up ProjectionEmbedding exactly as the EmbASI PySCF example does."""
         import pyscf
-        from ase.data.s22 import create_s22_system, s26
         from embasi.embedding import ProjectionEmbedding
         from pyscf.pbc.tools.pyscf_ase import PySCF, ase_atoms_to_pyscf
 
-        atoms = create_s22_system(s26[self.s26_index])
-        if self.n_atoms is not None:
-            atoms = atoms[: self.n_atoms]
+        atoms, charge = self._build_atoms()
 
         # Embedding mask: 1 = high-level, 2 = low-level.
         embed_mask = len(atoms) * [2]
@@ -430,7 +439,13 @@ class EmbeddingWorkflow(BaseSettings):
         sort_embed_mask = np.sort(embed_mask)
         atoms = atoms[idx_list]
 
-        mol = pyscf.M(atom=ase_atoms_to_pyscf(atoms), basis=self.basis)
+        # TODO(embasi-api): the charge is set on the PySCF Mole (which needs it to
+        # get nelec right), but ProjectionEmbedding is handed only the ASE Atoms and
+        # exposes no charge argument, so its own low-level SCF may still assume a
+        # neutral system.  ASK: accept a charge (or read it off the ASE Atoms'
+        # initial_charges).  Until that is confirmed against a live EmbASI, treat
+        # non-zero-charge embedding runs as unvalidated.
+        mol = pyscf.M(atom=ase_atoms_to_pyscf(atoms), basis=self.basis, charge=charge)
         mf_ll = mol.KS(xc=self.xc_ll)
         mf_hl = mol.KS(xc=self.xc_hl)
 
@@ -447,6 +462,23 @@ class EmbeddingWorkflow(BaseSettings):
         density_fit: bool | str = self.df_auxbasis or self.density_fit
         integrals = PySCFIntegrals(mf_hl, density_fit=density_fit)
         return ProjectionEmbeddingAdapter(projection, integrals, mu=self.mu)
+
+    def _build_atoms(self) -> tuple[Any, int]:
+        """Return ``(ase.Atoms, charge)`` for the requested geometry source."""
+        if self.xyz is not None:
+            from embasi_qiskit_integration.molecule import geometry
+
+            atoms, charge, _smiles = geometry.read_atoms_from_xyz(
+                self.xyz, charge_override=self.charge
+            )
+            return atoms, charge
+
+        from ase.data.s22 import create_s22_system, s26
+
+        atoms = create_s22_system(s26[self.s26_index])
+        if self.n_atoms is not None:
+            atoms = atoms[: self.n_atoms]
+        return atoms, self.charge or 0
 
     def _build_selector(self, emb: ProjectionEmbeddingAdapter):
         """Concentric-localisation selector, or ``None`` for the fixed cut.

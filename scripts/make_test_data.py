@@ -16,6 +16,12 @@ committed data::
     python scripts/make_test_data.py
     python scripts/make_test_data.py --bond_length 1.20 --ncas 6 --nelecas 6 \
         --stem n2_6o6e
+
+Geometry can also come from an ``.xyz`` file instead of the built-in N2 template,
+in which case the charge is taken from the file's ``smiles=``/``charge=`` metadata
+
+    python scripts/make_test_data.py --xyz tests/data/methanol.xyz \
+        --basis sto-3g --ncas 4 --nelecas 4 --stem methanol_4o4e
 """
 
 from __future__ import annotations
@@ -45,6 +51,9 @@ class MakeTestData(BaseSettings):
     bond_length: float = 1.09  # Angstrom
     ncas: int = 8
     nelecas: int = 10
+    # Geometry from a file instead of the `atom` template; charge comes from its
+    # smiles=/charge= metadata. None -> the pinned N2 template above.
+    xyz: Path | None = None
 
     # Output location.
     data_dir: Path = DATA_DIR
@@ -81,10 +90,8 @@ class MakeTestData(BaseSettings):
 
     def build_active_hamiltonian(self) -> EmbeddedHamiltonian:
         from pyscf import ao2mo, mcscf, scf
-        from pyscf import gto as pyscf_gto
 
-        atom = self.atom.format(bond_length=self.bond_length)
-        mol = pyscf_gto.M(atom=atom, basis=self.basis, verbose=0)
+        mol, meta = self._build_mol()
         mf = scf.RHF(mol)
         mf.kernel()
 
@@ -95,9 +102,8 @@ class MakeTestData(BaseSettings):
         na = self.nelecas // 2
         nb = self.nelecas - na
         meta = {
-            "system": "N2",
+            **meta,
             "basis": self.basis,
-            "bond_length_angstrom": self.bond_length,
             "active_space": {"ncas": self.ncas, "nelecas": self.nelecas},
             "rhf_energy": float(mf.e_tot),
         }
@@ -108,6 +114,29 @@ class MakeTestData(BaseSettings):
             nelec=(na, nb),
             meta=meta,
         )
+
+    def _build_mol(self) -> tuple[object, dict]:
+        """Build the PySCF ``Mole`` and the provenance half of ``meta``."""
+        if self.xyz is not None:
+            from embasi_qiskit_integration.molecule import geometry
+
+            atom_str, charge, smiles = geometry.read_xyz(self.xyz)
+            mol = geometry.build_pyscf_mol(atom_str, basis=self.basis, charge=charge, verbose=0)
+            meta: dict = {
+                "system": Path(self.xyz).stem,
+                "xyz_file": str(self.xyz),
+                "charge": charge,
+            }
+            if smiles:
+                meta["smiles"] = smiles
+            return mol, meta
+
+        from pyscf import gto as pyscf_gto
+
+        atom = self.atom.format(bond_length=self.bond_length)
+        mol = pyscf_gto.M(atom=atom, basis=self.basis, verbose=0)
+        # bond_length is only meaningful for the template geometry.
+        return mol, {"system": "N2", "bond_length_angstrom": self.bond_length}
 
     def _maybe_write_mock_counts(self, ham: EmbeddedHamiltonian) -> None:
         try:
