@@ -13,8 +13,11 @@ hardware. EmbASI is only required to close the embedding loop (Phase 8).
 
 - **Python ≥ 3.10** (developed and tested on 3.12).
 - **[uv](https://docs.astral.sh/uv/)** for environment management (recommended).
-- **A Rust toolchain** — required to build `qiskit-fermions`, which ships a
-  native extension. Install it with:
+- **A Rust toolchain** — *only* needed if you install the optional `fermions`
+  extra on a platform without a prebuilt `qiskit-fermions` wheel. PyPI ships
+  `abi3` wheels for macOS (x86_64/arm64), manylinux (x86_64/aarch64), and
+  Windows, so most users need no Rust at all. On an unsupported platform pip
+  falls back to the source distribution, which compiles a native extension:
 
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -22,9 +25,8 @@ hardware. EmbASI is only required to close the embedding loop (Phase 8).
   rustc --version   # confirm it is on PATH
   ```
 
-  On macOS you can alternatively `brew install rust`. Rust is only needed for
-  the optional `fermions` extra; the core quantum path (`quantum` extra) does
-  not require it.
+  On macOS you can alternatively `brew install rust`. The core quantum path
+  (`quantum` extra) never requires it.
 
 ## Installation
 
@@ -35,13 +37,17 @@ source .venv/bin/activate
 uv pip install -e ".[dev,quantum]"
 
 # optional extras
-uv pip install -e ".[fermions]"   # builds qiskit-fermions from git; needs Rust (see Prerequisites)
+uv pip install -e ".[fermions]"   # qiskit-fermions from PyPI (prebuilt wheels; see Prerequisites)
 uv pip install -e ".[hardware]"   # IBM Quantum Runtime
+
+# every runtime extra in one shot (quantum + fermions + relabel + hardware + embed)
+uv pip install -e ".[all]"        # add `dev` for test/lint tooling: ".[all,dev]"
 ```
 
-`qiskit-fermions` is not published on PyPI, so the `fermions` extra installs it
-directly from git (`git+https://github.com/Qiskit/qiskit-fermions.git`) and
-compiles its Rust extension at install time.
+`qiskit-fermions` is published on PyPI, so the `fermions` extra installs it as a
+normal dependency (`qiskit-fermions>=0.1.0`). On common platforms pip fetches a
+prebuilt `abi3` wheel; only an unsupported platform falls back to the source
+distribution, which compiles a Rust extension at install time.
 
 ## Quickstart
 

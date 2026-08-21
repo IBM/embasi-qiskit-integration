@@ -198,9 +198,6 @@ class EmbeddingWorkflow(BaseSettings):
 
         log("== Step 1: EmbASI low-level projection embedding ==")
         emb = self._build_adapter(parallel=size > 1)
-        # Collective on every rank: EmbASI's supersystem SCF, SPADE/Pipek-Mezey
-        # localisation, and the embedded Fock all run inside here.
-        emb.run_low_level()
         log(
             f"   {self.xc_hl}-in-{self.xc_ll} / {self.basis}, "
             f"active atoms {self.active_atoms}, projection=level-shift"
@@ -215,9 +212,19 @@ class EmbeddingWorkflow(BaseSettings):
         # electronic Hamiltonian to FCI/SQD.  Routing a hybrid xc through the WF
         # path is a category error (its signature is a large, non-monotonic
         # dependence of Δ_HL on the virtual budget), so it goes down its own path.
+        #
+        # The two paths drive DIFFERENT collective EmbASI entry points and must
+        # branch BEFORE the low-level call, so exactly one fires per rank: the
+        # DFT-in-DFT path runs EmbASI's native ``run()`` (which itself runs the
+        # supersystem SCF), while the WF path runs ``run_low_level()``.  Calling
+        # both would double the supersystem SCF (``run()`` re-invokes
+        # ``construct_embedding_potential`` internally).
         if self._is_dft_in_dft():
             return self._dft_in_dft(emb, log=log)
 
+        # WF-in-DFT only.  Collective on every rank: EmbASI's supersystem SCF,
+        # SPADE/Pipek-Mezey localisation, and the embedded Fock all run in here.
+        emb.run_low_level()
         selector = self._build_selector(emb)
         solver = self._build_solver()
         return self._run_outer_loop(emb, solver, selector, rank=rank, log=log)

@@ -6,7 +6,7 @@ orchestration WITHOUT EmbASI's broken ``parallel=True`` scalapack SPADE path.
 EmbASI's ``roothan_hall_eigensolver_scalapack.hamiltonian_eigensolv_parallel``
 does ``overlap[0,0].gl_m`` and assumes a scalapack-distributed matrix object,
 but under ``parallel=True`` it receives a plain numpy ndarray -> AttributeError,
-which blocks the real ``construct_embedded_fock`` on every rank.
+which blocks the real ``construct_embedding_potential`` on every rank.
 
 To test OUR MPI code -- rank-guarded logging (once), rank-0 solve + broadcast,
 both ranks reaching the same point -- we replace ``ProjectionEmbedding`` with a
@@ -18,6 +18,8 @@ workflow script; it exists only for the MPI test.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 
 
@@ -25,9 +27,12 @@ class _MockProjectionEmbedding:
     """Stands in for embasi.embedding.ProjectionEmbedding on the CEF path.
 
     Partitions a real closed-shell RHF into an "A" (first ``n_occ_a`` occupied
-    MOs) and "B" (remaining occupied) subsystem, and hands back the same
-    3-tuple ``construct_embedded_fock`` returns -- as (1, nao, nao) arrays, to
-    match the SpinKpointArray layout the adapter squeezes.
+    MOs) and "B" (remaining occupied) subsystem, and hands back the same 5-tuple
+    ``construct_embedding_potential`` returns -- ``(γ^A, γ^B, S, v_emb, P_B)`` as
+    (1, 1, nao, nao) arrays, to match the SpinKpointArray layout the adapter
+    squeezes.  The adapter reassembles ``F_emb = h_kin^A + h_estat_xc^A + v_emb +
+    P_B`` from the ``A_LL`` one-electron blocks exposed here plus the returned
+    ``v_emb``/``P_B``, so this mock mirrors the real read path.
     """
 
     projection = "level-shift"
@@ -45,9 +50,27 @@ class _MockProjectionEmbedding:
 
         self._mol = mol
         self._mu = mu
+        self.mu_val = mu  # adapter cross-checks this against its own mu
         self._s = mol.intor("int1e_ovlp")
         self._hcore = mf.get_hcore()
         self._mf = mf
+
+        # A_LL one-electron blocks the adapter reads to reassemble F_emb, plus the
+        # A_LL.atoms.calc.mol reach-through used by _a_fragment_footing.  h_core is
+        # split kinetic + "estat_plus_xc" (everything else) as EmbASI names them.
+        h_kin = np.asarray(mol.intor("int1e_kin"))
+        h_core = np.asarray(mf.get_hcore())
+        self._h_kin_a = h_kin
+        self._h_estat_xc_a = h_core - h_kin
+        self.A_LL = SimpleNamespace(
+            atoms=SimpleNamespace(calc=SimpleNamespace(mol=mol)),
+            hamiltonian_kinetic=h_kin[np.newaxis, np.newaxis, :, :],
+            hamiltonian_estat_plus_xc=(h_core - h_kin)[np.newaxis, np.newaxis, :, :],
+        )
+        # Surrogate low-level energies (eV) under EmbASI's own names, so the
+        # projection-energy assembly runs; constants -> a fixed offset only.
+        self.subsys_A_lowlvl_totalen = -1.0
+        self.subsys_AB_lowlvl_scftotalen = -2.5
 
         # Partition the OCCUPIED space into A (first n_occ_a) and B (rest); all
         # virtuals belong to A so build_orbitals recovers occupied + virtual A.
@@ -72,12 +95,18 @@ class _MockProjectionEmbedding:
         self.mo_coeffs_B_LL = c_b[np.newaxis, :, :]
         _ = nao
 
-    def construct_embedded_fock(self, dmab_in=None):
+    def construct_embedding_potential(self, dmab_in=None):
         # dmab_in path is not exercised by the MPI test (no feedback under mock).
+        # P_B is the level-shift projector mu * S γ^B S; v_emb is defined so the
+        # adapter's reassembly reproduces self._fock bit-for-bit.
+        p_b = self._mu * (self._s @ self._dm_b @ self._s)
+        v_emb = self._fock - self._h_kin_a - self._h_estat_xc_a - p_b
         return (
-            self._dm_a[np.newaxis, :, :],
-            self._dm_b[np.newaxis, :, :],
-            self._fock[np.newaxis, :, :],
+            self._dm_a[np.newaxis, np.newaxis, :, :],
+            self._dm_b[np.newaxis, np.newaxis, :, :],
+            self._s[np.newaxis, np.newaxis, :, :],
+            v_emb[np.newaxis, np.newaxis, :, :],
+            p_b[np.newaxis, np.newaxis, :, :],
         )
 
 

@@ -6,7 +6,9 @@
 A density-functional high level (PBE0, PBE, ...) is a *density* functional, not a
 wavefunction method: the workflow evaluates ``E_high[γ̃^A]`` as a Kohn-Sham energy at
 the embedded density over the FULL occupied space of subsystem A -- no active space,
-no virtual budget, no solver (:meth:`ProjectionEmbeddingAdapter.dft_in_dft_energy`).
+no virtual budget, no solver.  ``ProjectionEmbeddingAdapter.dft_in_dft_energy`` reads
+this total straight from EmbASI's native ``run()`` (``DFT_AinB_total_energy``), so the
+embedded high-level SCF is EmbASI's own ``A_HL.run_emb_scf``, not an adapter-side one.
 The dissociation energy is then formed directly on the complete embedding totals
 (Eq. 19): ``ΔE_dissoc = E_emb(dimer) - 2*E_emb(monoA)`` for the methanol homodimer,
 both hydroxyl groups high-level in the dimer, bare (isolated) monomer reference.
@@ -25,11 +27,11 @@ Two legs, both at the NATIVE s26[22] geometry, 6-31G, closed-shell:
 
 * **PBE0-in-PBE** (``xc_hl == PBE0``): the genuine high-vs-low functional difference.
   DFT-in-DFT reproduces the full-PBE0 number ``ΔE_PBE0 = -39.06 kJ/mol`` up to the
-  projection-embedding error, measured ``ΔE_dissoc = -38.77`` here (residual +0.29).
+  projection-embedding error, measured ``ΔE_dissoc = -39.25`` here (residual +0.19).
   Asserted with a small window around the measured value.
 
 Marked ``embasi``: skipped unless ``EMBASI_AVAILABLE=1`` (needs a live EmbASI).  Each
-leg is one supersystem SCF + one embedded KS-SCF relaxation of subsystem A (a handful
+leg is one supersystem SCF + EmbASI's embedded high-level SCF of subsystem A (a handful
 of small 6-31G runs, no correlated solve), so it is not marked ``slow``.
 """
 
@@ -55,10 +57,13 @@ TOL_CONTROL_DHL_KJMOL = 1.0e-3
 # Ha, SCF-convergence scale) is appropriate; -40.18 is quoted to 2 dp in the refs.
 PBE_BRACKET_KJMOL = -40.18
 TOL_BRACKET_KJMOL = 0.1
-# PBE0-in-PBE lands at the MEASURED -38.77 (residual +0.29 from the -39.06 full-PBE0
-# target, = the projection-embedding error on this system).  Asserted as a small
-# window around the measured value -- this is a value regression, not a physics-zero.
-PBE0_IN_PBE_MEASURED_KJMOL = -38.77
+# PBE0-in-PBE lands at the MEASURED -39.25 (residual +0.19 from the -39.06 full-PBE0
+# target, = the projection-embedding error on this system).  This value comes from
+# EmbASI's native embedded high-level SCF (A_HL.run_emb_scf, read out of
+# DFT_AinB_total_energy); it is closer to the full-PBE0 reference than the earlier
+# adapter-side SCF was.  Asserted as a small window around the measured value -- this
+# is a value regression, not a physics-zero.
+PBE0_IN_PBE_MEASURED_KJMOL = -39.25
 TOL_PBE0_KJMOL = 0.3
 
 
@@ -126,11 +131,11 @@ def test_pbe_in_pbe_control_is_pure_pbe():
 
 
 def test_pbe0_in_pbe_reproduces_full_pbe0():
-    """PBE0-in-PBE via DFT-in-DFT lands at -38.77 (full-PBE0 -39.06 + embedding err).
+    """PBE0-in-PBE via DFT-in-DFT lands at -39.25 (full-PBE0 -39.06 + embedding err).
 
     The low-level bracket still telescopes to -40.18 (size-consistency holds
     independently of the high level), and the genuine PBE0-vs-PBE functional
-    difference shifts ΔE_dissoc to the measured -38.77 -- within the projection-
+    difference shifts ΔE_dissoc to the measured -39.25 -- within the projection-
     embedding error of the full-PBE0 reference -39.06.
     """
     de, bracket, dhl_residual = _dissociation(xc_hl="PBE0")
