@@ -333,10 +333,12 @@ def read_xyz(
         source = "override"
     else:
         charge, smiles = charge_from_metadata(metadata)
+        source = "XYZ metadata"
         if smiles is None:
             source = "no-SMILES default (neutral)"
         if Chem is None:
             source = "XYZ metadata (SMILES present but rdkit missing)"
+
     logger.info(
         "[%s] charge=%+d via %s%s",
         Path(xyz_file).name,
