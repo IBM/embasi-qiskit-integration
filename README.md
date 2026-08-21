@@ -37,6 +37,7 @@ uv pip install -e ".[dev,quantum]"
 # optional extras
 uv pip install -e ".[fermions]"   # builds qiskit-fermions from git; needs Rust (see Prerequisites)
 uv pip install -e ".[hardware]"   # IBM Quantum Runtime
+uv pip install -e ".[chem]"       # rdkit, for SMILES-derived charges in .xyz metadata
 ```
 
 `qiskit-fermions` is not published on PyPI, so the `fermions` extra installs it
@@ -239,6 +240,34 @@ uv run python scripts/embedding_workflow.py --sampler runtime      # sqd on hard
 uv run python scripts/embedding_workflow.py --handoff two-process  # file handoff
 uv run python scripts/embedding_workflow.py --solver fci           # classical reference
 ```
+
+### Starting from an `.xyz`
+
+Both workflows default to their built-in geometry (the s26 methanol monomer above,
+and N2 for `make_test_data.py`). Pass `--xyz` to run on your own structure instead:
+
+```bash
+uv run python scripts/embedding_workflow.py --xyz mol.xyz --active_atoms '[1,5]'
+uv run python scripts/make_test_data.py --xyz tests/data/methanol.xyz \
+    --basis sto-3g --ncas 4 --nelecas 4 --stem methanol_4o4e
+```
+
+The file is a standard `.xyz` whose comment line carries `;`-separated metadata, so a
+geometry brings its own charge (see
+[`molecule/geometry.py`](src/embasi_qiskit_integration/molecule/geometry.py)):
+
+```
+6
+smiles=CO; charge=0
+C     0.000000    0.000000    0.000000
+...
+```
+
+`charge=` and `smiles=` are both optional. When both are given they are cross-checked
+and a contradiction is refused, rather than silently picking one — the charge sets
+`nelec`, so guessing would solve a different electronic state. Reading the charge off
+the SMILES needs the `chem` extra (rdkit); without it the `charge=` field is used on
+its own. `--active_atoms` indexes into the `.xyz` atom order.
 
 It is MPI-safe (the solve runs on rank 0 and the result is broadcast), so it can
 be driven the way real EmbASI runs — under `mpirun` (needs the `embed` extra for

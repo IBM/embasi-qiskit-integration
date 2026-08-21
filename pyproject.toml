@@ -22,7 +22,8 @@ fermions = ["qiskit-fermions @ git+https://github.com/Qiskit/qiskit-fermions.git
 relabel  = ["pyomo>=6.7", "highspy>=1.7"]
 hardware = ["qiskit-ibm-runtime", "samplomatic"]
 embed    = ["embasi @ git+https://github.com/tamm-cci/EmbASI.git@qm-code-adapter", "mpi4py"]          # EmbASI (from source); pulls ase + asi4py
-dev      = ["pytest>=7", "pytest-cov", "ruff==0.15.20", "mypy>=2.2,<2.4", "pre-commit"]
+chem     = ["rdkit>=2023.9"]         # SMILES-derived charge in molecule/geometry.py (optional)
+dev      = ["pytest>=7", "pytest-cov", "ruff==0.15.20", "mypy>=2.2,<2.4", "pre-commit", "rdkit>=2023.9"]
 
 [project.scripts]
 embasi-qiskit-integration = "embasi_qiskit_integration.cli:main"
