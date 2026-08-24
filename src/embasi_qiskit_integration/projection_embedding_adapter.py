@@ -94,6 +94,7 @@ downfold, and SQD spin handling); see :meth:`_as_ao_by_mo`.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -281,8 +282,17 @@ class ProjectionEnergy:
         return self.e_low_total - self.e_low_A + self.e_high_A + self.correction
 
 
-# Selector signature: (coeff, energy, n_occ) -> active column indices
+# Selector signature: (coeff, energy, n_occ) -> active column indices.  A Selector
+# only PICKS canonical columns; it cannot rotate the virtual block.
 Selector = Callable[[np.ndarray, np.ndarray, int], np.ndarray]
+
+# VirtualLocalizer signature: (coeff, n_occ) -> (coeff_localised, sigma2).  Unlike a
+# Selector, a localiser ROTATES the virtual block of ``coeff`` (occupied block and
+# any non-A columns untouched) so that rotated virtual ``i`` carries fragment weight
+# ``sigma2[i]`` (descending), and hands ``build_orbitals`` the per-virtual weight its
+# gap cut runs on.  ``sigma2`` has length ``coeff.shape[1] - n_occ``.  The concrete
+# SPADE localiser is ``selectors.spade_virtual_selector``.
+VirtualLocalizer = Callable[[np.ndarray, int], "tuple[np.ndarray, np.ndarray]"]
 
 
 # --------------------------------------------------------------------------- #
@@ -299,16 +309,26 @@ class ProjectionEmbeddingAdapter:
         mu: float = 1.0e6,  # level-shift parameter, paper Eq. 6
         env_eigenvalue_floor: float = _ENV_EIGENVALUE_FLOOR,
     ):
-        if getattr(projection, "projection", None) != "level-shift":
-            # TODO(embasi-api): EmbASI does not export Huzinaga as a constant
-            # offset, so any projection other than level-shift is rejected here and
-            # Huzinaga-in-DFT cannot be solved externally -- even though the paper
-            # (Sec. 2.1) shows H^AB_H collapses to the supersystem low-level
+        projection_kind = getattr(projection, "projection", None)
+        if projection_kind != "level-shift":
+            # P_B and v_emb are now read directly from construct_embedding_potential
+            # (see run_low_level), so the export no longer reconstructs P_B from the
+            # level-shift closed form mu*S*gamma^B*S -- the earlier hard guard was
+            # protecting that reconstruction, not the physics.  A non-level-shift
+            # projection whose construct_embedding_potential yields a usable
+            # (gamma^A, gamma^B, S, v_emb, P_B) can therefore flow through.  The
+            # paper (Sec. 2.1) shows H^AB_H collapses to the supersystem low-level
             # Hamiltonian when the high/low xc match, making P_B constant and
-            # exportable in exactly the WF-in-DFT regime.
-            raise ValueError(
-                "only projection='level-shift' can be exported to an external "
-                "solver; Huzinaga needs the high-level Fock inside the SCF"
+            # exportable in exactly the WF-in-DFT regime.  Correctness for such a
+            # projection is UNVERIFIED in-repo (the only regression case, methanol,
+            # is level-shift), so this is a warning rather than a silent pass.
+            warnings.warn(
+                f"projection={projection_kind!r} is untested for external export; "
+                "only 'level-shift' has an in-repo regression case. P_B/v_emb are "
+                "read directly from construct_embedding_potential, so the export no "
+                "longer depends on the level-shift closed form -- but verify the "
+                "assembled energy against a known reference before trusting it.",
+                stacklevel=2,
             )
         self.p = projection
         self.ints = integrals
@@ -631,6 +651,7 @@ class ProjectionEmbeddingAdapter:
         n_frozen_occ: int = 0,
         n_virtual: int | None = None,
         selector: Selector | None = None,
+        virtual_localizer: VirtualLocalizer | None = None,
         restrict_to_a: bool = True,
     ) -> EmbeddedOrbitals:
         """Orbitals of subsystem A from the generalized problem F_emb C = S C eps.
@@ -659,7 +680,27 @@ class ProjectionEmbeddingAdapter:
         recover the plain full-basis ``sla.eigh(F_emb, S)``; the two agree to
         solver precision (asserted in the tests), so this flag is a pure
         performance knob, never a physics one.
+
+        ``virtual_localizer`` (mutually exclusive with ``selector``) is the SPADE
+        alternative to a column-index :data:`Selector`.  A localiser *rotates* the
+        virtual block -- the kept orbitals become linear combinations of the
+        canonical virtuals, not columns of ``C`` -- so it cannot be expressed as an
+        index selector.  We apply it here (``selectors.spade_virtual_selector``
+        builds one): rotate the virtual block in place, cut on the returned σ² gap
+        (the same ``_gap_cut`` the Mulliken :func:`concentric_selector` uses), and
+        keep the occupied block untouched.  Rotating *within* the A-virtual block
+        preserves S-orthonormality and keeps ``P_B`` invisible in the active space
+        (``span`` is unchanged), so the downfold and energy assembly -- which treat
+        the active columns as an opaque S-orthonormal spanning set, never as
+        canonical MOs -- are unaffected.  The rotated virtuals are no longer F_emb
+        eigenvectors, so their ``energy`` entries are set to ``NaN`` (nothing reads a
+        virtual eigenvalue; a Fock eigenvalue would be a lie for a rotated orbital).
         """
+        if selector is not None and virtual_localizer is not None:
+            raise ValueError(
+                "pass either selector or virtual_localizer, not both: a localiser "
+                "rotates and cuts the virtual block itself"
+            )
         if restrict_to_a:
             eps, c = self._eigh_subsystem_a()
         else:
@@ -675,13 +716,28 @@ class ProjectionEmbeddingAdapter:
         if not 0 <= n_frozen_occ < n_occ:
             raise ValueError(f"n_frozen_occ={n_frozen_occ} outside [0, {n_occ}) for subsystem A")
 
-        if selector is not None:
-            # Hook for AVAS / MP2-NOON / concentric-localisation selection.  A
-            # concentric-localisation selector (Claudino & Mayhall, same lineage
-            # as SPADE) would order virtuals into shells by overlap with the A
-            # fragment and cut on the singular-value gap
-            # Δσ_i^2 = σ_i^2 - σ_{i+1}^2, exactly as the paper picks the occupied
-            # A space, making n_virtual inferable up to a tolerance.
+        if virtual_localizer is not None:
+            # SPADE: rotate the virtual block so each rotated virtual carries a
+            # definite fragment weight sigma2, then cut on the sigma2 gap exactly as
+            # the Mulliken path cuts on population.  c is replaced by the rotated
+            # coefficients; rotated-virtual eigenvalues are meaningless (set NaN).
+            from embasi_qiskit_integration.selectors import _gap_cut
+
+            c, sigma2 = virtual_localizer(c, n_occ)
+            eps = eps.copy()
+            eps[n_occ:] = np.nan
+            keep = _gap_cut(
+                sigma2,
+                gap_tol=getattr(virtual_localizer, "gap_tol", 1.0e-3),
+                max_virtual=getattr(virtual_localizer, "max_virtual", None),
+                min_virtual=getattr(virtual_localizer, "min_virtual", 0),
+            )
+            active = np.arange(n_frozen_occ, n_occ + keep)
+        elif selector is not None:
+            # Index-selector hook for AVAS / MP2-NOON / Mulliken concentric-cut
+            # selection: it PICKS canonical columns and returns their indices (it
+            # cannot rotate the virtual block -- that is the virtual_localizer path
+            # above, which is the true SPADE singular-value-gap cut).
             active = np.asarray(selector(c, eps, n_occ), dtype=int)
             if n_frozen_occ:
                 active = active[active >= n_frozen_occ]

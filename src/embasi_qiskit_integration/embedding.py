@@ -148,7 +148,12 @@ class EmbeddingWorkflow(BaseSettings):
     # Concentric by default so the WF-in-DFT path keeps a nested, size-consistent
     # active-virtual space (an energy-ordered "none" cut is non-nested across legs);
     # a single-fragment ``active_fragment_sizes`` reproduces the plain concentric cut.
-    selector: Literal["none", "concentric"] = "concentric"
+    # ``concentric`` ranks the canonical F_emb virtuals by Mulliken fragment
+    # population and cuts on the largest gap; ``spade`` instead ROTATES the virtual
+    # block (SPADE, Claudino & Mayhall, doi:10.1021/acs.jctc.9b00682) so each rotated
+    # virtual carries a definite fragment weight σ², then cuts on the σ² gap -- basis
+    # invariant, robust when the canonical virtuals delocalise.  ``none`` disables.
+    selector: Literal["none", "concentric", "spade"] = "concentric"
     # How the active atoms partition into PHYSICAL fragments, as consecutive
     # counts in the order they appear in ``active_atoms`` (which the reorder keeps
     # leading, ascending).  ``None`` (default) -> one fragment (current behaviour).
@@ -237,9 +242,9 @@ class EmbeddingWorkflow(BaseSettings):
         # WF-in-DFT only.  Collective on every rank: EmbASI's supersystem SCF,
         # SPADE/Pipek-Mezey localisation, and the embedded Fock all run in here.
         emb.run_low_level()
-        selector = self._build_selector(emb)
+        selector, virtual_localizer = self._build_selector(emb)
         solver = self._build_solver()
-        return self._run_outer_loop(emb, solver, selector, rank=rank, log=log)
+        return self._run_outer_loop(emb, solver, selector, virtual_localizer, rank=rank, log=log)
 
     def _is_dft_in_dft(self) -> bool:
         """True when the high level is a density functional (-> paper Eq. 2).
@@ -280,7 +285,7 @@ class EmbeddingWorkflow(BaseSettings):
         return energy
 
     # ---------------- outer self-consistency loop ---------------- #
-    def _run_outer_loop(self, emb, solver, selector, *, rank, log):
+    def _run_outer_loop(self, emb, solver, selector, virtual_localizer=None, *, rank, log):
         """Steps 2-5, iterated until self-consistent (or ``max_cycles``).
 
         ``max_cycles == 1`` reproduces the single-pass flow exactly.  With more
@@ -317,13 +322,14 @@ class EmbeddingWorkflow(BaseSettings):
                 n_frozen_occ=self.n_frozen_occ,
                 n_virtual=self.n_virtual,
                 selector=selector,
+                virtual_localizer=virtual_localizer,
             )
             log(f"   {orbitals}")
-            if selector is not None:
+            if selector is not None or virtual_localizer is not None:
                 n_kept_virt = orbitals.n_active_orbitals - (orbitals.n_occ - orbitals.inactive.size)
                 budget = "" if self.n_virtual is None else f" (cap {self.n_virtual})"
                 log(
-                    f"   selector=concentric picked {n_kept_virt} virtuals{budget}; "
+                    f"   selector={self.selector} picked {n_kept_virt} virtuals{budget}; "
                     f"n_frozen_occ={self.n_frozen_occ} frozen"
                 )
             elif self.solver == "sqd" and self.n_virtual is None:
@@ -481,23 +487,38 @@ class EmbeddingWorkflow(BaseSettings):
         return atoms, self.charge or 0
 
     def _build_selector(self, emb: ProjectionEmbeddingAdapter):
-        """Concentric-localisation selector, or ``None`` for the fixed cut.
+        """Build the active-virtual shaping hook from ``self.selector``.
+
+        Returns a ``(selector, virtual_localizer)`` pair with at most one non-None
+        (both ``None`` for the fixed ``--n_virtual`` cut):
+
+        * ``concentric`` -> a ``Selector`` (per-fragment Mulliken concentric cut),
+        * ``spade`` -> a ``VirtualLocalizer`` (SPADE rotation + σ² gap cut),
+        * ``none`` -> ``(None, None)``.
+
+        A rotation cannot be expressed as a column-index ``Selector``, so ``spade``
+        goes through the ``build_orbitals(virtual_localizer=...)`` hook instead.
 
         After the atom reorder in ``_build_adapter`` the region-1 (active) atoms
         occupy the first ``len(active_atoms)`` positions of ``mol``, so the
         fragment AO indices come straight from the leading atom slices.
         """
         if self.selector == "none":
-            return None
+            return None, None
         from embasi_qiskit_integration.selectors import (
             fragment_ao_indices,
             per_fragment_concentric_selector,
+            spade_virtual_selector,
         )
 
         mol = emb.ints.mol
+        # run_low_level() (called before this) populates the overlap; assert for the
+        # type-checker and to fail loudly if the call order is ever broken.
+        assert emb._s is not None, "run_low_level() must run before _build_selector()"
+        overlap = emb._s
         # Reordered active-atom positions lead, ascending: 0..len(active_atoms)-1.
         # Partition them into PHYSICAL fragments per ``active_fragment_sizes`` (one
-        # group by default), then run the concentric cut per group and union.
+        # group by default).
         n_active = len(self.active_atoms)
         sizes = self.active_fragment_sizes or [n_active]
         if sum(sizes) != n_active:
@@ -510,10 +531,22 @@ class EmbeddingWorkflow(BaseSettings):
             positions = list(range(start, start + sz))
             groups.append(fragment_ao_indices(mol, positions))
             start += sz
-        # ``n_virtual`` is the per-FRAGMENT ceiling here (additivity: each fragment
-        # gets its own shell, matched to the monomer leg's cut), not a global cap.
-        return per_fragment_concentric_selector(
-            emb._s, groups, max_virtual_per_fragment=self.n_virtual
+
+        if self.selector == "spade":
+            # A rotation cannot be unioned per-fragment the way index selection can,
+            # so SPADE anchors on the UNION of the fragment AOs.  ``n_virtual`` caps
+            # the kept rotated shell.
+            frag_union = np.unique(np.concatenate(groups)) if groups else np.empty(0, int)
+            return None, spade_virtual_selector(overlap, frag_union, max_virtual=self.n_virtual)
+
+        # concentric: run the per-fragment Mulliken cut and union.  ``n_virtual`` is
+        # the per-FRAGMENT ceiling here (additivity: each fragment gets its own
+        # shell, matched to the monomer leg's cut), not a global cap.
+        return (
+            per_fragment_concentric_selector(
+                overlap, groups, max_virtual_per_fragment=self.n_virtual
+            ),
+            None,
         )
 
     def _build_solver(self):
