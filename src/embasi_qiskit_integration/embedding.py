@@ -50,9 +50,9 @@ guarded to rank 0::
 Remaining work
 --------------
 The single-pass workflow runs end-to-end against real EmbASI: density-fitted
-``eri_mo`` (``--density_fit``), the concentric selector
-(``--selector concentric``), the restricted-span eigensolve, and the low-level
-energy readout are all in place.  What is left is either blocked on the EmbASI
+``eri_mo`` (``--density_fit``), the concentric-localization selector
+(``--selector concentric-cl``, the default), the restricted-span eigensolve, and
+the low-level energy readout are all in place.  What is left is either blocked on the EmbASI
 side or a deliberately-deferred package rewrite; the upstream asks are marked
 inline with ``TODO(embasi-api)`` and summarised in the docstring atop
 ``projection_embedding_adapter.py``:
@@ -144,22 +144,33 @@ class EmbeddingWorkflow(BaseSettings):
 
     # --- active space: solver budget only, not embedding physics --- #
     n_frozen_occ: int = 0
-    n_virtual: int | None = None  # None -> every virtual of subsystem A
-    # Concentric by default so the WF-in-DFT path keeps a nested, size-consistent
-    # active-virtual space (an energy-ordered "none" cut is non-nested across legs);
-    # a single-fragment ``active_fragment_sizes`` reproduces the plain concentric cut.
-    # ``concentric`` ranks the canonical F_emb virtuals by Mulliken fragment
-    # population and cuts on the largest gap; ``spade`` instead ROTATES the virtual
-    # block (SPADE, Claudino & Mayhall, doi:10.1021/acs.jctc.9b00682) so each rotated
-    # virtual carries a definite fragment weight σ², then cuts on the σ² gap -- basis
-    # invariant, robust when the canonical virtuals delocalise.  ``none`` disables.
-    selector: Literal["none", "concentric", "spade"] = "concentric"
+    n_virtual: int | None = None  # solver-budget cap; None -> the selector's own count
+    #   (``mulliken``: per-fragment cap; ``spade``: cap after the σ² gap; ``concentric-cl``:
+    #   ceiling on the shell-determined k, truncating the outermost shell tail for small
+    #   simulations; ``none``: the fixed energy-ordered cut).
+    # ``concentric-cl`` by default: the full iterative Concentric Localization of
+    # Claudino 2019 (JCTC 15, 6085), the paper-faithful cut.  It keeps a nested,
+    # size-consistent active-virtual space (an energy-ordered "none" cut is non-nested
+    # across legs) and grows it by ``n_shells`` Fock-coupled shells (the accuracy knob;
+    # ``n_shells=0`` is the single-shell case).  ``mulliken`` is the single-shell
+    # Mulliken-population cut (ranks canonical F_emb virtuals, cuts on the largest gap;
+    # honours ``active_fragment_sizes`` per-fragment); ``spade`` ROTATES the virtual
+    # block (Claudino & Mayhall, doi:10.1021/acs.jctc.9b00682) so each rotated virtual
+    # carries a definite fragment weight σ², then cuts on the σ² gap -- basis invariant,
+    # robust when the canonical virtuals delocalise.  ``none`` disables.
+    selector: Literal["none", "mulliken", "spade", "concentric-cl"] = "concentric-cl"
+    # ``concentric-cl`` only: number of Fock shell expansions after shell 0.  0 keeps
+    # just the fragment-spanned shell (single-shell equivalent); higher values grow the
+    # active-virtual space (and the qubit/determinant count) for accuracy.
+    n_shells: int = 0
     # How the active atoms partition into PHYSICAL fragments, as consecutive
     # counts in the order they appear in ``active_atoms`` (which the reorder keeps
     # leading, ascending).  ``None`` (default) -> one fragment (current behaviour).
     # e.g. both-OH dimer active_atoms=[1,5,7,11] -> [2, 2] (OH-A | OH-B): the
-    # concentric selector then cuts each OH shell independently and unions them,
-    # so the dimer active-virtual span contains BOTH monomer shells (additivity).
+    # ``mulliken`` selector then cuts each OH shell independently and unions them, so
+    # the dimer active-virtual span contains BOTH monomer shells (additivity).  Used
+    # ONLY by ``mulliken``; the rotating ``spade``/``concentric-cl`` cuts anchor on the
+    # fragment union and ignore the partition.
     active_fragment_sizes: list[int] | None = None
 
     # --- integral backend --- #
@@ -242,7 +253,7 @@ class EmbeddingWorkflow(BaseSettings):
         # WF-in-DFT only.  Collective on every rank: EmbASI's supersystem SCF,
         # SPADE/Pipek-Mezey localisation, and the embedded Fock all run in here.
         emb.run_low_level()
-        selector, virtual_localizer = self._build_selector(emb)
+        selector, virtual_localizer = self._build_selector(emb, log=log)
         solver = self._build_solver()
         return self._run_outer_loop(emb, solver, selector, virtual_localizer, rank=rank, log=log)
 
@@ -335,7 +346,7 @@ class EmbeddingWorkflow(BaseSettings):
             elif self.solver == "sqd" and self.n_virtual is None:
                 log(
                     "   note: full A virtual space -- pass --n_virtual or "
-                    "--selector concentric to fit a qubit budget"
+                    "--selector concentric-cl/mulliken to fit a qubit budget"
                 )
             ham = emb.embedded_hamiltonian(orbitals)
             log(
@@ -486,18 +497,21 @@ class EmbeddingWorkflow(BaseSettings):
             atoms = atoms[: self.n_atoms]
         return atoms, self.charge or 0
 
-    def _build_selector(self, emb: ProjectionEmbeddingAdapter):
+    def _build_selector(self, emb: ProjectionEmbeddingAdapter, *, log=None):
         """Build the active-virtual shaping hook from ``self.selector``.
 
         Returns a ``(selector, virtual_localizer)`` pair with at most one non-None
         (both ``None`` for the fixed ``--n_virtual`` cut):
 
-        * ``concentric`` -> a ``Selector`` (per-fragment Mulliken concentric cut),
+        * ``mulliken`` -> a ``Selector`` (per-fragment single-shell Mulliken cut),
         * ``spade`` -> a ``VirtualLocalizer`` (SPADE rotation + σ² gap cut),
+        * ``concentric-cl`` -> a ``VirtualLocalizer`` (iterative CL, ``n_shells``),
         * ``none`` -> ``(None, None)``.
 
         A rotation cannot be expressed as a column-index ``Selector``, so ``spade``
-        goes through the ``build_orbitals(virtual_localizer=...)`` hook instead.
+        and ``concentric-cl`` go through the ``build_orbitals(virtual_localizer=...)``
+        hook instead, anchored on the fragment UNION (a rotation cannot be unioned
+        per-fragment the way index selection can).
 
         After the atom reorder in ``_build_adapter`` the region-1 (active) atoms
         occupy the first ``len(active_atoms)`` positions of ``mol``, so the
@@ -506,14 +520,15 @@ class EmbeddingWorkflow(BaseSettings):
         if self.selector == "none":
             return None, None
         from embasi_qiskit_integration.selectors import (
+            concentric_localization_selector,
             fragment_ao_indices,
-            per_fragment_concentric_selector,
+            per_fragment_mulliken_selector,
             spade_virtual_selector,
         )
 
         mol = emb.ints.mol
-        # run_low_level() (called before this) populates the overlap; assert for the
-        # type-checker and to fail loudly if the call order is ever broken.
+        # run_low_level() (called before this) populates the overlap and F_emb; assert
+        # for the type-checker and to fail loudly if the call order is ever broken.
         assert emb._s is not None, "run_low_level() must run before _build_selector()"
         overlap = emb._s
         # Reordered active-atom positions lead, ascending: 0..len(active_atoms)-1.
@@ -532,18 +547,32 @@ class EmbeddingWorkflow(BaseSettings):
             groups.append(fragment_ao_indices(mol, positions))
             start += sz
 
-        if self.selector == "spade":
+        if self.selector in ("spade", "concentric-cl"):
             # A rotation cannot be unioned per-fragment the way index selection can,
-            # so SPADE anchors on the UNION of the fragment AOs.  ``n_virtual`` caps
-            # the kept rotated shell.
+            # so both localisers anchor on the UNION of the fragment AOs.
             frag_union = np.unique(np.concatenate(groups)) if groups else np.empty(0, int)
-            return None, spade_virtual_selector(overlap, frag_union, max_virtual=self.n_virtual)
+            if self.selector == "spade":
+                # ``n_virtual`` caps the kept rotated shell.
+                return None, spade_virtual_selector(overlap, frag_union, max_virtual=self.n_virtual)
+            # concentric-cl: the shell count sets the physically-motivated k; if
+            # ``n_virtual`` is given it is a solver-budget CEILING on top of that
+            # (for small simulations), truncating the outermost shell tail -- not a
+            # replacement for the shell structure.
+            assert emb._fock is not None, "run_low_level() must run before _build_selector()"
+            if self.n_virtual is not None and log is not None:
+                log(
+                    f"   [selector] concentric-cl: capping the shell-determined virtuals "
+                    f"at n_virtual={self.n_virtual} (solver budget)"
+                )
+            return None, concentric_localization_selector(
+                overlap, frag_union, emb._fock, n_shells=self.n_shells, max_virtual=self.n_virtual
+            )
 
-        # concentric: run the per-fragment Mulliken cut and union.  ``n_virtual`` is
-        # the per-FRAGMENT ceiling here (additivity: each fragment gets its own
-        # shell, matched to the monomer leg's cut), not a global cap.
+        # mulliken: run the per-fragment single-shell Mulliken cut and union.
+        # ``n_virtual`` is the per-FRAGMENT ceiling here (additivity: each fragment
+        # gets its own shell, matched to the monomer leg's cut), not a global cap.
         return (
-            per_fragment_concentric_selector(
+            per_fragment_mulliken_selector(
                 overlap, groups, max_virtual_per_fragment=self.n_virtual
             ),
             None,

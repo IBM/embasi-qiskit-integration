@@ -687,7 +687,7 @@ class ProjectionEmbeddingAdapter:
         canonical virtuals, not columns of ``C`` -- so it cannot be expressed as an
         index selector.  We apply it here (``selectors.spade_virtual_selector``
         builds one): rotate the virtual block in place, cut on the returned σ² gap
-        (the same ``_gap_cut`` the Mulliken :func:`concentric_selector` uses), and
+        (the same ``_gap_cut`` the Mulliken :func:`mulliken_selector` uses), and
         keep the occupied block untouched.  Rotating *within* the A-virtual block
         preserves S-orthonormality and keeps ``P_B`` invisible in the active space
         (``span`` is unchanged), so the downfold and energy assembly -- which treat

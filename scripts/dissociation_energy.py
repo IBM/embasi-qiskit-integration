@@ -51,9 +51,9 @@ Paths, routed on the high-level METHOD and (for HF) the solver
   reproduce a DFT number.  The deliverable of this path is the **quantum-solver
   integration itself**: SQD reproduces the exact FCI result at a *fixed* active space
   (agreement <0.001 Ha), which is what validates that the Qiskit solver is correctly
-  wired into the EmbASI embedding.  Uses the concentric selector
-  (``--selector concentric``); the two legs are differenced at matched
-  *fragment-coupling* active spaces.
+  wired into the EmbASI embedding.  Uses the concentric-localization selector
+  (``--selector concentric-cl``, the default); the two legs are differenced at
+  matched *fragment-coupling* active spaces.
 
 (A CCSD-over-full-A "CCSD-in-PBE" path was explored as a would-be *correlated*
 dissociation-energy reference for the SQD path -- a ~3.4 kJ/mol effect the reference
@@ -100,8 +100,8 @@ Usage::
     uv run python scripts/dissociation_energy.py                 # PBE0-in-PBE (DFT-in-DFT) -> ~-38.8
     uv run python scripts/dissociation_energy.py --xc_hl PBE      # PBE-in-PBE control -> -40.18
     # WF-in-DFT (HF + active-space correlation); FCI is the reference SQD must match:
-    uv run python scripts/dissociation_energy.py --xc_hl HF --solver fci --selector concentric
-    uv run python scripts/dissociation_energy.py --xc_hl HF --solver sqd --sampler aer --selector concentric
+    uv run python scripts/dissociation_energy.py --xc_hl HF --solver fci --selector concentric-cl
+    uv run python scripts/dissociation_energy.py --xc_hl HF --solver sqd --sampler aer --selector concentric-cl
 
 Every other embedding knob (basis, xc, mu, active space, solver, sampler, ...) is
 accepted and forwarded verbatim to each sub-run.  The WF-path knobs are inert on the
@@ -153,12 +153,13 @@ class DissociationEnergy(BaseSettings):
     assume_symmetric: bool = True  # homodimer: E(B) == E(A); False -> unsupported
 
     # --- WF-in-DFT knobs (used only when xc_hl == HF; inert on DFT-in-DFT) --- #
-    # These reach the number ONLY on the wavefunction path.  The concentric
-    # selector is the default because the WF path requires it (energy-ordered cuts
-    # are non-nested across the two differently-sized legs -- see module docstring).
+    # These reach the number ONLY on the wavefunction path.  A shell-based selector
+    # is the default because the WF path requires it (energy-ordered cuts are
+    # non-nested across the two differently-sized legs -- see module docstring).
     solver: str = "sqd"  # "sqd" | "fci"
-    selector: str = "concentric"  # "concentric" | "none"
-    n_virtual: int | None = None  # advisory when a selector is set
+    selector: str = "concentric-cl"  # "concentric-cl" | "mulliken" | "spade" | "none"
+    n_shells: int = 0  # concentric-cl only: Fock shell expansions after shell 0
+    n_virtual: int | None = None  # per-fragment cap (mulliken); budget cap (spade/concentric-cl)
     sampler: str = "aer"  # "aer" | "mock" | "runtime" (SQD only)
     shots: int = 100_000
     seed: int = 24
@@ -170,11 +171,11 @@ class DissociationEnergy(BaseSettings):
     def _forwarded(self) -> dict:
         """The subset of fields shared with EmbeddingWorkflow, as kwargs.
 
-        The WF-path knobs (``solver``/``selector``/``n_virtual``/``sampler``/
-        ``shots``/``seed``/``max_cycles``) are forwarded on every leg but are inert
-        unless ``xc_hl == HF`` (the workflow routes on the high-level method).
-        ``active_fragment_sizes`` is deliberately NOT here -- it differs per leg
-        (dimer vs monomer) and is set at each :meth:`_run` call site.
+        The WF-path knobs (``solver``/``selector``/``n_shells``/``n_virtual``/
+        ``sampler``/``shots``/``seed``/``max_cycles``) are forwarded on every leg but
+        are inert unless ``xc_hl == HF`` (the workflow routes on the high-level
+        method).  ``active_fragment_sizes`` is deliberately NOT here -- it differs per
+        leg (dimer vs monomer) and is set at each :meth:`_run` call site.
         """
         shared = [
             "s26_index",
@@ -185,6 +186,7 @@ class DissociationEnergy(BaseSettings):
             "mu",
             "solver",
             "selector",
+            "n_shells",
             "n_virtual",
             "sampler",
             "shots",
@@ -194,14 +196,18 @@ class DissociationEnergy(BaseSettings):
         return {k: getattr(self, k) for k in shared}
 
     def _fragment_sizes(self, active_atoms: list[int]) -> list[int]:
-        """Per-fragment atom counts for the concentric selector, for one leg.
+        """Per-fragment atom counts for the ``mulliken`` selector, for one leg.
 
         The monomer leg is a single fragment ``[len(active_atoms)]``; the dimer
         leg is that same fragment repeated once per monomer copy (``[2, 2]`` for
-        both-OH), so the concentric selector cuts each OH shell independently and
+        both-OH), so the ``mulliken`` selector cuts each OH shell independently and
         unions them -- the dimer active-virtual span then contains BOTH monomer
         shells (additivity), which is what makes the two legs differ at MATCHED
         fragment-coupling cuts.  Derived from ``active_atoms`` so it cannot drift.
+
+        Inert for ``spade``/``concentric-cl`` (both anchor on the fragment union and
+        ignore the partition), but harmless to compute -- the workflow's selector
+        dispatch collapses the groups to a union for those cuts.
         """
         m = len(self.active_atoms)
         assert len(active_atoms) % m == 0, (
@@ -280,8 +286,9 @@ class DissociationEnergy(BaseSettings):
         and ``Δ_HL`` legs are surfaced only as the built-in bracket / control checks.
 
         ``active_fragment_sizes`` is this leg's per-fragment partition for the
-        concentric selector (``[2]`` monomer, ``[2, 2]`` dimer); inert unless the
-        WF path (``xc_hl == HF``) with ``selector == concentric`` is active.
+        ``mulliken`` selector (``[2]`` monomer, ``[2, 2]`` dimer); inert unless the
+        WF path (``xc_hl == HF``) with ``selector == mulliken`` is active (the
+        default ``concentric-cl`` and ``spade`` anchor on the fragment union).
         """
         print(f"\n########## {tag} ##########")
         wf = EmbeddingWorkflow(
@@ -340,7 +347,7 @@ class DissociationEnergy(BaseSettings):
                 )
                 print(
                     "  ***          The dissociation energy will not be trustworthy; "
-                    "use --selector concentric."
+                    "use --selector concentric-cl (the default)."
                 )
             print(
                 "  NOTE: this is HF-in-PBE + correlation, a DIFFERENT quantity from the "

@@ -239,7 +239,7 @@ projection-based-embedding energy → feed the 1-RDM back. It drives a live
 HF-in-PBE, sto-3g), so it needs EmbASI installed (see below).
 
 By default it takes the **WF-in-DFT** path (`--xc_hl HF`: an HF mean field plus an
-active-space quantum solve, with the `concentric` selector), so the default run
+active-space quantum solve, with the `concentric-cl` selector), so the default run
 genuinely exercises the SQD pipeline. A Kohn-Sham `--xc_hl` (PBE0/PBE) instead
 routes DFT-in-DFT, where the solver and selector are inert.
 

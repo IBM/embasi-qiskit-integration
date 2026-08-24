@@ -7,8 +7,8 @@
 active column indices`` -- so the choice of which virtuals to correlate can be
 made data-driven instead of guessed with ``--n_virtual``.
 
-:func:`concentric_selector` implements a concentric-localisation cut in the
-lineage of SPADE (Claudino & Mayhall): the occupied subsystem-A space is fixed
+:func:`mulliken_selector` implements a single-shell concentric-localisation cut in
+the lineage of SPADE (Claudino & Mayhall): the occupied subsystem-A space is fixed
 by the embedding, and the virtuals are *ranked* by how strongly each couples to
 the active fragment, then truncated at the largest gap in that ranking.  Because
 ``build_orbitals`` hands the selector the *canonical* orbitals of ``F_emb`` (the
@@ -20,6 +20,18 @@ defined in the canonical basis.
 The selector never touches the occupied block: subsystem A's occupied orbitals
 are dictated by the level-shift embedding, and freezing occupied orbitals is a
 separate knob (``n_frozen_occ``).  It only decides *how many virtuals* to keep.
+
+:func:`concentric_localization_selector` is the *iterative* concentric algorithm
+of Claudino et al. (*J. Chem. Theory Comput.* **2019**, 15, 6085), of which the
+Mulliken/SPADE cuts above are the single-shell case.  Shell 0 projects the
+virtuals onto the active-fragment AO basis and SVD-splits the fragment-*spanned*
+virtuals from the kernel remainder; each subsequent shell SVDs the current span
+against the current kernel *through the embedded Fock matrix* and appends the
+newly-coupled virtuals.  The kept count therefore *grows* with the shell count and
+is set by SVD rank, not a gap cut -- the shell structure itself is the truncation.
+Like SPADE it rotates the virtual block, so it is a ``VirtualLocalizer``; unlike
+SPADE it needs the Fock matrix as the shell-expansion metric.  The paper reports
+the single-shell cut at ~1 kcal/mol; the extra shells are the accuracy knob.
 
 :func:`spade_virtual_selector` is the localising variant.  A Mulliken weight of a
 *canonical* virtual is only a good shell coordinate while the canonical virtuals
@@ -49,8 +61,9 @@ from embasi_qiskit_integration.projection_embedding_adapter import (
 )
 
 __all__ = [
-    "concentric_selector",
-    "per_fragment_concentric_selector",
+    "mulliken_selector",
+    "per_fragment_mulliken_selector",
+    "concentric_localization_selector",
     "spade_virtual_selector",
     "fragment_ao_indices",
 ]
@@ -69,7 +82,7 @@ def _gap_cut(
     ``weights[i] - weights[i+1]`` that clears ``gap_tol`` (keeping ``0..i``); if no
     gap qualifies every virtual is kept -- the cut refuses to truncate on noise.
     ``min_virtual``/``max_virtual`` then floor/cap the count.  Shared by
-    :func:`concentric_selector` (Mulliken weights) and :func:`spade_virtual_selector`
+    :func:`mulliken_selector` (Mulliken weights) and :func:`spade_virtual_selector`
     (σ² weights) so both truncate identically.
     """
     n_virt = int(weights.shape[0])
@@ -87,7 +100,7 @@ def _gap_cut(
     return min(keep, n_virt)
 
 
-def concentric_selector(
+def mulliken_selector(
     overlap: np.ndarray,
     fragment_ao: np.ndarray,
     *,
@@ -95,7 +108,10 @@ def concentric_selector(
     max_virtual: int | None = None,
     min_virtual: int = 0,
 ) -> Selector:
-    """Build a virtual-space selector that cuts on the fragment-coupling gap.
+    """Build a single-shell virtual-space selector that cuts on the fragment-coupling gap.
+
+    The single-shell (shell-0) Mulliken cut; :func:`concentric_localization_selector`
+    is the iterative generalisation.
 
     Args:
         overlap: AO overlap matrix ``S`` (``adapter._s``), shape (nao, nao).
@@ -146,7 +162,7 @@ def concentric_selector(
     return _select
 
 
-def per_fragment_concentric_selector(
+def per_fragment_mulliken_selector(
     overlap: np.ndarray,
     fragment_ao_groups: list[np.ndarray],
     *,
@@ -154,7 +170,7 @@ def per_fragment_concentric_selector(
     max_virtual_per_fragment: int | None = None,
     min_virtual_per_fragment: int = 0,
 ) -> Selector:
-    """Concentric cut run *independently per fragment*, then unioned.
+    """Single-shell Mulliken cut run *independently per fragment*, then unioned.
 
     For an interaction of ``k`` fragments (e.g. both OH groups of a dimer), a
     single concentric cut anchored on the *union* ``OH-A ∪ OH-B`` cannot
@@ -176,10 +192,10 @@ def per_fragment_concentric_selector(
     Args:
         overlap: AO overlap matrix ``S`` (``adapter._s``), shape (nao, nao).
         fragment_ao_groups: one AO-index array per physical fragment.  A single
-            group reproduces :func:`concentric_selector` exactly (verified by the
+            group reproduces :func:`mulliken_selector` exactly (verified by the
             length-1 delegation below), so this is a strict generalisation.
         gap_tol: shell-boundary tolerance, per fragment (see
-            :func:`concentric_selector`).
+            :func:`mulliken_selector`).
         max_virtual_per_fragment: cap on virtuals kept *for each fragment* (the
             per-fragment budget -- this is what additivity needs, in contrast to a
             single global cap that starves the multi-fragment leg).  ``None`` for
@@ -192,9 +208,9 @@ def per_fragment_concentric_selector(
     """
     groups = [np.asarray(g, dtype=int) for g in fragment_ao_groups]
     if len(groups) == 1:
-        # Single fragment: identical to the plain concentric cut (per-fragment
-        # cap == global cap when there is one fragment).
-        return concentric_selector(
+        # Single fragment: identical to the plain single-shell Mulliken cut
+        # (per-fragment cap == global cap when there is one fragment).
+        return mulliken_selector(
             overlap,
             groups[0],
             gap_tol=gap_tol,
@@ -231,6 +247,158 @@ def per_fragment_concentric_selector(
     return _select
 
 
+def concentric_localization_selector(
+    overlap: np.ndarray,
+    fragment_ao: np.ndarray,
+    fock: np.ndarray,
+    *,
+    n_shells: int = 0,
+    min_virtual: int = 0,
+    max_virtual: int | None = None,
+) -> VirtualLocalizer:
+    """Build the *iterative* Concentric Localization (CL) virtual-space localiser.
+
+    The full Claudino et al. algorithm (*J. Chem. Theory Comput.* **2019**, 15,
+    6085), of which :func:`mulliken_selector`/:func:`spade_virtual_selector` are the
+    single-shell case.  It **rotates** the virtual block (so it is a
+    :data:`VirtualLocalizer`, not a :class:`Selector`) and grows the retained space
+    one *shell* at a time:
+
+    * **Shell 0** projects the virtuals onto the active-fragment AO basis
+      (``proj = S[frag, :]``) and SVDs ``C_spanᵀ proj C_ker`` to split the
+      fragment-*spanned* virtuals (SVD rank) from the orthogonal kernel remainder.
+    * **Each further shell** SVDs the current span against the current kernel
+      *through the embedded Fock matrix* (``proj = fock``) and appends the newly
+      Fock-coupled virtuals to the span.
+
+    The kept count therefore *grows* with ``n_shells`` and is fixed by SVD rank, not
+    a gap in a weight vector -- the shell structure itself is the truncation.  To
+    reuse :meth:`ProjectionEmbeddingAdapter.build_orbitals`' localiser branch
+    unchanged, the returned callable rotates the *whole* virtual block into
+    ``[kept shells | kernel remainder]``, returns a synthetic descending ``sigma2``
+    (``1`` for kept, ``0`` for the remainder), and pins ``max_virtual == min_virtual
+    == k`` (the kept count) on itself so the shared :func:`_gap_cut` returns exactly
+    ``k`` regardless of the synthetic weights.
+
+    S-orthonormality (the correctness gate the downfold relies on) is preserved
+    because every retained/kernel column is the *incoming* S-orthonormal ``C_virt``
+    rotated by an orthogonal SVD factor ``V`` (``(C_virt V)ᵀ S (C_virt V) = Vᵀ I V =
+    I``); ``proj`` -- the non-symmetric ``S[frag,:]`` or the Fock -- only *chooses* the
+    rotation, it is never multiplied into the returned coefficients.  The projected
+    ``C'`` used to seed shell 0 is an SVD input only and is discarded.  A final
+    assert (and, if round-off drifts it, a symmetric re-S-orthonormalisation) keeps
+    the invariant exact.
+
+    Args:
+        overlap: AO overlap matrix ``S`` (``adapter._s``), shape (nao, nao).
+        fragment_ao: AO indices of the active-fragment atoms (as
+            :func:`mulliken_selector`).
+        fock: embedded Fock matrix ``F_emb`` (``adapter._fock``), shape (nao, nao) --
+            the shell-expansion metric for shells >= 1.  Unlike SPADE, CL needs it.
+        n_shells: number of Fock shell expansions after shell 0 (``0`` -> the
+            fragment-spanned shell only, the single-shell case; the paper's
+            convergence graphs suggest one cycle suffices in the working basis).
+        min_virtual: floor on the kept count (forwarded through the pinned cap).
+        max_virtual: hard ceiling on the kept count, applied *after* the shell
+            structure sets ``k`` -- a solver-budget knob for small simulations,
+            **not** part of the CL construction.  Because the rotated block is
+            ordered most-local first (shell 0, then successive Fock shells), a cap
+            of ``m < k`` keeps the ``m`` most fragment-local rotated virtuals and
+            drops the outermost shell tail.  ``None`` (default) keeps the full
+            shell-determined ``k``.  A cap below ``min_virtual`` wins (the ceiling
+            is the harder constraint when the two conflict).
+
+    Returns:
+        A ``VirtualLocalizer`` closing over ``S``, the fragment, and ``F_emb``.
+    """
+    s = np.asarray(overlap, dtype=float)
+    f = np.asarray(fock, dtype=float)
+    frag = np.asarray(fragment_ao, dtype=int)
+
+    def _span_kernel(c_span: np.ndarray, c_ker: np.ndarray, proj: np.ndarray):
+        """SVD-split ``c_ker`` by its ``proj``-coupling to ``c_span``.
+
+        Returns ``(cn, cn_ker)``: the columns of ``c_ker`` that couple to
+        ``c_span`` through ``proj`` (SVD rank, singular value > tol), and the
+        orthogonal remainder.  Both are ``c_ker`` rotated by the (orthogonal) right
+        singular vectors, so both inherit ``c_ker``'s S-orthonormality.
+        """
+        if c_ker.shape[1] == 0 or c_span.shape[1] == 0:
+            return c_ker[:, :0], c_ker
+        m = c_span.T @ proj @ c_ker
+        _u, svals, vt = np.linalg.svd(m)
+        rank = int(np.sum(svals > 1.0e-10))
+        v = vt.T  # right singular vectors: an orthogonal rotation of c_ker's columns
+        return c_ker @ v[:, :rank], c_ker @ v[:, rank:]
+
+    def _localise(coeff: np.ndarray, n_occ: int) -> tuple[np.ndarray, np.ndarray]:
+        c_virt = coeff[:, n_occ:]
+        n_virt = c_virt.shape[1]
+        if n_virt == 0:
+            return coeff.copy(), np.empty(0)
+
+        # Shell 0: project onto the fragment AO basis and split spanned vs kernel.
+        # ``c_virt_prime`` is the projection SEED for the SVD only -- it is NOT
+        # S-orthonormal and is never returned as coefficients.
+        s_pbwb = s[frag, :]  # (n_frag, nao)
+        s_inv = np.linalg.inv(s[np.ix_(frag, frag)])
+        c_virt_prime = s_inv @ s_pbwb @ c_virt
+        c_kept, c_ker = _span_kernel(c_virt_prime, c_virt, s_pbwb)
+
+        # Shells 1..n_shells: grow the span through the Fock coupling to the kernel.
+        for _ in range(n_shells):
+            c_new, c_ker = _span_kernel(c_kept, c_ker, f)
+            if c_new.shape[1] == 0:
+                break  # kernel exhausted / no further Fock coupling
+            c_kept = np.hstack([c_kept, c_new])
+
+        k = c_kept.shape[1]
+        # Full rotated virtual block: kept shells first, then the kernel remainder,
+        # so build_orbitals' active = [0, n_occ + k) picks exactly the kept shells.
+        virt_rot = np.hstack([c_kept, c_ker])
+
+        # Correctness gate: the retained + remainder columns must stay S-orthonormal
+        # (the downfold treats the active columns as an opaque S-orthonormal set).
+        gram = virt_rot.T @ s @ virt_rot
+        if not np.allclose(gram, np.eye(virt_rot.shape[1]), atol=1.0e-8):
+            # Symmetric (Löwdin) re-orthonormalisation against S, then re-check.  A
+            # slip beyond round-off means the rotation was not orthogonal -- fail loud.
+            w_g, u_g = np.linalg.eigh(gram)
+            if np.any(w_g <= 1.0e-10):
+                raise ValueError(
+                    "concentric-localization virtual block lost rank under S "
+                    "(non-orthogonal rotation); the span/kernel split is inconsistent"
+                )
+            virt_rot = virt_rot @ (u_g * (1.0 / np.sqrt(w_g))) @ u_g.T
+            gram = virt_rot.T @ s @ virt_rot
+            if not np.allclose(gram, np.eye(virt_rot.shape[1]), atol=1.0e-6):
+                raise ValueError(
+                    "concentric-localization virtual block is not S-orthonormal "
+                    f"(max |CᵀSC - I| = {np.abs(gram - np.eye(gram.shape[0])).max():.2e})"
+                )
+
+        # Shell structure sets k; an optional solver-budget cap truncates it from
+        # the most-local end (the rotated block is ordered shell-0 first).  The cap
+        # is the harder constraint, so it also overrides the min_virtual floor.
+        k_keep = k if max_virtual is None else min(k, max_virtual)
+
+        c_loc = coeff.copy()
+        c_loc[:, n_occ:] = virt_rot
+        # Synthetic descending weight so _gap_cut's invariants hold; the pinned cap
+        # below is what actually fixes the count at k_keep.
+        sigma2 = np.concatenate([np.ones(k_keep), np.zeros(n_virt - k_keep)])
+        _localise.max_virtual = k_keep  # type: ignore[attr-defined]
+        _localise.min_virtual = k_keep  # type: ignore[attr-defined]
+        return c_loc, sigma2
+
+    # gap_tol < 1 so the synthetic 1->0 step is a valid boundary; max/min_virtual are
+    # (re)pinned to the kept count k inside _localise, computed once coeff is known.
+    _localise.gap_tol = 0.5  # type: ignore[attr-defined]
+    _localise.max_virtual = None  # type: ignore[attr-defined]
+    _localise.min_virtual = min_virtual  # type: ignore[attr-defined]
+    return _localise
+
+
 def spade_virtual_selector(
     overlap: np.ndarray,
     fragment_ao: np.ndarray,
@@ -241,7 +409,7 @@ def spade_virtual_selector(
 ) -> VirtualLocalizer:
     """Build a SPADE virtual-space *localiser* that rotates then cuts on σ².
 
-    Unlike :func:`concentric_selector`, which ranks the *canonical* virtuals by
+    Unlike :func:`mulliken_selector`, which ranks the *canonical* virtuals by
     their Mulliken fragment population, this **rotates** the virtual block so each
     rotated virtual carries a definite fragment weight, then cuts on the gap in
     those weights.  The rotation is the SPADE construction (Claudino & Mayhall,
@@ -264,7 +432,7 @@ def spade_virtual_selector(
             fragment population ``Σ_{μ∈frag} C[μ,v]²`` (same weight the Mulliken cut
             scores), so the two paths coincide when the AO basis is orthonormal.
         fragment_ao: AO indices of the active-fragment atoms (as
-            :func:`concentric_selector`).
+            :func:`mulliken_selector`).
         gap_tol: minimum ``σ²_i − σ²_{i+1}`` counting as a shell boundary; the cut is
             at the largest qualifying gap.  No gap over the tolerance keeps every
             virtual (refuses to truncate on noise).
