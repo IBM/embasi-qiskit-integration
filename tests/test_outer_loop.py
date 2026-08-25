@@ -4,20 +4,25 @@
 """Outer self-consistency loop (``EmbeddingWorkflow._run_outer_loop``).
 
 The loop logic is package-owned; the only thing blocking it against *real*
-EmbASI is that ``construct_embedding_potential(dmab_in=...)`` wants a
-``SpinKpointArray`` rather than the plain ``(nao, nao)`` density the loop feeds
-back.  Here we exercise the loop end-to-end against a mock that closes that gap
-*on the mock side only* -- it accepts a plain ``(nao, nao)`` density and exposes
+EmbASI is that ``construct_embedding_potential(dma_in=..., dmb_in=...)`` wants
+``SpinKpointArray`` blocks rather than the plain ``(nao, nao)`` densities the loop
+feeds back.  Here we exercise the loop end-to-end against a mock that closes that
+gap *on the mock side only* -- it accepts plain ``(nao, nao)`` densities and exposes
 low-level energies under EmbASI's own attribute names -- so the loop's control
 flow (cycle count, convergence criteria, reseed policy) is tested on honest
 adapter numbers without EmbASI.
 
+The two subsystem densities are propagated **separately** (``dma_in`` = γ̃^A,
+``dmb_in`` = γ^B), matching EmbASI's signature.  The loop does not sum them into a
+total for the callee to re-partition: γ^B is frozen, so only γ̃^A is mixed, and the
+adapter passes each block through under its own name.
+
 The mock is a real PySCF RHF partitioned into A/B subsystems, identical in
 spirit to ``tests/_mpi_workflow_mock.py`` but with a working ``feedback`` path:
-``construct_embedding_potential(dmab_in=...)`` returns the fed-back partition's
-``(γ^A, γ^B, S, v_emb, P_B)`` so successive cycles genuinely move (and, because
-the high-level solver here is FCI on the full A space, converge back to the same
-fixed point).
+``construct_embedding_potential(dma_in=..., dmb_in=...)`` returns the fed-back
+partition's ``(γ^A, γ^B, S, v_emb, P_B)`` so successive cycles genuinely move (and,
+because the high-level solver here is FCI on the full A space, converge back to the
+same fixed point).
 
 NOTE: the surrogate low-level energies below (``subsys_A_lowlvl_totalen`` /
 ``subsys_AB_lowlvl_scftotalen``, the names the adapter reads) are the only
@@ -49,11 +54,11 @@ from embasi_qiskit_integration.solvers import FCISolver  # noqa:E402
 class _FeedbackMockEmbedding:
     """Partitioned RHF standing in for ProjectionEmbedding, with feedback.
 
-    ``construct_embedding_potential`` accepts an optional ``dmab_in`` (plain
-    ndarray, the shape the adapter's ``feedback`` produces).  Without it, it
-    returns the reference partition; with it, it rebuilds the pieces from the
-    supplied total density so the outer loop's second cycle actually differs from
-    the first.  It mirrors the *real* EmbASI entry point the adapter now uses,
+    ``construct_embedding_potential`` accepts optional ``dma_in`` / ``dmb_in``
+    (plain ndarrays, the shape the adapter's ``feedback`` produces).  Without them it
+    returns the reference partition; with them it rebuilds the pieces from the
+    supplied γ̃^A so the outer loop's second cycle actually differs from the first.
+    It mirrors the *real* EmbASI entry point the adapter now uses,
     returning the 5-tuple ``(γ^A, γ^B, S, v_emb, P_B)`` -- ``v_emb`` and ``P_B``
     read directly rather than the adapter reconstructing ``P_B`` by subtraction.
 
@@ -138,28 +143,32 @@ class _FeedbackMockEmbedding:
         sc = self._s @ self._c
         return sc @ np.diag(eps) @ sc.T
 
-    def construct_embedding_potential(self, dmab_in=None):
+    def construct_embedding_potential(self, dma_in=None, dmb_in=None):
         """Mirror EmbASI: return (γ^A, γ^B, S, v_emb, P_B).
 
         ``P_B`` is the level-shift projector ``mu * S γ^B S`` (what EmbASI's
         ``levelshift_projector`` builds), and ``v_emb`` is defined so the adapter's
         reassembly ``h_kin^A + h_estat_xc^A + v_emb + P_B`` reproduces the surrogate
         ``F_emb`` bit-for-bit.
+
+        The two subsystem densities arrive **separately** (``dma_in`` = γ̃^A,
+        ``dmb_in`` = γ^B), matching EmbASI's own signature: the outer loop no longer
+        sums them into one total for the callee to take apart again.
         """
         fock = self._assemble_fock()
-        if dmab_in is None:
+        if dma_in is None:
             dm_a = self._ref_dm_a
         else:
-            # dmab_in arrives as EmbASI's SpinKpointArray (the adapter wraps the
+            # dma_in arrives as EmbASI's SpinKpointArray (the adapter wraps the
             # fed-back (nao, nao) density in run_low_level); unwrap the single
             # spin/k-point block exactly as EmbASI's qmcode adapter does with
-            # ``density_matrix_in[0, 0]``.
-            dm_total = np.asarray(dmab_in[0, 0])
-            # Fed-back total density minus the frozen environment = new γ^A.
-            # (Real EmbASI re-localizes; the mock keeps the algebra honest by
-            # just subtracting the frozen B block, which is exactly what the
-            # adapter's feedback passed in.)
-            dm_a = dm_total - self._dm_b
+            # ``density_matrix_in[0, 0]``.  It is already γ̃^A alone -- no
+            # environment block to subtract back off.
+            dm_a = np.asarray(dma_in[0, 0])
+        # γ^B is frozen across the loop, so an explicit dmb_in must agree with the
+        # reference block; assert rather than silently preferring one.
+        if dmb_in is not None:
+            np.testing.assert_allclose(np.asarray(dmb_in[0, 0]), self._dm_b, atol=1e-12)
         p_b = self._mu * (self._s @ self._dm_b @ self._s)
         v_emb = fock - self._h_kin_a - self._h_estat_xc_a - p_b
         return (
@@ -286,21 +295,80 @@ def test_converge_on_energy_stops_when_density_still_moving():
     assert not any("converged" in line for line in logs_ed)
 
 
+def test_feedback_propagates_the_two_densities_separately():
+    """The loop hands EmbASI γ̃^A and γ^B as distinct blocks, not a summed total.
+
+    Pins the contract of ``run_low_level(dma_in=..., dmb_in=...)``: ``dma_in`` is the
+    correlated subsystem-A density on its own, and ``dmb_in`` is the frozen
+    environment.  The predecessor API took a single ``dm_ab_in`` total, leaving the
+    callee to recover γ^A by subtracting γ^B back off; that round-trip is what this
+    asserts is gone.
+
+    Without this, feeding the summed total as ``dma_in`` would still run and still
+    converge (the mock's γ^A is whatever it is handed), so the error would surface
+    only as a wrong embedding potential -- silently, in the energy.  Hence checking
+    the arguments, not just the outcome.
+    """
+    calls: list[tuple[np.ndarray | None, np.ndarray | None]] = []
+
+    class _RecordingBoth(_FeedbackMockEmbedding):
+        def construct_embedding_potential(self, dma_in=None, dmb_in=None):
+            calls.append(
+                (
+                    None if dma_in is None else np.asarray(dma_in[0, 0]).copy(),
+                    None if dmb_in is None else np.asarray(dmb_in[0, 0]).copy(),
+                )
+            )
+            return super().construct_embedding_potential(dma_in=dma_in, dmb_in=dmb_in)
+
+    mol = pyscf.M(atom="H 0 0 0; H 0 0 0.74; H 0 0 1.48; H 0 0 2.22", basis="sto-3g")
+    mock = _RecordingBoth(mol, mu=1.0e6, n_occ_a=1)
+    adapter = ProjectionEmbeddingAdapter(mock, PySCFIntegrals(mol.RHF()), mu=1.0e6)
+    adapter.run_low_level()
+    dm_b = mock._dm_b.copy()
+
+    # The opening run_low_level() takes no densities (nothing fed back yet).
+    assert calls == [(None, None)] or calls[0] == (None, None)
+    calls.clear()
+
+    # mix_alpha=1.0 -> the fed γ̃^A is the raw correlated density, unmixed, so it can
+    # be compared against the adapter's own rdm1_ao output without damping algebra.
+    wf = _workflow(solver="fci", max_cycles=2, mix_alpha=1.0, e_tol=1e-30, rho_tol=1e-30)
+    wf._run_outer_loop(adapter, FCISolver(), None, rank=0, log=lambda *a, **k: None)
+
+    assert calls, "feedback never reached construct_embedding_potential"
+    for fed_a, fed_b in calls:
+        assert fed_a is not None and fed_b is not None, "both blocks must be passed"
+        # γ^B is the frozen environment, forwarded untouched every cycle.
+        np.testing.assert_allclose(fed_b, dm_b, atol=1e-12)
+        # γ̃^A must NOT be the total.  tr(γ S) counts electrons, so subsystem A alone
+        # traces to 2 here (n_occ_a=1, doubly occupied) while the old summed total
+        # would trace to all 4 -- the cleanest discriminator between the two APIs.
+        n_a = float(np.einsum("ij,ji->", fed_a, mock._s))
+        n_b = float(np.einsum("ij,ji->", dm_b, mock._s))
+        assert n_a == pytest.approx(2.0, abs=1e-6), f"tr(γ̃^A S)={n_a}, expected 2"
+        assert n_a == pytest.approx(4.0 - n_b, abs=1e-6)  # A and B partition the 4
+
+
 def test_mix_alpha_damps_the_fed_back_density():
     """``mix_alpha`` linearly mixes the fed-back density across cycles.
 
-    The mock records every ``dmab_in`` it is handed.  With ``mix_alpha=1.0`` the
-    loop feeds the raw new total density (undamped); with ``mix_alpha=0.5`` the
-    second cycle's fed density must be the average of the unmixed new density and
-    the previous cycle's fed density -- i.e. strictly between them.
+    The mock records every ``dma_in`` it is handed.  With ``mix_alpha=1.0`` the
+    loop feeds the raw new γ̃^A (undamped); with ``mix_alpha=0.5`` the second
+    cycle's fed density must be the average of the unmixed new density and the
+    previous cycle's fed density -- i.e. strictly between them.
+
+    Mixing applies to γ̃^A only.  γ^B is frozen, so damping is a property of the
+    correlated block alone; recording ``dma_in`` (not a summed total) is what makes
+    that visible.
     """
     seen: list[np.ndarray] = []
 
     class _Recording(_FeedbackMockEmbedding):
-        def construct_embedding_potential(self, dmab_in=None):
-            if dmab_in is not None:
-                seen.append(np.asarray(dmab_in[0, 0]).copy())
-            return super().construct_embedding_potential(dmab_in=dmab_in)
+        def construct_embedding_potential(self, dma_in=None, dmb_in=None):
+            if dma_in is not None:
+                seen.append(np.asarray(dma_in[0, 0]).copy())
+            return super().construct_embedding_potential(dma_in=dma_in, dmb_in=dmb_in)
 
     def build(alpha):
         mol = pyscf.M(atom="H 0 0 0; H 0 0 0.74; H 0 0 1.48; H 0 0 2.22", basis="sto-3g")

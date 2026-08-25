@@ -95,8 +95,9 @@ class _MockProjectionEmbedding:
         self.mo_coeffs_B_LL = c_b[np.newaxis, :, :]
         _ = nao
 
-    def construct_embedding_potential(self, dmab_in=None):
-        # dmab_in path is not exercised by the MPI test (no feedback under mock).
+    def construct_embedding_potential(self, dma_in=None, dmb_in=None):
+        # The dma_in/dmb_in feedback path is not exercised by the MPI test (a
+        # single pass, no feedback under mock).
         # P_B is the level-shift projector mu * S γ^B S; v_emb is defined so the
         # adapter's reassembly reproduces self._fock bit-for-bit.
         p_b = self._mu * (self._s @ self._dm_b @ self._s)
