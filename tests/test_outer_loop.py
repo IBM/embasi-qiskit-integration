@@ -295,6 +295,61 @@ def test_converge_on_energy_stops_when_density_still_moving():
     assert not any("converged" in line for line in logs_ed)
 
 
+def test_feedback_propagates_the_two_densities_separately():
+    """The loop hands EmbASI γ̃^A and γ^B as distinct blocks, not a summed total.
+
+    Pins the contract of ``run_low_level(dma_in=..., dmb_in=...)``: ``dma_in`` is the
+    correlated subsystem-A density on its own, and ``dmb_in`` is the frozen
+    environment.  The predecessor API took a single ``dm_ab_in`` total, leaving the
+    callee to recover γ^A by subtracting γ^B back off; that round-trip is what this
+    asserts is gone.
+
+    Without this, feeding the summed total as ``dma_in`` would still run and still
+    converge (the mock's γ^A is whatever it is handed), so the error would surface
+    only as a wrong embedding potential -- silently, in the energy.  Hence checking
+    the arguments, not just the outcome.
+    """
+    calls: list[tuple[np.ndarray | None, np.ndarray | None]] = []
+
+    class _RecordingBoth(_FeedbackMockEmbedding):
+        def construct_embedding_potential(self, dma_in=None, dmb_in=None):
+            calls.append(
+                (
+                    None if dma_in is None else np.asarray(dma_in[0, 0]).copy(),
+                    None if dmb_in is None else np.asarray(dmb_in[0, 0]).copy(),
+                )
+            )
+            return super().construct_embedding_potential(dma_in=dma_in, dmb_in=dmb_in)
+
+    mol = pyscf.M(atom="H 0 0 0; H 0 0 0.74; H 0 0 1.48; H 0 0 2.22", basis="sto-3g")
+    mock = _RecordingBoth(mol, mu=1.0e6, n_occ_a=1)
+    adapter = ProjectionEmbeddingAdapter(mock, PySCFIntegrals(mol.RHF()), mu=1.0e6)
+    adapter.run_low_level()
+    dm_b = mock._dm_b.copy()
+
+    # The opening run_low_level() takes no densities (nothing fed back yet).
+    assert calls == [(None, None)] or calls[0] == (None, None)
+    calls.clear()
+
+    # mix_alpha=1.0 -> the fed γ̃^A is the raw correlated density, unmixed, so it can
+    # be compared against the adapter's own rdm1_ao output without damping algebra.
+    wf = _workflow(solver="fci", max_cycles=2, mix_alpha=1.0, e_tol=1e-30, rho_tol=1e-30)
+    wf._run_outer_loop(adapter, FCISolver(), None, rank=0, log=lambda *a, **k: None)
+
+    assert calls, "feedback never reached construct_embedding_potential"
+    for fed_a, fed_b in calls:
+        assert fed_a is not None and fed_b is not None, "both blocks must be passed"
+        # γ^B is the frozen environment, forwarded untouched every cycle.
+        np.testing.assert_allclose(fed_b, dm_b, atol=1e-12)
+        # γ̃^A must NOT be the total.  tr(γ S) counts electrons, so subsystem A alone
+        # traces to 2 here (n_occ_a=1, doubly occupied) while the old summed total
+        # would trace to all 4 -- the cleanest discriminator between the two APIs.
+        n_a = float(np.einsum("ij,ji->", fed_a, mock._s))
+        n_b = float(np.einsum("ij,ji->", dm_b, mock._s))
+        assert n_a == pytest.approx(2.0, abs=1e-6), f"tr(γ̃^A S)={n_a}, expected 2"
+        assert n_a == pytest.approx(4.0 - n_b, abs=1e-6)  # A and B partition the 4
+
+
 def test_mix_alpha_damps_the_fed_back_density():
     """``mix_alpha`` linearly mixes the fed-back density across cycles.
 
