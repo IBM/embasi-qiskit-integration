@@ -102,8 +102,8 @@ def _no_embasi_import(monkeypatch):
 def test_spin_kpoint_array_fallback_is_indexable(monkeypatch):
     """Without EmbASI, the wrapper is a (1, 1, nao, nao) ndarray, [0,0]-indexable.
 
-    The mock outer loop (and real EmbASI) unwrap ``dmab_in[0, 0]`` to the plain
-    density block, so the fallback must reproduce that indexing exactly.
+    The mock outer loop (and real EmbASI) unwrap ``dma_in[0, 0]`` / ``dmb_in[0, 0]``
+    to the plain density block, so the fallback must reproduce that indexing exactly.
     """
     _no_embasi_import(monkeypatch)
     dm = np.arange(16.0).reshape(4, 4)
