@@ -18,12 +18,14 @@ dependencies = [
 
 [project.optional-dependencies]
 quantum  = ["qiskit>=1.0", "qiskit-aer", "qiskit-addon-sqd", "ffsim"]
-fermions = ["qiskit-fermions @ git+https://github.com/Qiskit/qiskit-fermions.git"]
+fermions = ["qiskit-fermions>=0.1.0"]
 relabel  = ["pyomo>=6.7", "highspy>=1.7"]
 hardware = ["qiskit-ibm-runtime", "samplomatic"]
 embed    = ["embasi @ git+https://github.com/tamm-cci/EmbASI.git@qm-code-adapter", "mpi4py"]          # EmbASI (from source); pulls ase + asi4py
 chem     = ["rdkit>=2023.9"]         # SMILES-derived charge in molecule/geometry.py (optional)
 dev      = ["pytest>=7", "pytest-cov", "ruff==0.15.20", "mypy>=2.2,<2.4", "pre-commit", "rdkit>=2023.9"]
+# Every runtime extra in one shot (excludes `dev` tooling).
+all      = ["embasi-qiskit-integration[quantum,fermions,relabel,hardware,embed]"]
 
 [project.scripts]
 embasi-qiskit-integration = "embasi_qiskit_integration.cli:main"
@@ -43,8 +45,8 @@ filterwarnings = [
 ]
 
 [tool.hatch.metadata]
-# The `fermions` extra references qiskit-fermions directly from git (it is not
-# on PyPI); hatchling requires opting in to direct references.
+# The `embed` extra references EmbASI directly from git (it is not on PyPI);
+# hatchling requires opting in to direct references.
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]

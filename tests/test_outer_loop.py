@@ -4,7 +4,7 @@
 """Outer self-consistency loop (``EmbeddingWorkflow._run_outer_loop``).
 
 The loop logic is package-owned; the only thing blocking it against *real*
-EmbASI is that ``construct_embedded_fock(dmab_in=...)`` wants a
+EmbASI is that ``construct_embedding_potential(dmab_in=...)`` wants a
 ``SpinKpointArray`` rather than the plain ``(nao, nao)`` density the loop feeds
 back.  Here we exercise the loop end-to-end against a mock that closes that gap
 *on the mock side only* -- it accepts a plain ``(nao, nao)`` density and exposes
@@ -14,9 +14,10 @@ adapter numbers without EmbASI.
 
 The mock is a real PySCF RHF partitioned into A/B subsystems, identical in
 spirit to ``tests/_mpi_workflow_mock.py`` but with a working ``feedback`` path:
-``construct_embedded_fock(dmab_in=...)`` rebuilds ``F_emb`` from the fed-back
-density, so successive cycles genuinely move (and, because the high-level solver
-here is FCI on the full A space, converge back to the same fixed point).
+``construct_embedding_potential(dmab_in=...)`` returns the fed-back partition's
+``(γ^A, γ^B, S, v_emb, P_B)`` so successive cycles genuinely move (and, because
+the high-level solver here is FCI on the full A space, converge back to the same
+fixed point).
 
 NOTE: the surrogate low-level energies below (``subsys_A_lowlvl_totalen`` /
 ``subsys_AB_lowlvl_scftotalen``, the names the adapter reads) are the only
@@ -37,21 +38,33 @@ pyscf = pytest.importorskip("pyscf")
 
 # Imported after the importorskip above, so the module skips cleanly without
 # pyscf rather than failing at import time -- hence the E402 waivers.
-from embasi_qiskit_integration.embedding import EmbeddingWorkflow  # noqa: E402
-from embasi_qiskit_integration.projection_embedding_adapter import (  # noqa: E402
+from embasi_qiskit_integration.embedding import EmbeddingWorkflow  # noqa:E402
+from embasi_qiskit_integration.projection_embedding_adapter import (  # noqa:E402
     ProjectionEmbeddingAdapter,
     PySCFIntegrals,
 )
-from embasi_qiskit_integration.solvers import FCISolver  # noqa: E402
+from embasi_qiskit_integration.solvers import FCISolver  # noqa:E402
 
 
 class _FeedbackMockEmbedding:
     """Partitioned RHF standing in for ProjectionEmbedding, with feedback.
 
-    ``construct_embedded_fock`` accepts an optional ``dmab_in`` (plain ndarray,
-    the shape the adapter's ``feedback`` produces).  Without it, it returns the
-    reference partition; with it, it rebuilds ``F_emb`` from the supplied total
-    density so the outer loop's second cycle actually differs from the first.
+    ``construct_embedding_potential`` accepts an optional ``dmab_in`` (plain
+    ndarray, the shape the adapter's ``feedback`` produces).  Without it, it
+    returns the reference partition; with it, it rebuilds the pieces from the
+    supplied total density so the outer loop's second cycle actually differs from
+    the first.  It mirrors the *real* EmbASI entry point the adapter now uses,
+    returning the 5-tuple ``(γ^A, γ^B, S, v_emb, P_B)`` -- ``v_emb`` and ``P_B``
+    read directly rather than the adapter reconstructing ``P_B`` by subtraction.
+
+    ``F_emb`` is not returned; the adapter assembles it exactly as EmbASI's
+    ``construct_embedded_fock`` does, from ``A_LL.hamiltonian_kinetic`` +
+    ``A_LL.hamiltonian_estat_plus_xc`` + ``v_emb`` + ``P_B``.  The mock therefore
+    also exposes those two one-electron blocks on ``A_LL`` (a kinetic /
+    everything-else split of the supersystem ``h_core``), and defines
+    ``P_B = mu * S γ^B S`` (the level-shift projector EmbASI's ``levelshift_projector``
+    produces) with ``v_emb = F_emb - h_kin^A - h_estat_xc^A - P_B`` so the
+    reassembled ``F_emb`` is bit-identical to the surrogate it targets.
 
     Exposes surrogate low-level energies under EmbASI's own attribute names
     (``subsys_A_lowlvl_totalen`` / ``subsys_AB_lowlvl_scftotalen``, in eV, the
@@ -95,10 +108,21 @@ class _FeedbackMockEmbedding:
         self._eps0 = mf.mo_energy.copy()
         self._b_cols = np.arange(n_occ_a, n_occ)
 
-        # Minimal A_LL.atoms.calc.mol reach-through for _a_fragment_footing.  No
+        # The A_LL one-electron blocks the adapter reads to reassemble F_emb, and
+        # the A_LL.atoms.calc.mol reach-through for _a_fragment_footing.  No
         # ghosting in the mock: the A-fragment mol is the supersystem mol, so the
-        # rebasing is a full-vs-full no-op (footing_shift ~ 0).
-        self.A_LL = SimpleNamespace(atoms=SimpleNamespace(calc=SimpleNamespace(mol=mol)))
+        # rebasing is a full-vs-full no-op (footing_shift ~ 0).  h_core is split
+        # into kinetic + "estat_plus_xc" (everything else) exactly as EmbASI names
+        # the two blocks; their sum is the supersystem h_core.
+        h_kin = np.asarray(mol.intor("int1e_kin"))
+        h_core = np.asarray(mf.get_hcore())
+        self._h_kin_a = h_kin
+        self._h_estat_xc_a = h_core - h_kin
+        self.A_LL = SimpleNamespace(
+            atoms=SimpleNamespace(calc=SimpleNamespace(mol=mol)),
+            hamiltonian_kinetic=h_kin[np.newaxis, np.newaxis, :, :],
+            hamiltonian_estat_plus_xc=(h_core - h_kin)[np.newaxis, np.newaxis, :, :],
+        )
 
         c_a = c_occ[:, :n_occ_a]
         c_b = c_occ[:, n_occ_a:]
@@ -114,7 +138,14 @@ class _FeedbackMockEmbedding:
         sc = self._s @ self._c
         return sc @ np.diag(eps) @ sc.T
 
-    def construct_embedded_fock(self, dmab_in=None):
+    def construct_embedding_potential(self, dmab_in=None):
+        """Mirror EmbASI: return (γ^A, γ^B, S, v_emb, P_B).
+
+        ``P_B`` is the level-shift projector ``mu * S γ^B S`` (what EmbASI's
+        ``levelshift_projector`` builds), and ``v_emb`` is defined so the adapter's
+        reassembly ``h_kin^A + h_estat_xc^A + v_emb + P_B`` reproduces the surrogate
+        ``F_emb`` bit-for-bit.
+        """
         fock = self._assemble_fock()
         if dmab_in is None:
             dm_a = self._ref_dm_a
@@ -129,10 +160,14 @@ class _FeedbackMockEmbedding:
             # just subtracting the frozen B block, which is exactly what the
             # adapter's feedback passed in.)
             dm_a = dm_total - self._dm_b
+        p_b = self._mu * (self._s @ self._dm_b @ self._s)
+        v_emb = fock - self._h_kin_a - self._h_estat_xc_a - p_b
         return (
-            dm_a[np.newaxis, :, :],
-            self._dm_b[np.newaxis, :, :],
-            fock[np.newaxis, :, :],
+            dm_a[np.newaxis, np.newaxis, :, :],
+            self._dm_b[np.newaxis, np.newaxis, :, :],
+            self._s[np.newaxis, np.newaxis, :, :],
+            v_emb[np.newaxis, np.newaxis, :, :],
+            p_b[np.newaxis, np.newaxis, :, :],
         )
 
 
@@ -262,10 +297,10 @@ def test_mix_alpha_damps_the_fed_back_density():
     seen: list[np.ndarray] = []
 
     class _Recording(_FeedbackMockEmbedding):
-        def construct_embedded_fock(self, dmab_in=None):
+        def construct_embedding_potential(self, dmab_in=None):
             if dmab_in is not None:
                 seen.append(np.asarray(dmab_in[0, 0]).copy())
-            return super().construct_embedded_fock(dmab_in=dmab_in)
+            return super().construct_embedding_potential(dmab_in=dmab_in)
 
     def build(alpha):
         mol = pyscf.M(atom="H 0 0 0; H 0 0 0.74; H 0 0 1.48; H 0 0 2.22", basis="sto-3g")

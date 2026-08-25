@@ -13,8 +13,11 @@ hardware. EmbASI is only required to close the embedding loop (Phase 8).
 
 - **Python ≥ 3.10** (developed and tested on 3.12).
 - **[uv](https://docs.astral.sh/uv/)** for environment management (recommended).
-- **A Rust toolchain** — required to build `qiskit-fermions`, which ships a
-  native extension. Install it with:
+- **A Rust toolchain** — *only* needed if you install the optional `fermions`
+  extra on a platform without a prebuilt `qiskit-fermions` wheel. PyPI ships
+  `abi3` wheels for macOS (x86_64/arm64), manylinux (x86_64/aarch64), and
+  Windows, so most users need no Rust at all. On an unsupported platform pip
+  falls back to the source distribution, which compiles a native extension:
 
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -22,9 +25,8 @@ hardware. EmbASI is only required to close the embedding loop (Phase 8).
   rustc --version   # confirm it is on PATH
   ```
 
-  On macOS you can alternatively `brew install rust`. Rust is only needed for
-  the optional `fermions` extra; the core quantum path (`quantum` extra) does
-  not require it.
+  On macOS you can alternatively `brew install rust`. The core quantum path
+  (`quantum` extra) never requires it.
 
 ## Installation
 
@@ -35,14 +37,18 @@ source .venv/bin/activate
 uv pip install -e ".[dev,quantum]"
 
 # optional extras
-uv pip install -e ".[fermions]"   # builds qiskit-fermions from git; needs Rust (see Prerequisites)
+uv pip install -e ".[fermions]"   # qiskit-fermions from PyPI (prebuilt wheels; see Prerequisites)
 uv pip install -e ".[hardware]"   # IBM Quantum Runtime
 uv pip install -e ".[chem]"       # rdkit, for SMILES-derived charges in .xyz metadata
+
+# every runtime extra in one shot (quantum + fermions + relabel + hardware + embed)
+uv pip install -e ".[all]"        # add `dev` for test/lint tooling: ".[all,dev]"
 ```
 
-`qiskit-fermions` is not published on PyPI, so the `fermions` extra installs it
-directly from git (`git+https://github.com/Qiskit/qiskit-fermions.git`) and
-compiles its Rust extension at install time.
+`qiskit-fermions` is published on PyPI, so the `fermions` extra installs it as a
+normal dependency (`qiskit-fermions>=0.1.0`). On common platforms pip fetches a
+prebuilt `abi3` wheel; only an unsupported platform falls back to the source
+distribution, which compiles a Rust extension at install time.
 
 ## Quickstart
 
@@ -230,15 +236,19 @@ embedding flow against **real EmbASI** — EmbASI low-level embedding → extrac
 active-space Hamiltonian → solve with SQD/FCI → assemble the
 projection-based-embedding energy → feed the 1-RDM back. It drives a live
 `embasi.embedding.ProjectionEmbedding` (methanol monomer, OH active fragment,
-PBE-in-PBE, sto-3g), so it needs EmbASI installed (see below).
+HF-in-PBE, sto-3g), so it needs EmbASI installed (see below).
 
-It defaults to the SQD pipeline:
+By default it takes the **WF-in-DFT** path (`--xc_hl HF`: an HF mean field plus an
+active-space quantum solve, with the `concentric-cl` selector), so the default run
+genuinely exercises the SQD pipeline. A Kohn-Sham `--xc_hl` (PBE0/PBE) instead
+routes DFT-in-DFT, where the solver and selector are inert.
 
 ```bash
-uv run python scripts/embedding_workflow.py                        # sqd + aer (default)
+uv run python scripts/embedding_workflow.py                        # WF-in-DFT: sqd + aer (default)
 uv run python scripts/embedding_workflow.py --sampler runtime      # sqd on hardware
 uv run python scripts/embedding_workflow.py --handoff two-process  # file handoff
-uv run python scripts/embedding_workflow.py --solver fci           # classical reference
+uv run python scripts/embedding_workflow.py --solver fci           # classical FCI reference
+uv run python scripts/embedding_workflow.py --xc_hl PBE0           # DFT-in-DFT (solver inert)
 ```
 
 ### Starting from an `.xyz`
@@ -440,6 +450,28 @@ to exercise the real embedding backend.
    Without a completed FHI-aims embedding run the real-EmbASI smoke test skips
    itself with an explanatory message; with the driver in place it exercises the
    extraction/feedback path against live EmbASI matrices.
+
+## References & citation
+
+This library couples the **EmbASI** projection-based embedding framework to the
+Qiskit SQD stack. The embedding formalism — the DFT-in-DFT and WF-in-DFT energy
+expressions, the level-shift projector, and the reference results this package's
+docstrings cite as "the paper" (Eq. 2, 6, 8, 19; §2.2; Fig. 3B) — is described
+in:
+
+> G. Bramley, P. Stishenko, O. van Vuren, V. Blum, and A. J. Logsdail,
+> *A General Pythonic Framework for DFT-in-DFT and WF-in-DFT Embedding*,
+> ChemRxiv (2025), preprint. DOI: [10.26434/chemrxiv-2025-c23jf](https://doi.org/10.26434/chemrxiv-2025-c23jf).
+
+If you use this integration, please cite the EmbASI paper above. The projection /
+level-shift embedding scheme it implements originates with:
+
+> F. R. Manby, M. Stella, J. D. Goodpaster, and T. F. Miller III,
+> *A Simple, Exact Density-Functional-Theory Embedding Scheme*,
+> J. Chem. Theory Comput. **8**, 2564–2568 (2012).
+> DOI: [10.1021/ct300544e](https://doi.org/10.1021/ct300544e).
+
+EmbASI itself is developed at <https://github.com/tamm-cci/EmbASI>.
 
 ## License
 

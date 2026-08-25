@@ -50,9 +50,9 @@ guarded to rank 0::
 Remaining work
 --------------
 The single-pass workflow runs end-to-end against real EmbASI: density-fitted
-``eri_mo`` (``--density_fit``), the concentric selector
-(``--selector concentric``), the restricted-span eigensolve, and the low-level
-energy readout are all in place.  What is left is either blocked on the EmbASI
+``eri_mo`` (``--density_fit``), the concentric-localization selector
+(``--selector concentric-cl``, the default), the restricted-span eigensolve, and
+the low-level energy readout are all in place.  What is left is either blocked on the EmbASI
 side or a deliberately-deferred package rewrite; the upstream asks are marked
 inline with ``TODO(embasi-api)`` and summarised in the docstring atop
 ``projection_embedding_adapter.py``:
@@ -64,6 +64,20 @@ inline with ``TODO(embasi-api)`` and summarised in the docstring atop
 
 Open-shell / unrestricted embedding is a deferred package rewrite (separate
 alpha/beta orbital sets, ``(h1a, h1b)``, SQD spin-symmetry).
+
+References
+----------
+"The paper" throughout this package -- its Eq. 2 (DFT-in-DFT), Eq. 6 (level
+shift), Eq. 8 (WF-in-DFT assembly), Eq. 19 (dissociation energy), §2.2 and
+Fig. 3B -- is the EmbASI framework paper:
+
+    G. Bramley, P. Stishenko, O. van Vuren, V. Blum, A. J. Logsdail, "A General
+    Pythonic Framework for DFT-in-DFT and WF-in-DFT Embedding", ChemRxiv (2025),
+    preprint, doi:10.26434/chemrxiv-2025-c23jf.
+
+The projection / level-shift embedding scheme it implements originates with
+F. R. Manby, M. Stella, J. D. Goodpaster, T. F. Miller III, J. Chem. Theory
+Comput. 8, 2564 (2012), doi:10.1021/ct300544e.
 """
 
 from __future__ import annotations
@@ -122,13 +136,42 @@ class EmbeddingWorkflow(BaseSettings):
     active_atoms: list[int] = [1, 5]  # O and its hydroxyl H -> the OH fragment
     basis: str = "sto-3g"  # matches the EmbASI developers' example
     xc_ll: str = "PBE"
-    xc_hl: str = "PBE"
+    # HF high level -> the WF-in-DFT path (the SQD integration this package is
+    # about).  A KS ``xc_hl`` (e.g. PBE/PBE0) instead routes DFT-in-DFT, where the
+    # solver never runs; the dissociation-energy driver overrides this per run.
+    xc_hl: str = "HF"
     mu: float = 1.0e6  # level-shift parameter, paper Eq. 6
 
     # --- active space: solver budget only, not embedding physics --- #
     n_frozen_occ: int = 0
-    n_virtual: int | None = None  # None -> every virtual of subsystem A
-    selector: Literal["none", "concentric"] = "none"
+    n_virtual: int | None = None  # solver-budget cap; None -> the selector's own count
+    #   (``mulliken``: per-fragment cap; ``spade``: cap after the σ² gap; ``concentric-cl``:
+    #   ceiling on the shell-determined k, truncating the outermost shell tail for small
+    #   simulations; ``none``: the fixed energy-ordered cut).
+    # ``concentric-cl`` by default: the full iterative Concentric Localization of
+    # Claudino 2019 (JCTC 15, 6085), the paper-faithful cut.  It keeps a nested,
+    # size-consistent active-virtual space (an energy-ordered "none" cut is non-nested
+    # across legs) and grows it by ``n_shells`` Fock-coupled shells (the accuracy knob;
+    # ``n_shells=0`` is the single-shell case).  ``mulliken`` is the single-shell
+    # Mulliken-population cut (ranks canonical F_emb virtuals, cuts on the largest gap;
+    # honours ``active_fragment_sizes`` per-fragment); ``spade`` ROTATES the virtual
+    # block (Claudino & Mayhall, doi:10.1021/acs.jctc.9b00682) so each rotated virtual
+    # carries a definite fragment weight σ², then cuts on the σ² gap -- basis invariant,
+    # robust when the canonical virtuals delocalise.  ``none`` disables.
+    selector: Literal["none", "mulliken", "spade", "concentric-cl"] = "concentric-cl"
+    # ``concentric-cl`` only: number of Fock shell expansions after shell 0.  0 keeps
+    # just the fragment-spanned shell (single-shell equivalent); higher values grow the
+    # active-virtual space (and the qubit/determinant count) for accuracy.
+    n_shells: int = 0
+    # How the active atoms partition into PHYSICAL fragments, as consecutive
+    # counts in the order they appear in ``active_atoms`` (which the reorder keeps
+    # leading, ascending).  ``None`` (default) -> one fragment (current behaviour).
+    # e.g. both-OH dimer active_atoms=[1,5,7,11] -> [2, 2] (OH-A | OH-B): the
+    # ``mulliken`` selector then cuts each OH shell independently and unions them, so
+    # the dimer active-virtual span contains BOTH monomer shells (additivity).  Used
+    # ONLY by ``mulliken``; the rotating ``spade``/``concentric-cl`` cuts anchor on the
+    # fragment union and ignore the partition.
+    active_fragment_sizes: list[int] | None = None
 
     # --- integral backend --- #
     density_fit: bool = False  # density-fit the active-space ERIs
@@ -162,7 +205,7 @@ class EmbeddingWorkflow(BaseSettings):
         """Run the full embedding pipeline and return its ``ProjectionEnergy``.
 
         ``cli_cmd`` (the pydantic-settings entry point) just calls this; callers
-        that need the energy back -- e.g. an interaction-energy driver that
+        that need the energy back -- e.g. a dissociation-energy driver that
         differences a dimer against its monomers -- can call it directly and use
         the returned :class:`ProjectionEnergy`.  Pass ``log`` to redirect the
         console output (default: print on rank 0).
@@ -183,20 +226,77 @@ class EmbeddingWorkflow(BaseSettings):
         source = f"xyz={self.xyz}" if self.xyz is not None else f"s26[{self.s26_index}]"
         log(f"   geometry: {source}")
         emb = self._build_adapter(parallel=size > 1)
-        # Collective on every rank: EmbASI's supersystem SCF, SPADE/Pipek-Mezey
-        # localisation, and the embedded Fock all run inside here.
-        emb.run_low_level()
         log(
             f"   {self.xc_hl}-in-{self.xc_ll} / {self.basis}, "
             f"active atoms {self.active_atoms}, projection=level-shift"
         )
 
-        selector = self._build_selector(emb)
+        # Route on the high-level METHOD, not the solver.  A density functional
+        # (pure or hybrid: PBE, PBE0, B3LYP, ...) is DFT-in-DFT (paper Eq. 2): the
+        # high-level energy is a Kohn-Sham energy at the embedded density, with no
+        # active space, no solver, and no correlated wavefunction.  A wavefunction
+        # method (HF as a mean field, or a correlated solver on top) is WF-in-DFT
+        # (Eq. 8): downfold subsystem A to an active space and hand a bare
+        # electronic Hamiltonian to FCI/SQD.  Routing a hybrid xc through the WF
+        # path is a category error (its signature is a large, non-monotonic
+        # dependence of Δ_HL on the virtual budget), so it goes down its own path.
+        #
+        # The two paths drive DIFFERENT collective EmbASI entry points and must
+        # branch BEFORE the low-level call, so exactly one fires per rank: the
+        # DFT-in-DFT path runs EmbASI's native ``run()`` (which itself runs the
+        # supersystem SCF), while the WF path runs ``run_low_level()``.  Calling
+        # both would double the supersystem SCF (``run()`` re-invokes
+        # ``construct_embedding_potential`` internally).
+        if self._is_dft_in_dft():
+            return self._dft_in_dft(emb, log=log)
+
+        # WF-in-DFT only.  Collective on every rank: EmbASI's supersystem SCF,
+        # SPADE/Pipek-Mezey localisation, and the embedded Fock all run in here.
+        emb.run_low_level()
+        selector, virtual_localizer = self._build_selector(emb, log=log)
         solver = self._build_solver()
-        return self._run_outer_loop(emb, solver, selector, rank=rank, log=log)
+        return self._run_outer_loop(emb, solver, selector, virtual_localizer, rank=rank, log=log)
+
+    def _is_dft_in_dft(self) -> bool:
+        """True when the high level is a density functional (-> paper Eq. 2).
+
+        ``HF`` is the sole wavefunction mean field expressible as an ``xc_hl``
+        string, so it (and any correlated method layered on it) takes the
+        WF-in-DFT path; every other ``xc_hl`` is a KS functional and takes
+        DFT-in-DFT.  Kept as an explicit predicate so the routing rule is one
+        readable line and the two paths never blur into a shared ``run()`` body.
+        """
+        return self.xc_hl.strip().upper() != "HF"
+
+    def _dft_in_dft(self, emb, *, log):
+        """Paper Eq. 2 reference path: a Kohn-Sham energy at the embedded density.
+
+        Deliberately NOT a variant of the WF outer loop -- it never builds an
+        active space, never constructs a downfolded Hamiltonian, never calls a
+        solver, and never feeds a correlated density back.  It self-consistently
+        relaxes the high-level KS density of subsystem A inside the frozen
+        embedding potential and assembles the same :class:`ProjectionEnergy`
+        breakdown, so a dissociation-energy driver consumes both paths identically.
+
+        This is the correctness baseline: on s26[22] it reproduces PBE0-in-PBE to
+        within the embedding error of the full PBE0 number, and the PBE-in-PBE
+        control gives Δ_HL = 0 exactly (the high/low functionals coincide, so the
+        embedding is a no-op on the energy -- the paper's Fig. 3B cancellation).
+        """
+        log("== DFT-in-DFT (paper Eq. 2): embedded Kohn-Sham energy, no active space ==")
+        energy = emb.dft_in_dft_energy()
+        log("   E = E_low(total) - E_low(A) + E_high(A) + corr")
+        log(
+            f"     = {energy.e_low_total:.6f} - {energy.e_low_A:.6f} "
+            f"+ {energy.e_high_A:.6f} + {energy.correction:.6f}"
+        )
+        log(f"     = {energy.total:.6f} Ha")
+        log(f"   tr[γ̃^A P_B] = {energy.projector_leak:.2e} Ha (should be ~0)")
+        log(f"   footing shift applied to E_high(A): {energy.footing_shift:.6f} Ha")
+        return energy
 
     # ---------------- outer self-consistency loop ---------------- #
-    def _run_outer_loop(self, emb, solver, selector, *, rank, log):
+    def _run_outer_loop(self, emb, solver, selector, virtual_localizer=None, *, rank, log):
         """Steps 2-5, iterated until self-consistent (or ``max_cycles``).
 
         ``max_cycles == 1`` reproduces the single-pass flow exactly.  With more
@@ -233,19 +333,20 @@ class EmbeddingWorkflow(BaseSettings):
                 n_frozen_occ=self.n_frozen_occ,
                 n_virtual=self.n_virtual,
                 selector=selector,
+                virtual_localizer=virtual_localizer,
             )
             log(f"   {orbitals}")
-            if selector is not None:
+            if selector is not None or virtual_localizer is not None:
                 n_kept_virt = orbitals.n_active_orbitals - (orbitals.n_occ - orbitals.inactive.size)
                 budget = "" if self.n_virtual is None else f" (cap {self.n_virtual})"
                 log(
-                    f"   selector=concentric picked {n_kept_virt} virtuals{budget}; "
+                    f"   selector={self.selector} picked {n_kept_virt} virtuals{budget}; "
                     f"n_frozen_occ={self.n_frozen_occ} frozen"
                 )
             elif self.solver == "sqd" and self.n_virtual is None:
                 log(
                     "   note: full A virtual space -- pass --n_virtual or "
-                    "--selector concentric to fit a qubit budget"
+                    "--selector concentric-cl/mulliken to fit a qubit budget"
                 )
             ham = emb.embedded_hamiltonian(orbitals)
             log(
@@ -396,32 +497,86 @@ class EmbeddingWorkflow(BaseSettings):
             atoms = atoms[: self.n_atoms]
         return atoms, self.charge or 0
 
-    def _build_selector(self, emb: ProjectionEmbeddingAdapter):
-        """Concentric-localisation selector, or ``None`` for the fixed cut.
+    def _build_selector(self, emb: ProjectionEmbeddingAdapter, *, log=None):
+        """Build the active-virtual shaping hook from ``self.selector``.
+
+        Returns a ``(selector, virtual_localizer)`` pair with at most one non-None
+        (both ``None`` for the fixed ``--n_virtual`` cut):
+
+        * ``mulliken`` -> a ``Selector`` (per-fragment single-shell Mulliken cut),
+        * ``spade`` -> a ``VirtualLocalizer`` (SPADE rotation + σ² gap cut),
+        * ``concentric-cl`` -> a ``VirtualLocalizer`` (iterative CL, ``n_shells``),
+        * ``none`` -> ``(None, None)``.
+
+        A rotation cannot be expressed as a column-index ``Selector``, so ``spade``
+        and ``concentric-cl`` go through the ``build_orbitals(virtual_localizer=...)``
+        hook instead, anchored on the fragment UNION (a rotation cannot be unioned
+        per-fragment the way index selection can).
 
         After the atom reorder in ``_build_adapter`` the region-1 (active) atoms
         occupy the first ``len(active_atoms)`` positions of ``mol``, so the
         fragment AO indices come straight from the leading atom slices.
         """
         if self.selector == "none":
-            return None
+            return None, None
         from embasi_qiskit_integration.selectors import (
-            concentric_selector,
+            concentric_localization_selector,
             fragment_ao_indices,
+            per_fragment_mulliken_selector,
+            spade_virtual_selector,
         )
 
-        # ``mol`` is a PySCF-backend detail, not part of the AOIntegrals protocol
-        # (FHIaimsIntegrals has no Mole), so the concentric selector is only
-        # available on the PySCF path.
-        mol = getattr(emb.ints, "mol", None)
-        if mol is None:
+        mol = emb.ints.mol
+        # run_low_level() (called before this) populates the overlap and F_emb; assert
+        # for the type-checker and to fail loudly if the call order is ever broken.
+        assert emb._s is not None, "run_low_level() must run before _build_selector()"
+        overlap = emb._s
+        # Reordered active-atom positions lead, ascending: 0..len(active_atoms)-1.
+        # Partition them into PHYSICAL fragments per ``active_fragment_sizes`` (one
+        # group by default).
+        n_active = len(self.active_atoms)
+        sizes = self.active_fragment_sizes or [n_active]
+        if sum(sizes) != n_active:
             raise ValueError(
-                "selector='concentric' needs the PySCF integral backend "
-                f"(no 'mol' on {type(emb.ints).__name__}); use selector='none'"
+                f"active_fragment_sizes {sizes} sum to {sum(sizes)}, but there are "
+                f"{n_active} active atoms"
             )
-        active_after_sort = list(range(len(self.active_atoms)))
-        frag_ao = fragment_ao_indices(mol, active_after_sort)
-        return concentric_selector(emb._s_arr, frag_ao, max_virtual=self.n_virtual)
+        groups, start = [], 0
+        for sz in sizes:
+            positions = list(range(start, start + sz))
+            groups.append(fragment_ao_indices(mol, positions))
+            start += sz
+
+        if self.selector in ("spade", "concentric-cl"):
+            # A rotation cannot be unioned per-fragment the way index selection can,
+            # so both localisers anchor on the UNION of the fragment AOs.
+            frag_union = np.unique(np.concatenate(groups)) if groups else np.empty(0, int)
+            if self.selector == "spade":
+                # ``n_virtual`` caps the kept rotated shell.
+                return None, spade_virtual_selector(overlap, frag_union, max_virtual=self.n_virtual)
+            # concentric-cl: the shell count sets the physically-motivated k; if
+            # ``n_virtual`` is given it is a solver-budget CEILING on top of that
+            # (for small simulations), truncating the outermost shell tail -- not a
+            # replacement for the shell structure.
+            assert emb._fock is not None, "run_low_level() must run before _build_selector()"
+            if self.n_virtual is not None and log is not None:
+                log(
+                    f"   [selector] concentric-cl: capping the shell-determined virtuals "
+                    f"at n_virtual={self.n_virtual} (solver budget)"
+                )
+            return None, concentric_localization_selector(
+                overlap, frag_union, emb._fock, n_shells=self.n_shells, max_virtual=self.n_virtual
+            )
+
+        # mulliken: run the per-fragment single-shell Mulliken cut and union.
+        # ``n_virtual`` is the per-FRAGMENT ceiling here (additivity: each fragment
+        # gets its own shell, matched to the monomer leg's cut), not a global cap.
+        return (
+            per_fragment_mulliken_selector(
+                overlap, groups, max_virtual_per_fragment=self.n_virtual
+            ),
+            None,
+        )
 
     def _build_solver(self):
         from embasi_qiskit_integration.solvers import FCISolver, SQDSolver

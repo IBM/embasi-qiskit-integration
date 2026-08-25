@@ -238,7 +238,7 @@ def path_score(
         score += t1_rescaled[qubit]
         score += spam_rescaled[qubit]
         if index < len(path_qubits) - 1:
-            pair = (path_qubits[index], path_qubits[index + 1])
+            pair = (qubit, path_qubits[index + 1])
             if pair not in bell_rescaled:
                 pair = pair[::-1]
             score += bell_rescaled[pair]

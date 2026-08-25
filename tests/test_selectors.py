@@ -19,8 +19,11 @@ from __future__ import annotations
 import numpy as np
 
 from embasi_qiskit_integration.selectors import (
-    concentric_selector,
+    _gap_cut,
+    concentric_localization_selector,
     fragment_ao_indices,
+    mulliken_selector,
+    spade_virtual_selector,
 )
 
 
@@ -55,7 +58,7 @@ def test_orthonormal_basis_ranks_virtuals_by_fragment_population():
     s = np.eye(nao)
     energy = np.arange(nao, dtype=float)
 
-    sel = concentric_selector(s, frag, gap_tol=0.1)
+    sel = mulliken_selector(s, frag, gap_tol=0.1)
     active = sel(coeff, energy, n_occ)
 
     # Occupied block is always kept, in order.
@@ -85,7 +88,7 @@ def test_gap_cut_keeps_the_tight_shell():
     s = np.eye(nao)
     energy = np.arange(nao, dtype=float)
 
-    sel = concentric_selector(s, frag, gap_tol=0.1)
+    sel = mulliken_selector(s, frag, gap_tol=0.1)
     active = sel(coeff, energy, n_occ)
     kept_virt = set(active[n_occ:])
     # Only the two strong virtuals clear the gap.
@@ -107,7 +110,7 @@ def test_max_virtual_caps_after_the_gap():
     energy = np.arange(nao, dtype=float)
 
     # gap_tol high enough that nothing cuts on the gap; cap does the work.
-    sel = concentric_selector(s, frag, gap_tol=0.5, max_virtual=2)
+    sel = mulliken_selector(s, frag, gap_tol=0.5, max_virtual=2)
     active = sel(coeff, energy, n_occ)
     assert active[0] == 0  # occupied kept
     assert len(active) - n_occ == 2  # capped at 2 virtuals
@@ -131,7 +134,7 @@ def test_no_significant_gap_keeps_everything():
     s = np.eye(nao)
     energy = np.arange(nao, dtype=float)
 
-    sel = concentric_selector(s, frag, gap_tol=0.1)  # gaps are all 0.02
+    sel = mulliken_selector(s, frag, gap_tol=0.1)  # gaps are all 0.02
     active = sel(coeff, energy, n_occ)
     assert len(active) == nao  # all occ + all virt
     assert set(active[n_occ:]) == set(range(n_occ, nao))
@@ -152,7 +155,7 @@ def test_min_virtual_floor():
     s = np.eye(nao)
     energy = np.arange(nao, dtype=float)
 
-    sel = concentric_selector(s, frag, gap_tol=0.1, min_virtual=3)
+    sel = mulliken_selector(s, frag, gap_tol=0.1, min_virtual=3)
     active = sel(coeff, energy, n_occ)
     assert len(active) - n_occ == 3
     # the three strongest by fragment weight (columns 1, 2, 3).
@@ -166,7 +169,7 @@ def test_no_virtuals_returns_occupied_only():
     coeff = _orthonormal(nao)
     s = np.eye(nao)
     energy = np.arange(nao, dtype=float)
-    sel = concentric_selector(s, frag)
+    sel = mulliken_selector(s, frag)
     active = sel(coeff, energy, n_occ)
     assert list(active) == [0, 1, 2]
 
@@ -196,7 +199,7 @@ def test_nonorthogonal_overlap_uses_S_weighted_population():
     pop = np.einsum("mv,mv->v", sc[frag, :], c_virt[frag, :])
     expected_order = np.argsort(-pop)
 
-    sel = concentric_selector(s, frag, gap_tol=1e9, max_virtual=1)  # keep top-1
+    sel = mulliken_selector(s, frag, gap_tol=1e9, max_virtual=1)  # keep top-1
     active = sel(coeff, energy, n_occ)
     kept = active[n_occ:]
     assert kept.tolist() == [n_occ + int(expected_order[0])]
@@ -268,7 +271,7 @@ def test_n_frozen_occ_is_honoured_when_a_selector_is_set():
     exists to bound — was larger than requested.
     """
     adapter, overlap = _stub_adapter(nao=8, n_occ=3)
-    selector = concentric_selector(overlap, np.arange(4), max_virtual=2)
+    selector = mulliken_selector(overlap, np.arange(4), max_virtual=2)
 
     unfrozen = adapter.build_orbitals(n_frozen_occ=0, selector=selector, restrict_to_a=False)
     frozen = adapter.build_orbitals(n_frozen_occ=2, selector=selector, restrict_to_a=False)
@@ -295,3 +298,410 @@ def test_freeze_that_empties_the_active_space_raises():
             selector=lambda coeff, energy, n_occ: np.array([0, 1]),
             restrict_to_a=False,
         )
+
+
+# ----- SPADE virtual-space localiser ----------------------------------------- #
+
+
+def _apply_localizer(loc, coeff, n_occ):
+    """Mimic ``build_orbitals``: rotate + gap-cut, returning (kept_count, c_loc)."""
+    c_loc, sigma2 = loc(coeff, n_occ)
+    keep = _gap_cut(
+        sigma2,
+        gap_tol=loc.gap_tol,
+        max_virtual=loc.max_virtual,
+        min_virtual=loc.min_virtual,
+    )
+    return keep, c_loc, sigma2
+
+
+def test_spade_sigma2_reduces_to_fragment_population_at_identity_overlap():
+    """At ``S = I`` the σ² of each rotated virtual is its own fragment population.
+
+    The Löwdin step is the identity when ``S = I``, so σ² collapses to the plain
+    ``Σ_{μ∈frag} C[μ,v]²`` the Mulliken cut scores -- but now of the *rotated*
+    virtuals.  Verified directly against the rotated coefficients.
+    """
+    nao, n_occ = 6, 2
+    frag = np.array([0, 1])
+    coeff = _orthonormal(nao, seed=1)
+
+    loc = spade_virtual_selector(np.eye(nao), frag, gap_tol=0.1)
+    c_loc, sigma2 = loc(coeff, n_occ)
+
+    rotated_pop = (c_loc[frag, n_occ:] ** 2).sum(axis=0)
+    assert np.allclose(sigma2, rotated_pop)
+    # σ² is a probability weight: within [0, 1] and sorted descending.
+    assert np.all(sigma2 >= -1e-12) and np.all(sigma2 <= 1 + 1e-12)
+    assert np.all(np.diff(sigma2) <= 1e-12)
+
+
+def test_spade_rotation_preserves_orthonormality_and_span():
+    """A within-A virtual rotation keeps S-orthonormality and the virtual span.
+
+    These are the two invariants the downfold relies on (the active columns are an
+    opaque S-orthonormal spanning set, and P_B stays invisible because span is
+    unchanged).  A non-identity SPD overlap makes the Löwdin step non-trivial, so
+    this also exercises the ``S != I`` path.
+    """
+    nao, n_occ = 7, 3
+    frag = np.array([0, 1, 2])
+    # An SPD overlap that is not the identity: S = I + small symmetric perturbation.
+    rng = np.random.default_rng(11)
+    b = rng.normal(size=(nao, nao)) * 0.1
+    s = np.eye(nao) + b @ b.T
+    # S-orthonormal coefficients: C = S^{-1/2} Q for orthonormal Q (so CᵀSC = I).
+    w, u = np.linalg.eigh(s)
+    s_minus_half = (u / np.sqrt(w)) @ u.T
+    q = _orthonormal(nao, seed=2)
+    coeff = s_minus_half @ q
+    assert np.allclose(coeff.T @ s @ coeff, np.eye(nao), atol=1e-10)
+
+    loc = spade_virtual_selector(s, frag, gap_tol=0.1)
+    c_loc, sigma2 = loc(coeff, n_occ)
+
+    virt = c_loc[:, n_occ:]
+    # S-orthonormality of the rotated virtuals.
+    assert np.allclose(virt.T @ s @ virt, np.eye(nao - n_occ), atol=1e-10)
+    # Occupied block untouched.
+    assert np.allclose(c_loc[:, :n_occ], coeff[:, :n_occ])
+    # Span of the virtual block unchanged (all principal cosines with the original
+    # canonical virtual block are 1) -- so no P_B leak is introduced.
+    cos = np.linalg.svd(coeff[:, n_occ:].T @ s @ virt, compute_uv=False)
+    assert np.allclose(cos, 1.0, atol=1e-10)
+    # σ² ∈ [0, 1], descending.
+    assert np.all(sigma2 >= -1e-12) and np.all(sigma2 <= 1 + 1e-12)
+
+
+def test_spade_recovers_local_shell_the_mulliken_cut_misses():
+    """The decisive case: delocalised canonical virtuals hide a local shell.
+
+    Build a 2-dimensional fragment-*local* virtual shell (living entirely on the
+    fragment AOs) plus two environment virtuals (zero fragment population), then mix
+    all four by a random orthogonal rotation.  The resulting *canonical* virtuals
+    each carry a similar, jittery fragment population -- the Mulliken cut sees a flat
+    spectrum, finds its largest gap in the wrong place, and cannot isolate the true
+    2-dim shell.  SPADE unmixes the rotation: σ² is exactly ``[1, 1, 0, 0]``, so the
+    gap cut keeps precisely the two local virtuals, and the kept rotated block spans
+    the known local subspace exactly.  This is the improvement the localiser exists
+    for.
+    """
+    nao, n_occ = 6, 2
+    frag = np.array([0, 1, 2])  # local shell (dim 2) lives on AO 0, 1
+
+    c_virt = np.zeros((nao, 4))
+    c_virt[0, 0] = 1.0
+    c_virt[1, 1] = 1.0  # local shell: full fragment population
+    c_virt[4, 2] = 1.0
+    c_virt[5, 3] = 1.0  # environment: zero fragment population
+    rot, _ = np.linalg.qr(np.random.default_rng(7).standard_normal((4, 4)))
+    c_virt_canonical = c_virt @ rot  # delocalise: flatten the fragment populations
+
+    coeff = np.zeros((nao, nao))
+    coeff[2, 0] = 1.0
+    coeff[3, 1] = 1.0  # occupied block
+    coeff[:, n_occ:] = c_virt_canonical
+    s = np.eye(nao)
+    energy = np.arange(nao, dtype=float)
+
+    # The Mulliken cut on the canonical virtuals does NOT isolate the 2-dim shell.
+    mulliken = mulliken_selector(s, frag, gap_tol=0.1)
+    kept_mulliken = [int(i - n_occ) for i in mulliken(coeff, energy, n_occ)[n_occ:]]
+    assert len(kept_mulliken) != 2, (
+        f"the Mulliken-on-canonical cut kept {len(kept_mulliken)} virtuals -- the "
+        "delocalised construction was meant to defeat it (kept != 2)"
+    )
+
+    # SPADE recovers exactly the 2-dim local shell.
+    loc = spade_virtual_selector(s, frag, gap_tol=0.1)
+    keep, c_loc, sigma2 = _apply_localizer(loc, coeff, n_occ)
+    assert keep == 2, f"SPADE kept {keep} virtuals, expected the 2-dim local shell"
+    assert np.allclose(np.sort(sigma2)[::-1][:2], 1.0, atol=1e-9)
+    assert np.allclose(sigma2[2:], 0.0, atol=1e-9)
+
+    # The kept rotated virtuals span the true local subspace (AO 0, 1) exactly.
+    kept_block = c_loc[:, n_occ : n_occ + keep]
+    local_true = np.zeros((nao, 2))
+    local_true[0, 0] = 1.0
+    local_true[1, 1] = 1.0
+    cos = np.linalg.svd(local_true.T @ kept_block, compute_uv=False)
+    assert np.allclose(cos, 1.0, atol=1e-9), (
+        f"kept SPADE virtuals do not span the local shell (principal cosines {cos})"
+    )
+
+
+def test_spade_no_gap_keeps_every_virtual():
+    """A flat σ² spectrum (no gap over tolerance) refuses to truncate.
+
+    Same safe-degrade contract as the Mulliken cut: when no σ² gap clears the
+    tolerance, keep every virtual rather than slice on noise.
+    """
+    nao, n_occ = 6, 2
+    frag = np.array([0, 1])
+    # Four virtuals sharing the fragment evenly -> σ² near-degenerate, no clean gap.
+    c_virt = np.zeros((nao, 4))
+    for j in range(4):
+        c_virt[0, j] = 0.5
+        c_virt[1, j] = 0.5
+        c_virt[2 + j, j] = np.sqrt(0.5)
+    # Orthonormalise so the block is a legitimate S=I virtual set.
+    q, _ = np.linalg.qr(c_virt)
+    coeff = np.zeros((nao, nao))
+    coeff[2, 0] = 1.0  # occupied (overwritten below by orthonormal fill)
+    coeff = _orthonormal(nao, seed=5)
+    coeff[:, n_occ:] = q[:, : nao - n_occ]
+
+    loc = spade_virtual_selector(np.eye(nao), frag, gap_tol=0.9)  # huge tol -> no gap
+    keep, _c_loc, _sigma2 = _apply_localizer(loc, coeff, n_occ)
+    assert keep == nao - n_occ  # kept everything
+
+
+def test_spade_localizer_wired_through_build_orbitals():
+    """``build_orbitals(virtual_localizer=...)`` rotates, cuts, and NaNs the eps.
+
+    End-to-end through the adapter hook on a stub adapter (no EmbASI): the active
+    space is occupied + the kept SPADE shell, rotated-virtual energies are NaN, and
+    the active virtual columns are S-orthonormal.
+    """
+    nao, n_occ = 6, 2
+    frag = np.array([0, 1, 2])
+    adapter, overlap = _stub_adapter(nao=nao, n_occ=n_occ, seed=4)
+
+    loc = spade_virtual_selector(overlap, frag, gap_tol=1e-4)
+    orb = adapter.build_orbitals(virtual_localizer=loc, restrict_to_a=False)
+
+    # Occupied block always kept and leading.
+    assert list(orb.active[:n_occ]) == list(range(n_occ))
+    # Rotated virtuals carry NaN energies (no meaningful Fock eigenvalue).
+    assert np.all(np.isnan(orb.energy[n_occ:]))
+    assert np.all(np.isfinite(orb.energy[:n_occ]))
+    # Active virtual columns are S-orthonormal against the (identity) overlap.
+    c_act_virt = orb.coeff[:, orb.active[orb.active >= n_occ]]
+    gram = c_act_virt.T @ overlap @ c_act_virt
+    assert np.allclose(gram, np.eye(c_act_virt.shape[1]), atol=1e-10)
+
+
+def test_build_orbitals_rejects_selector_and_localizer_together():
+    """Passing both a selector and a localiser is a hard error, not a silent pick."""
+    import pytest
+
+    nao, n_occ = 6, 2
+    adapter, overlap = _stub_adapter(nao=nao, n_occ=n_occ)
+    sel = mulliken_selector(overlap, np.array([0, 1]))
+    loc = spade_virtual_selector(overlap, np.array([0, 1]))
+
+    with pytest.raises(ValueError, match="not both"):
+        adapter.build_orbitals(selector=sel, virtual_localizer=loc, restrict_to_a=False)
+
+
+# ----- iterative Concentric Localization (CL) -------------------------------- #
+
+
+def _cl_system(seed: int = 17):
+    """A synthetic (coeff, S, fock, frag) with a known shell structure.
+
+    Built in an S-orthonormal MO basis (``S = I`` so the coeff columns are already
+    orthonormal) with virtuals laid out as three groups:
+
+    * ``d0`` virtuals living on the fragment AOs  -> shell 0 keeps exactly these,
+    * ``d1`` virtuals that couple to the shell-0 block *only through the Fock*
+      (zero fragment population, nonzero Fock block to the shell-0 virtuals),
+    * the rest, coupled to neither -> never selected.
+
+    Returns ``(coeff, s, fock, frag, n_occ, d0, d1)``.  The Fock is symmetric and
+    its only off-diagonal virtual coupling is the shell-0<->shell-1 block, so
+    ``k(0) == d0`` and ``k(1) == d0 + d1`` exactly.
+    """
+    n_occ, d0, d1, d_rest = 2, 2, 2, 3
+    n_virt = d0 + d1 + d_rest
+    nao = n_occ + n_virt
+    frag = np.arange(d0)  # fragment AOs 0..d0-1
+
+    coeff = np.eye(nao)  # S = I, so identity columns are S-orthonormal MOs
+    # Occupied block lives on AOs [n_virt:] (off the fragment) so it is inert here.
+    coeff = np.zeros((nao, nao))
+    coeff[n_virt : n_virt + n_occ, :n_occ] = np.eye(n_occ)  # occupied -> tail AOs
+    # Virtual block: column j (0-indexed within virtuals) lives on AO j.
+    coeff[:n_virt, n_occ:] = np.eye(n_virt)
+
+    s = np.eye(nao)
+
+    # Fock: diagonal (arbitrary orbital energies) + a single coupling block between
+    # the shell-0 virtuals (AOs 0..d0-1) and the shell-1 virtuals (AOs d0..d0+d1-1).
+    rng = np.random.default_rng(seed)
+    fock = np.diag(rng.uniform(1.0, 2.0, size=nao))
+    block = rng.uniform(0.5, 1.0, size=(d0, d1))
+    fock[0:d0, d0 : d0 + d1] = block
+    fock[d0 : d0 + d1, 0:d0] = block.T  # symmetric
+    return coeff, s, fock, frag, n_occ, d0, d1
+
+
+def _cl_localise(loc, coeff, n_occ):
+    """Run a CL localiser + gap cut like ``build_orbitals`` does; return kept count."""
+    c_loc, sigma2 = loc(coeff, n_occ)
+    keep = _gap_cut(
+        sigma2,
+        gap_tol=loc.gap_tol,
+        max_virtual=loc.max_virtual,
+        min_virtual=loc.min_virtual,
+    )
+    return keep, c_loc, sigma2
+
+
+def test_cl_shell_count_grows_with_shells():
+    """Decisive: shell 0 keeps the fragment-spanned block; each shell adds its Fock coupling.
+
+    With a construction whose fragment-spanned dimension is ``d0`` and whose only
+    Fock coupling out of that block reaches ``d1`` further virtuals, ``k`` must be
+    ``d0`` at ``n_shells=0`` and ``d0 + d1`` at ``n_shells>=1`` (the coupling
+    saturates after one Fock shell here), and never decrease.
+    """
+    coeff, s, fock, frag, n_occ, d0, d1 = _cl_system()
+
+    keeps = []
+    for n_shells in (0, 1, 2):
+        loc = concentric_localization_selector(s, frag, fock, n_shells=n_shells)
+        keep, _c, _sig = _cl_localise(loc, coeff, n_occ)
+        keeps.append(keep)
+
+    assert keeps[0] == d0, f"shell 0 kept {keeps[0]}, expected the fragment span {d0}"
+    assert keeps[1] == d0 + d1, f"shell 1 kept {keeps[1]}, expected {d0 + d1}"
+    # Saturating and non-decreasing: no coupling remains past the one block.
+    assert keeps[2] == keeps[1]
+    assert keeps[0] <= keeps[1] <= keeps[2]
+
+
+def test_cl_max_virtual_caps_the_shell_count():
+    """``max_virtual`` truncates the shell-determined k from the most-local end.
+
+    A small-simulation budget knob: with a shell structure that would keep
+    ``d0 + d1`` at ``n_shells=1``, a cap of ``d0`` must keep exactly ``d0`` -- and
+    the kept block must be the shell-0 (fragment-local) virtuals, since the rotated
+    block is ordered most-local first.  The cap also overrides ``min_virtual``.
+    """
+    coeff, s, fock, frag, n_occ, d0, d1 = _cl_system(seed=41)
+
+    # Uncapped: k = d0 + d1 at one Fock shell.
+    loc_full = concentric_localization_selector(s, frag, fock, n_shells=1)
+    keep_full, _c, _sig = _cl_localise(loc_full, coeff, n_occ)
+    assert keep_full == d0 + d1
+
+    # Capped at d0: keep exactly the fragment-local shell-0 block.
+    loc_cap = concentric_localization_selector(s, frag, fock, n_shells=1, max_virtual=d0)
+    keep_cap, c_loc, _sig = _cl_localise(loc_cap, coeff, n_occ)
+    assert keep_cap == d0
+    kept_block = c_loc[:, n_occ : n_occ + keep_cap]
+    local_true = np.zeros((coeff.shape[0], d0))
+    local_true[np.arange(d0), np.arange(d0)] = 1.0
+    cos = np.linalg.svd(local_true.T @ kept_block, compute_uv=False)
+    assert np.allclose(cos, 1.0, atol=1e-9), (
+        f"capped CL kept the wrong virtuals (cosines with shell-0 shell {cos})"
+    )
+
+    # A cap never exceeds the available k, and beats a conflicting min_virtual floor.
+    loc_over = concentric_localization_selector(
+        s, frag, fock, n_shells=1, max_virtual=d0, min_virtual=d0 + d1
+    )
+    keep_over, _c, _sig = _cl_localise(loc_over, coeff, n_occ)
+    assert keep_over == d0
+
+
+def test_cl_preserves_orthonormality_and_span():
+    """The make-or-break invariant: CL rotates the virtual block, never breaks S-orthonormality.
+
+    Non-identity SPD overlap, S-orthonormal input coefficients: after CL the full
+    virtual block must stay S-orthonormal, the occupied block untouched, and the
+    total virtual span unchanged (all principal cosines 1 -- no P_B leak).
+    """
+    nao, n_occ = 8, 3
+    frag = np.array([0, 1, 2])
+    rng = np.random.default_rng(23)
+    b = rng.normal(size=(nao, nao)) * 0.1
+    s = np.eye(nao) + b @ b.T  # SPD, not identity
+    # S-orthonormal coefficients: C = S^{-1/2} Q.
+    w, u = np.linalg.eigh(s)
+    s_minus_half = (u / np.sqrt(w)) @ u.T
+    coeff = s_minus_half @ _orthonormal(nao, seed=24)
+    assert np.allclose(coeff.T @ s @ coeff, np.eye(nao), atol=1e-10)
+    a = rng.normal(size=(nao, nao))
+    fock = a + a.T
+
+    loc = concentric_localization_selector(s, frag, fock, n_shells=1)
+    c_loc, _sigma2 = loc(coeff, n_occ)
+
+    virt = c_loc[:, n_occ:]
+    assert np.allclose(virt.T @ s @ virt, np.eye(nao - n_occ), atol=1e-8)
+    assert np.allclose(c_loc[:, :n_occ], coeff[:, :n_occ])  # occupied untouched
+    # Full virtual span preserved: principal cosines with the original virtuals are 1.
+    cos = np.linalg.svd(coeff[:, n_occ:].T @ s @ virt, compute_uv=False)
+    assert np.allclose(cos, 1.0, atol=1e-8)
+
+
+def test_cl_shell0_keeps_exactly_the_fragment_spanned_virtuals():
+    """At ``n_shells=0`` the kept block spans exactly the fragment-local virtuals.
+
+    Mirror of the SPADE local-shell test: a clean ``d0``-dim local shell plus
+    fragment-orthogonal environment virtuals; shell 0 keeps precisely the local
+    shell and the kept rotated block spans it exactly.
+    """
+    coeff, s, fock, frag, n_occ, d0, _d1 = _cl_system(seed=31)
+
+    loc = concentric_localization_selector(s, frag, fock, n_shells=0)
+    keep, c_loc, _sigma2 = _cl_localise(loc, coeff, n_occ)
+    assert keep == d0
+
+    # The kept rotated virtuals span the fragment-local subspace (AOs 0..d0-1).
+    kept_block = c_loc[:, n_occ : n_occ + keep]
+    local_true = np.zeros((coeff.shape[0], d0))
+    local_true[np.arange(d0), np.arange(d0)] = 1.0
+    cos = np.linalg.svd(local_true.T @ kept_block, compute_uv=False)
+    assert np.allclose(cos, 1.0, atol=1e-9), (
+        f"kept shell-0 virtuals do not span the fragment shell (cosines {cos})"
+    )
+
+
+def test_cl_wired_through_build_orbitals():
+    """End-to-end through ``build_orbitals``: active = occupied + exactly ``k``.
+
+    Proves the A1 pinning (``max_virtual == min_virtual == k``): the synthetic
+    ``sigma2`` notwithstanding, the gap cut returns exactly the CL shell count, the
+    rotated-virtual energies are NaN, and the active virtuals are S-orthonormal.
+    """
+    nao, n_occ = 8, 3
+    frag = np.arange(3)
+    adapter, overlap = _stub_adapter(nao=nao, n_occ=n_occ, seed=6)
+    fock = adapter._fock_arr  # the stub's symmetric Fock
+
+    loc = concentric_localization_selector(overlap, frag, fock, n_shells=1)
+    orb = adapter.build_orbitals(virtual_localizer=loc, restrict_to_a=False)
+
+    # A1 pinning: build_orbitals must return exactly the CL shell count k, which the
+    # localiser pins onto itself (max == min == k) during the call it just made.
+    expected_k = loc.max_virtual
+    assert expected_k is not None and 0 < expected_k <= nao - n_occ
+    assert loc.min_virtual == expected_k  # pinned to the same k
+    assert list(orb.active[:n_occ]) == list(range(n_occ))
+    assert len(orb.active) - n_occ == expected_k
+    assert np.all(np.isnan(orb.energy[n_occ:]))
+    assert np.all(np.isfinite(orb.energy[:n_occ]))
+    c_act_virt = orb.coeff[:, orb.active[orb.active >= n_occ]]
+    gram = c_act_virt.T @ overlap @ c_act_virt
+    assert np.allclose(gram, np.eye(c_act_virt.shape[1]), atol=1e-10)
+
+
+def test_cl_honours_n_frozen_occ():
+    """CL selects virtuals only; ``n_frozen_occ`` must still remove low occupied orbitals."""
+    nao, n_occ = 8, 3
+    adapter, overlap = _stub_adapter(nao=nao, n_occ=n_occ, seed=7)
+    fock = adapter._fock_arr
+    loc = concentric_localization_selector(overlap, np.arange(3), fock, n_shells=1)
+
+    unfrozen = adapter.build_orbitals(n_frozen_occ=0, virtual_localizer=loc, restrict_to_a=False)
+    frozen = adapter.build_orbitals(n_frozen_occ=2, virtual_localizer=loc, restrict_to_a=False)
+
+    assert unfrozen.inactive.tolist() == []
+    assert frozen.inactive.tolist() == [0, 1]
+    assert frozen.n_active_electrons == unfrozen.n_active_electrons - 4
+    assert frozen.n_active_orbitals == unfrozen.n_active_orbitals - 2
+    # The virtual choice is unchanged by the occupied freeze.
+    assert [i for i in frozen.active if i >= n_occ] == [i for i in unfrozen.active if i >= n_occ]
