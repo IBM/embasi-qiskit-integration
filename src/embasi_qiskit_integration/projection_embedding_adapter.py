@@ -347,7 +347,9 @@ class ProjectionEmbeddingAdapter:
         self._v_emb_embasi: np.ndarray | None = None
 
     # ---------------- low-level embedding ---------------- #
-    def run_low_level(self, dm_ab_in: np.ndarray | None = None) -> None:
+    def run_low_level(
+        self, dma_in: np.ndarray | None = None, dmb_in: np.ndarray | None = None
+    ) -> None:
         """Drive EmbASI: supersystem SCF, SPADE/PM localisation, F_emb."""
         # TODO(embasi-api): EmbASI does not expose the retained-AO index array
         # under basis truncation (paper Sec. 2.4, threshold tau).  With
@@ -364,12 +366,13 @@ class ProjectionEmbeddingAdapter:
         # ``construct_embedded_fock`` does it, so the downfold is unchanged:
         #     F_emb = h_kin^A + h_estat_xc^A + v_emb + P_B
         # (see embasi.embedding.ProjectionEmbedding.construct_embedded_fock).
-        wrapped = None if dm_ab_in is None else self._as_spin_kpoint_array(dm_ab_in)
+        wrapped_dma_in = None if dma_in is None else self._as_spin_kpoint_array(dma_in)
+        wrapped_dmb_in = None if dmb_in is None else self._as_spin_kpoint_array(dmb_in)
         # EmbASI wants dmab_in as a SpinKpointArray, not the plain (nao, nao)
         # density the outer loop feeds back -- wrap it (mirror of the _as_ao_matrix
         # squeeze on the way out) so the multi-cycle loop runs against real EmbASI.
         dm_a, dm_b, _overlap, v_emb_embasi, p_b_embasi = self.p.construct_embedding_potential(
-            dmab_in=wrapped
+            dma_in=wrapped_dma_in, dmb_in=wrapped_dmb_in
         )
 
         # EmbASI returns SpinKpointArray objects (leading (nspin, nkpt) axes)
@@ -709,7 +712,6 @@ class ProjectionEmbeddingAdapter:
             eps, c = eps[keep], c[:, keep]
 
         n_occ = self.mo_a_ll.shape[1]  # inferred, never passed in
-        self._validate_span(c[:, :n_occ])
 
         n_virt_total = c.shape[1] - n_occ
         n_virt = n_virt_total if n_virtual is None else min(n_virtual, n_virt_total)

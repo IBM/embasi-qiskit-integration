@@ -413,11 +413,11 @@ class EmbeddingWorkflow(BaseSettings):
             # total density (γ̃^A + γ^B) with the previous cycle's to damp the
             # otherwise-divergent fixed-point iteration; mix_alpha=1.0 is the
             # bare (undamped) feedback emb.feedback would do on its own.
-            fed = emb.rdm1_ao(result.rdm1, orbitals) + emb._dm_b
+            fed = emb.rdm1_ao(result.rdm1, orbitals)
             if prev_fed is not None and self.mix_alpha != 1.0:
                 fed = self.mix_alpha * fed + (1.0 - self.mix_alpha) * prev_fed
             prev_fed = fed
-            emb.run_low_level(dm_ab_in=fed)
+            emb.run_low_level(dma_in=fed, dmb_in=emb._dm_b)
             log(f"   embedded Fock rebuilt at γ̃^A + γ^B (mix_alpha={self.mix_alpha}).")
 
         return energy
