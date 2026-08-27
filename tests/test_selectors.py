@@ -20,6 +20,9 @@ import numpy as np
 
 from embasi_qiskit_integration.selectors import (
     _gap_cut,
+    apc_active_space,
+    apc_orbital_entropies,
+    apc_pair_coefficients,
     concentric_localization_selector,
     fragment_ao_indices,
     mulliken_selector,
@@ -705,3 +708,169 @@ def test_cl_honours_n_frozen_occ():
     assert frozen.n_active_orbitals == unfrozen.n_active_orbitals - 2
     # The virtual choice is unchanged by the occupied freeze.
     assert [i for i in frozen.active if i >= n_occ] == [i for i in unfrozen.active if i >= n_occ]
+
+
+# ----- APC (Approximate Pair Coefficient) ranking ----------------------------- #
+
+
+def test_apc_pair_coefficient_solves_two_by_two_ci():
+    """Eq. 19's c_ia must satisfy the defining 2x2 CI eigenvalue problem it solves.
+
+    ``[[0, K], [K, 2*Delta]] (1, c)^T = (1, c)^T E_corr`` reduces (eliminating
+    ``E_corr``) to ``K*(1 - c^2) + 2*Delta*c = 0``; checking against that identity
+    (not the closed form itself) actually exercises eq. 19 rather than restating it.
+    """
+    rng = np.random.default_rng(0)
+    f_occ = rng.uniform(-1.0, 0.0, size=5)
+    f_virt = rng.uniform(0.0, 2.0, size=7)
+    k_virt = rng.uniform(0.01, 1.0, size=7)  # K_aa > 0: the exchange operator is PSD
+
+    c = apc_pair_coefficients(f_occ, f_virt, k_virt)
+    assert c.shape == (5, 7)
+
+    k12 = 0.5 * k_virt[None, :]
+    delta = f_virt[None, :] - f_occ[:, None]
+    residual = k12 * (1 - c**2) + 2 * delta * c
+    assert np.allclose(residual, 0.0, atol=1e-10)
+
+    # Degenerate limit (Delta = 0): maximal mixing, c = -1 exactly.
+    c_degenerate = apc_pair_coefficients(np.array([1.0]), np.array([1.0]), np.array([2.0]))
+    assert np.isclose(c_degenerate[0, 0], -1.0)
+
+
+def test_apc_orbital_entropies_zero_for_uncoupled_orbitals():
+    # An orbital that pairs with nothing (every c_ia = 0) has zero entropy.
+    c_pairs = np.zeros((3, 4))
+    s_occ, s_virt = apc_orbital_entropies(c_pairs)
+    assert np.allclose(s_occ, 0.0)
+    assert np.allclose(s_virt, 0.0)
+
+
+def test_apc_orbital_entropies_matches_two_configuration_formula():
+    # A single maximally-mixed pair (c=1): entropy reduces to the textbook
+    # two-configuration value -0.5*ln(0.5)*2 = ln(2).
+    c_pairs = np.array([[1.0]])
+    s_occ, s_virt = apc_orbital_entropies(c_pairs)
+    assert np.isclose(s_occ[0], np.log(2))
+    assert np.isclose(s_virt[0], np.log(2))
+
+
+def test_apc_active_space_fixed_picks_highest_entropy_orbitals():
+    """``fixed=True`` selects exactly (nelec, norb) from the top-ranked candidates."""
+    occ_pattern = np.array([2, 2, 2, 2, 0, 0, 0, 0])
+    entropies = np.array([0.01, 0.5, 0.02, 0.4, 0.01, 0.6, 0.02, 0.3])
+
+    active = apc_active_space(occ_pattern, entropies, max_size=(4, 4), fixed=True)
+    # (nelec=4, norb=4) -> 2 doubly-occupied + 2 virtual: the two highest-entropy
+    # candidates of each type (occupied: 1, 3; virtual: 5, 7).
+    assert active.tolist() == [1, 3, 5, 7]
+
+
+def test_apc_active_space_dynamic_shrinks_with_a_tighter_budget():
+    """``fixed=False`` drops the lowest-entropy candidates until the CSF budget fits."""
+    occ_pattern = np.array([2, 2, 2, 2, 0, 0, 0, 0])
+    entropies = np.array([0.01, 0.5, 0.02, 0.4, 0.01, 0.6, 0.02, 0.3])
+
+    generous = apc_active_space(occ_pattern, entropies, max_size=10**6)
+    assert generous.tolist() == list(range(8))  # nothing dropped
+
+    # An int max_size is a ceiling on the ORBITAL COUNT (Chooser's convention, not
+    # an N_CSF budget -- see apc_active_space's docstring). 3 forces dropping down
+    # to the minimal "reasonable" active space (>=1 occ, not fully occupied):
+    # 2 occupied + 1 virtual survive here (the two highest-entropy occupied
+    # candidates and the single highest-entropy virtual).
+    tight = apc_active_space(occ_pattern, entropies, max_size=3)
+    assert tight.tolist() == [1, 3, 5]
+
+
+def test_apc_concentric_ranks_occupied_and_virtual_together():
+    """End-to-end: CL locality pre-filter, then APC ranks occ + virt and can freeze occ.
+
+    ``_cl_system`` gives 2 occupied candidates and a clean shell-0/shell-1 virtual
+    structure; ``max_size=(2, 3)`` (1 doubly-occupied + 2 virtual) forces APC to
+    drop one of the two occupied candidates -- the behaviour no other selector in
+    this module has (they never touch the occupied block).
+    """
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        ProjectionEmbeddingAdapter,
+    )
+
+    coeff, s, fock, frag, n_occ, d0, d1 = _cl_system(seed=17)
+
+    class _Stub(ProjectionEmbeddingAdapter):
+        _s_arr = property(lambda self: s)
+        _fock_arr = property(lambda self: fock)
+        mo_a_ll = property(lambda self: coeff[:, :n_occ])
+
+        def _validate_span(self, c_occ):
+            return None
+
+    class _FakeInts:
+        def get_k(self, dm):
+            # A fixed PSD stand-in "exchange" matrix: APC's math is already tested
+            # in isolation above, this just exercises the get_k plumbing.
+            rng = np.random.default_rng(99)
+            a = rng.normal(size=dm.shape)
+            return a @ a.T
+
+    adapter = object.__new__(_Stub)
+    adapter._floor = np.inf
+    adapter.ints = _FakeInts()
+
+    orbitals = adapter.build_orbitals_apc_concentric(
+        fragment_ao=frag, n_shells=1, max_size=(2, 3), fixed=True, restrict_to_a=False
+    )
+    assert orbitals.n_occ == n_occ
+    assert orbitals.n_active_orbitals == 3
+    assert orbitals.n_active_electrons == 2  # 1 doubly-occupied orbital kept of 2
+    assert orbitals.inactive.size == n_occ - 1  # one occupied candidate was dropped
+    # Active virtuals stay S-orthonormal after CL's rotation + APC's re-selection.
+    c_act_virt = orbitals.coeff[:, orbitals.active[orbitals.active >= n_occ]]
+    gram = c_act_virt.T @ s @ c_act_virt
+    assert np.allclose(gram, np.eye(c_act_virt.shape[1]), atol=1e-10)
+
+
+def test_apc_concentric_handles_non_square_subsystem_a_coeff():
+    """Regression: ``EmbeddedOrbitals.coeff`` is ``(nao, n_A)`` with ``n_A < nao``
+    whenever a real environment exists -- ``restrict_to_a``'s whole point -- so
+    ``pyscf.mcscf.apc.Chooser``'s ``assert(orbs.shape[0] == orbs.shape[1])`` must
+    never see it. A ``_floor=np.inf`` stub (as the sibling test above uses) keeps
+    every orbital and is accidentally square, hiding this; here two "environment"
+    orbitals sit far above a finite floor so ``build_orbitals``'s own eigh + floor
+    filter actually produces a non-square candidate space.
+    """
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        ProjectionEmbeddingAdapter,
+    )
+
+    coeff, s, fock, frag, n_occ, d0, d1 = _cl_system(seed=17)
+    nao = coeff.shape[0]
+    n_env = 2
+    big_s = np.eye(nao + n_env)
+    big_fock = np.zeros((nao + n_env, nao + n_env))
+    big_fock[:nao, :nao] = fock
+    big_fock[nao:, nao:] = np.diag([50.0, 60.0])  # far above any reasonable floor
+
+    class _Stub(ProjectionEmbeddingAdapter):
+        _s_arr = property(lambda self: big_s)
+        _fock_arr = property(lambda self: big_fock)
+        mo_a_ll = property(lambda self: coeff[:, :n_occ])
+
+        def _validate_span(self, c_occ):
+            return None
+
+    class _FakeInts:
+        def get_k(self, dm):
+            rng = np.random.default_rng(99)
+            a = rng.normal(size=dm.shape)
+            return a @ a.T
+
+    adapter = object.__new__(_Stub)
+    adapter._floor = 10.0  # excludes the two environment orbitals (eigenvalues 50, 60)
+    adapter.ints = _FakeInts()
+
+    orbitals = adapter.build_orbitals_apc_concentric(
+        fragment_ao=frag, n_shells=1, max_size=(2, 3), fixed=True, restrict_to_a=False
+    )
+    assert orbitals.coeff.shape == (nao + n_env, nao)  # non-square: n_A (9) < nao (11)
+    assert orbitals.n_active_orbitals == 3

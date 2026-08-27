@@ -66,6 +66,9 @@ __all__ = [
     "concentric_localization_selector",
     "spade_virtual_selector",
     "fragment_ao_indices",
+    "apc_pair_coefficients",
+    "apc_orbital_entropies",
+    "apc_active_space",
 ]
 
 
@@ -486,3 +489,146 @@ def fragment_ao_indices(mol, active_atoms) -> np.ndarray:
     aoslice = mol.aoslice_by_atom()
     ranges = [np.arange(aoslice[a, 2], aoslice[a, 3]) for a in active_atoms]
     return np.hstack(ranges).astype(int) if ranges else np.empty(0, dtype=int)
+
+
+# --------------------------------------------------------------------------- #
+# APC (Approximate Pair Coefficient) ranking
+# --------------------------------------------------------------------------- #
+#
+# King & Gagliardi, J. Chem. Theory Comput. 2021, 17, 7387 (doi:10.1021/acs.jctc.1c00037):
+# a cheap surrogate for the DMRG single-orbital entropy (AutoCAS), built from an
+# analytic two-configuration model of each occupied-virtual pair. Unlike the
+# gap-cut selectors above, APC ranks the OCCUPIED block alongside the virtuals
+# and truncates to a fixed active-space budget rather than a gap in the ranking
+# metric -- so it uses PySCF's own ``mcscf.apc.Chooser`` for the truncation (the
+# ranked-orbital drop-until-budget procedure the paper describes) instead of
+# this module's ``_gap_cut``.
+#
+# Restricted-closed-shell only, matching this package's scope: PySCF's
+# ``apc.APC`` class handles singly-occupied orbitals (ROHF/UHF) by assigning
+# them a synthetic max-entropy value; that branch is omitted here since the
+# adapter never produces singly-occupied candidates.
+
+
+def apc_pair_coefficients(
+    f_diag_occ: np.ndarray, f_diag_virt: np.ndarray, k_diag_virt: np.ndarray
+) -> np.ndarray:
+    """Eq. 19: analytic pair coefficient ``c_ia`` for every (occupied, virtual) pair.
+
+    Each doubly-occupied/virtual pair is modelled as an independent two-configuration
+    CI problem; ``c_ia`` is that problem's exact ground-state mixing coefficient,
+    approximated from one-electron quantities alone (eq. 15-18): ``Delta_ia = f_a -
+    f_i`` (Koopmans-like orbital energy gap) and ``(ia|ia) ~ 0.5 K_aa`` (the exchange
+    integral, approximated from the virtual's own exchange diagonal only).
+
+    Args:
+        f_diag_occ: ``(n_occ,)`` Fock expectation value of each candidate occupied
+            orbital -- an eigenvalue for a canonical orbital, or ``diag(C^T F C)``
+            for a rotated one (e.g. after :func:`concentric_localization_selector`).
+        f_diag_virt: ``(n_virt,)`` ditto for the candidate virtuals.
+        k_diag_virt: ``(n_virt,)`` exchange-operator diagonal of the candidate
+            virtuals, ``diag(C^T K C)``.
+
+    Returns:
+        ``(n_occ, n_virt)`` matrix of pair coefficients.
+    """
+    k12 = 0.5 * np.asarray(k_diag_virt)[None, :]
+    delta = np.asarray(f_diag_virt)[None, :] - np.asarray(f_diag_occ)[:, None]
+    return -k12 / (delta + np.sqrt(k12**2 + delta**2))
+
+
+def apc_orbital_entropies(c_pairs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Eq. 12/13: approximate single-orbital entropy from the pair-coefficient matrix.
+
+    Each occupied orbital's entropy is computed from its row (summed over all
+    candidate virtuals it pairs with); each virtual's from its column (summed over
+    all candidate occupieds). A pair coefficient of 0 contributes 0 entropy for
+    either orbital, so an orbital that pairs with nothing ranks lowest -- the
+    intended behaviour for :func:`apc_active_space`'s truncation.
+
+    Args:
+        c_pairs: ``(n_occ, n_virt)`` pair coefficients, as returned by
+            :func:`apc_pair_coefficients`.
+
+    Returns:
+        ``(s_occ, s_virt)``: entropies of shape ``(n_occ,)`` and ``(n_virt,)``.
+    """
+    c2 = np.asarray(c_pairs) ** 2
+
+    def _entropy(sum_c2: np.ndarray) -> np.ndarray:
+        norm2 = 1.0 / (1.0 + sum_c2)
+        excited2 = sum_c2 / (1.0 + sum_c2)
+        excited_term = np.where(excited2 > 0, excited2 * np.log(excited2), 0.0)
+        return -norm2 * np.log(norm2) - excited_term
+
+    return _entropy(c2.sum(axis=1)), _entropy(c2.sum(axis=0))
+
+
+def apc_active_space(
+    occ_pattern: np.ndarray,
+    entropies: np.ndarray,
+    max_size: int | tuple[int, int],
+    *,
+    fixed: bool = False,
+) -> np.ndarray:
+    """Rank-and-truncate orbitals to ``max_size`` via PySCF's ``Chooser``.
+
+    Delegates the truncation itself to ``pyscf.mcscf.apc.Chooser`` -- the
+    ranked-orbital procedure of the APC paper (repeatedly drop the lowest-entropy
+    orbital, respecting a minimum-reasonability floor of >=1 active electron and
+    not every active orbital doubly occupied) -- rather than this module's
+    gap-based ``_gap_cut``, since APC's truncation is budget-driven, not a gap in
+    the ranking metric.
+
+    ``Chooser`` also wants the orbital coefficients themselves (to build its own
+    ``casorbs`` return value), and asserts they are square -- ``(n_mo, n_mo)``, the
+    normal SCF convention. This adapter's ``EmbeddedOrbitals.coeff`` is instead
+    ``(nao, n_A)`` with ``n_A < nao`` whenever there is a real environment (i.e.
+    essentially always, once ``restrict_to_a`` has deflated subsystem B out), so it
+    is never square and would trip that assertion. Since only ``active_idx`` is
+    used here (:meth:`ProjectionEmbeddingAdapter.build_orbitals_apc_concentric`
+    rebuilds ``EmbeddedOrbitals`` from its own ``coeff``, never from ``casorbs``),
+    an identity placeholder of the right size satisfies ``Chooser`` without
+    needing real coefficients at all.
+
+    To rank only a subset of candidates (e.g. a concentric-localization pool),
+    give every orbital outside that subset an entropy far below the real range
+    (e.g. a large negative sentinel) so ``Chooser`` always drops them first.
+
+    Args:
+        occ_pattern: ``(n_orb,)`` occupation of each orbital (``2`` or ``0``; this
+            package is restricted-closed-shell only).
+        entropies: ``(n_orb,)`` importance ranking from :func:`apc_orbital_entropies`
+            (occupied and virtual entropies scattered back to matching positions).
+        max_size: ``Chooser``'s size constraint -- an int ceiling on the *number of
+            active orbitals* (not an N_CSF count, despite the paper's ranked-orbital
+            framing -- this is ``pyscf.mcscf.apc.Chooser``'s own convention), or a
+            fixed ``(nelec, norb)`` target when ``fixed=True`` (``Chooser`` requires
+            a tuple in that mode).
+        fixed: if True, select exactly the highest-entropy ``(nelec, norb)`` rather
+            than dynamically dropping until the orbital-count budget is met.
+            Recommended when this feeds a self-consistency loop (see the outer-loop
+            stability note in
+            :meth:`ProjectionEmbeddingAdapter.build_orbitals_apc_concentric`):
+            dynamic dropping can flip which orbital is dropped near a budget
+            boundary as the Fock matrix drifts cycle to cycle, changing the qubit
+            count mid-run; a fixed target does not.
+
+    Returns:
+        Sorted indices, positional into ``occ_pattern``/``entropies``, of the
+        selected active space.
+    """
+    from pyscf.mcscf.apc import Chooser
+
+    occ_pattern = np.asarray(occ_pattern)
+    placeholder_orbs = np.eye(occ_pattern.size)
+    chooser = Chooser(
+        placeholder_orbs,
+        occ_pattern,
+        np.asarray(entropies),
+        max_size=max_size,
+        fixed=fixed,
+        verbose=0,
+    )
+    _, _, _, active_idx = chooser.kernel()
+    return np.asarray(sorted(active_idx), dtype=int)

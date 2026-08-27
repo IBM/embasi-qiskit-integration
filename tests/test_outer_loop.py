@@ -393,6 +393,55 @@ def test_mix_alpha_damps_the_fed_back_density():
     np.testing.assert_allclose(damped[1], expected, atol=1e-10)
 
 
+def test_diis_extrapolate_converges_a_map_plain_iteration_never_settles():
+    """DIIS, applied recursively, converges a fixed-point map whose undamped
+    iteration just oscillates -- a linear toy standing in for the outer loop's
+    documented failure mode near a vanishing gap: a large-magnitude,
+    sign-flipping response eigenvalue (here ``A``'s ``-3`` eigenvalue) that
+    plain repetition of the map never damps out.
+
+    For ``x -> A x + b`` the fixed point is ``x* = (I-A)^{-1} b``.  Re-running
+    ``_diis_extrapolate`` over the growing (input, output) history each cycle
+    -- exactly what ``_run_outer_loop`` does -- must land on ``x*`` to high
+    precision within a handful of cycles, while the plain map at the same
+    cycle count is still oscillating with the amplitude set by the ``-3``
+    eigenvalue and nowhere close.
+    """
+    a = np.array([[-3.0, 0.0], [0.0, 0.2]])  # one oscillating/divergent mode, one tame
+    b = np.array([4.0, 1.0])
+    x_star = np.linalg.solve(np.eye(2) - a, b)
+
+    def f(x):
+        return a @ x + b
+
+    x = np.array([0.0, 2.0])
+    residuals: list[np.ndarray] = []
+    outputs: list[np.ndarray] = []
+    for _ in range(5):
+        y = f(x)
+        residuals.append(y - x)
+        outputs.append(y)
+        extrapolated = (
+            EmbeddingWorkflow._diis_extrapolate(residuals, outputs) if len(residuals) >= 2 else None
+        )
+        x = extrapolated if extrapolated is not None else y
+    np.testing.assert_allclose(x, x_star, atol=1e-8)
+
+    x_plain = np.array([0.0, 2.0])
+    for _ in range(5):
+        x_plain = f(x_plain)
+    assert np.abs(x_plain - x_star).max() > 1.0, (
+        "sanity: plain iteration should still be oscillating"
+    )
+
+
+def test_diis_extrapolate_returns_none_for_a_singular_subspace():
+    """Two identical residuals make the DIIS B-matrix singular; caller falls back."""
+    r = np.array([[1.0, 0.5], [0.5, -1.0]])
+    result = EmbeddingWorkflow._diis_extrapolate([r, r.copy()], [r, r.copy()])
+    assert result is None
+
+
 def test_reseed_policy_advances_fci_noop():
     """FCI has no seed, so _maybe_reseed is a no-op regardless of reseed_sqd."""
     adapter = _build_adapter()
