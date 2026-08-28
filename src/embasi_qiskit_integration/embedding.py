@@ -473,7 +473,8 @@ class EmbeddingWorkflow(BaseSettings):
                 break
 
             log(f"== Step 5: feed the correlated 1-RDM back into the embedding =={tag}")
-            # Single-core implementation of DIIS - Claude Anthropic.
+
+            # Single-core implementation of DIIS.
             fed = emb.rdm1_ao(result.rdm1, orbitals)
             mixing_desc = f"mix_alpha={self.mix_alpha}"
             extrapolated = None
@@ -498,6 +499,9 @@ class EmbeddingWorkflow(BaseSettings):
                 # historical --diis=False default).
                 fed = self.mix_alpha * fed + (1.0 - self.mix_alpha) * prev_fed
             prev_fed = fed
+            # Currently commented out the old outer loop behaviour where the
+            # low level potential is re-constructed and subtracted from the
+            # supersystem embedding potential.
             # emb.run_low_level(dma_in=fed, dmb_in=emb._dm_b)
             emb.run_low_level_a_only(dma_in=fed, dmb_in=emb._dm_b)
             log(f"   embedded Fock rebuilt at γ̃^A + γ^B ({mixing_desc}).")

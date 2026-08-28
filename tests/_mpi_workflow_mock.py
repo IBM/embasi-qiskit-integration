@@ -95,9 +95,21 @@ class _MockProjectionEmbedding:
         self.mo_coeffs_B_LL = c_b[np.newaxis, :, :]
         _ = nao
 
-    def construct_embedding_potential(self, dma_in=None, dmb_in=None):
-        # The dma_in/dmb_in feedback path is not exercised by the MPI test (a
-        # single pass, no feedback under mock).
+    def construct_embedding_potential(
+        self, dmab_in=None, dma_in=None, dmb_in=None, a_nspade_mos=None
+    ):
+        # Signature mirrors embasi.embedding.ProjectionEmbedding, so a kwarg the
+        # adapter starts passing shows up here as a wrong *answer*, not a
+        # TypeError from the mock.  The A/B split is fixed at construction
+        # (``n_occ_a``), so an explicit SPADE-MO count would have to repartition
+        # this mock to be honoured -- the MPI test never sets one, and silently
+        # ignoring it would make the returned densities disagree with the request.
+        assert a_nspade_mos is None, (
+            "mock partitions A/B at construction via n_occ_a; honouring "
+            f"a_nspade_mos={a_nspade_mos!r} would need a repartition"
+        )
+        # The dma_in/dmb_in/dmab_in feedback path is not exercised by the MPI test
+        # (a single pass, no feedback under mock).
         # P_B is the level-shift projector mu * S γ^B S; v_emb is defined so the
         # adapter's reassembly reproduces self._fock bit-for-bit.
         p_b = self._mu * (self._s @ self._dm_b @ self._s)
