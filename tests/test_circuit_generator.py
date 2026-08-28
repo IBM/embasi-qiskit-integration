@@ -201,9 +201,9 @@ def test_sqdrift_time_accepts_scalar_or_sequence(n2_ham):
 @requires_fermions
 def test_sqdrift_rejects_empty_sweep_axes(n2_ham):
     with pytest.raises(ValueError, match="at least one evolution time"):
-        build_sqdrift_circuits(n2_ham, method="exact", time=[])
+        build_sqdrift_circuits(n2_ham, method="exact", time=[], optimize=False)
     with pytest.raises(ValueError, match="at least one group count"):
-        build_sqdrift_circuits(n2_ham, method="qdrift", time=1.0, num_groups=[])
+        build_sqdrift_circuits(n2_ham, method="qdrift", time=1.0, num_groups=[], optimize=False)
 
 
 @requires_fermions
@@ -394,6 +394,7 @@ def test_filter_trivial_defaults_to_where_occupation_is_visible(n2_ham):
                 num_randomizations=1,
                 seed=42,
                 include_initial_state=include,
+                optimize=False,
             )
 
 
