@@ -12,6 +12,8 @@ tests deliberately use asymmetric sectors, following
 
 from __future__ import annotations
 
+import textwrap
+
 import numpy as np
 import pytest
 
@@ -227,27 +229,43 @@ def test_unrestricted_downfold_refuses_restricted_orbitals():
         adapter.embedded_hamiltonian(restricted)
 
 
-def test_apc_selection_preserves_the_beta_count():
-    """Active-space selection must not drop ``n_occ_b`` and demote an open shell."""
-    orb = EmbeddedOrbitals(
-        coeff=np.eye(5),
-        energy=np.arange(5.0),
-        n_occ=3,
-        inactive=np.array([0]),
-        active=np.array([1, 2, 3]),
-        n_occ_b=2,
+def test_apc_selection_forwards_the_beta_count():
+    """``build_orbitals_apc_concentric`` must forward ``n_occ_b`` to its new orbitals.
+
+    It rebuilds an :class:`EmbeddedOrbitals` after ranking, and omitting ``n_occ_b=``
+    there would silently demote an open-shell partition back to the restricted reading --
+    with a plausible active space and nothing to flag it.
+
+    Asserted against the source rather than by calling the method: the APC path needs a
+    live adapter with real integrals (``self.ints.get_k``, a concentric-localization
+    stage), so a unit test cannot reach the one line that matters. The dataclass
+    round-trip is already covered by
+    :func:`test_active_electrons_spin_open_shell_is_not_halved`; what is unprotected is
+    the *call site*, which is what this pins.
+    """
+    import ast
+    import inspect
+
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        ProjectionEmbeddingAdapter,
     )
-    # Reconstructing as build_orbitals_apc_concentric does must keep the beta count.
-    carried = EmbeddedOrbitals(
-        coeff=orb.coeff,
-        energy=orb.energy,
-        n_occ=orb.n_occ,
-        inactive=orb.inactive,
-        active=orb.active,
-        n_occ_b=orb.n_occ_b,
-    )
-    assert carried.is_open_shell
-    assert carried.n_active_electrons_spin == (2, 1)
+
+    src = inspect.getsource(ProjectionEmbeddingAdapter.build_orbitals_apc_concentric)
+    tree = ast.parse(textwrap.dedent(src))
+    constructions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "EmbeddedOrbitals"
+    ]
+    assert constructions, "expected build_orbitals_apc_concentric to build EmbeddedOrbitals"
+    for call in constructions:
+        passed = {kw.arg for kw in call.keywords}
+        assert "n_occ_b" in passed, (
+            "build_orbitals_apc_concentric builds EmbeddedOrbitals without n_occ_b, "
+            "which silently demotes an open-shell partition to the restricted reading"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -312,51 +330,26 @@ def test_spin_sq_target_is_recorded(ham_factory):
 # --------------------------------------------------------------------------- #
 # Spin-resolved RDMs out of the SQD path
 # --------------------------------------------------------------------------- #
-def test_sqd_returns_the_spin_resolved_rdm_pair(ham_factory):
+@pytest.mark.parametrize("nelec", [(3, 1), (3, 2)])
+def test_sqd_returns_a_spin_resolved_rdm_pair_matching_fci(ham_factory, nelec):
     """SQD must supply ``rdm1a``/``rdm1b``, or unrestricted feedback silently degrades.
 
     ``EmbeddingWorkflow`` gates the spin-resolved density feedback on
     ``result.is_spin_resolved``. When the SQD path returned only a spin-summed ``rdm1``,
     an ``unrestricted=True`` run fell back to the spin-summed ``rdm1_ao`` with no warning
     -- exactly the "cannot represent gamma_a != gamma_b" failure the unrestricted path
-    exists to avoid -- and ``check_spin_sector`` was unreachable. This pins the pair, its
-    consistency with ``rdm1``, and that it lands in the right sector.
+    exists to avoid -- and ``check_spin_sector`` was unreachable.
+
+    Checking against FCI's ``make_rdm1s`` elementwise subsumes the weaker invariants
+    (correct traces, and summing back to ``rdm1``), so both are asserted here rather than
+    in a second Aer solve.
     """
     pytest.importorskip("qiskit_aer")
     from embasi_qiskit_integration.circuit_run import build_sampler
     from embasi_qiskit_integration.solvers import SQDSolver
 
-    ham = ham_factory(4, (3, 2))
+    ham = ham_factory(4, nelec)
     result = SQDSolver(
-        build_sampler("aer"),
-        shots=40000,
-        num_groups=60,
-        seed=3,
-        optimize=False,
-        samples_per_batch=150,
-        num_batches=4,
-        max_iterations=4,
-    ).solve(ham)
-
-    assert result.is_spin_resolved
-    assert result.diagnostics["spin_resolved_rdm1"] is True
-    assert result.rdm1a.shape == (ham.norb, ham.norb)
-    # The pair must reconstruct the spin-summed RDM (SolverResult validates this too).
-    np.testing.assert_allclose(result.rdm1a + result.rdm1b, result.rdm1, atol=1e-8)
-    # And it must sit in the requested sector -- the check that was dead before.
-    assert result.check_spin_sector(ham.nelec) == pytest.approx(0.0, abs=1e-6)
-    assert np.trace(result.rdm1a) == pytest.approx(3.0, abs=1e-6)
-    assert np.trace(result.rdm1b) == pytest.approx(2.0, abs=1e-6)
-
-
-def test_sqd_spin_rdms_agree_with_fci(ham_factory):
-    """The SQD pair matches FCI's ``make_rdm1s`` when SQD reaches the exact answer."""
-    pytest.importorskip("qiskit_aer")
-    from embasi_qiskit_integration.circuit_run import build_sampler
-    from embasi_qiskit_integration.solvers import SQDSolver
-
-    ham = ham_factory(4, (3, 1))
-    sqd = SQDSolver(
         build_sampler("aer"),
         shots=40000,
         num_groups=60,
@@ -368,9 +361,19 @@ def test_sqd_spin_rdms_agree_with_fci(ham_factory):
     ).solve(ham)
     ref = FCISolver().solve(ham)
 
-    assert sqd.energy == pytest.approx(ref.energy, abs=1e-8)
-    np.testing.assert_allclose(sqd.rdm1a, ref.rdm1a, atol=1e-6)
-    np.testing.assert_allclose(sqd.rdm1b, ref.rdm1b, atol=1e-6)
+    assert result.is_spin_resolved
+    assert result.diagnostics["spin_resolved_rdm1"] is True
+    assert result.rdm1a.shape == (ham.norb, ham.norb)
+    # The pair must reconstruct the spin-summed RDM (SolverResult validates this too).
+    np.testing.assert_allclose(result.rdm1a + result.rdm1b, result.rdm1, atol=1e-8)
+    # And sit in the requested sector -- the check that was dead before.
+    assert result.check_spin_sector(ham.nelec) == pytest.approx(0.0, abs=1e-6)
+    assert np.trace(result.rdm1a) == pytest.approx(float(nelec[0]), abs=1e-6)
+    assert np.trace(result.rdm1b) == pytest.approx(float(nelec[1]), abs=1e-6)
+    # SQD reaches the exact answer on this small space, so the pair must match FCI's.
+    assert result.energy == pytest.approx(ref.energy, abs=1e-8)
+    np.testing.assert_allclose(result.rdm1a, ref.rdm1a, atol=1e-6)
+    np.testing.assert_allclose(result.rdm1b, ref.rdm1b, atol=1e-6)
 
 
 # --------------------------------------------------------------------------- #

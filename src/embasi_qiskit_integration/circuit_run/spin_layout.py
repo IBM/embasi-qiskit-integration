@@ -34,7 +34,6 @@ import numpy as np
 
 ALPHA_BETA = "alpha_beta"
 BETA_ALPHA = "beta_alpha"
-VALID_SPIN_LAYOUTS = frozenset({ALPHA_BETA, BETA_ALPHA})
 
 #: The convention this package produces and consumes everywhere.
 NATIVE_SPIN_LAYOUT = ALPHA_BETA
@@ -42,9 +41,6 @@ NATIVE_SPIN_LAYOUT = ALPHA_BETA
 
 def swap_spin_halves(bitstring: str, num_orbitals: int) -> str:
     """Exchange the two spin halves of a bitstring (``ALPHA_BETA`` <-> ``BETA_ALPHA``).
-
-    For a spin-symmetric state the swap is the identity, which is precisely why a layout
-    error cannot be caught on a closed-shell system.
 
     Raises:
         ValueError: if the length is not ``2 * num_orbitals``.
@@ -144,13 +140,9 @@ def verify_counts_sector(
         raise ValueError(
             f"{source} appear to use the {BETA_ALPHA!r} spin layout: every bitstring "
             f"has (n_alpha, n_beta) = {observed} but this Hamiltonian is {nelec}, the "
-            f"exact reversal.  This package uses {NATIVE_SPIN_LAYOUT!r} -- alpha in the "
-            "rightmost norb characters of an MSB-left key, the same convention as "
-            "qiskit-addon-sqd, so counts from the addon need NO conversion.  Only a "
-            "producer emitting the mirrored order needs swap_spin_halves().  "
-            "First check the sampler prepared the determinant this "
-            "Hamiltonian describes: left uncorrected the energy stays plausible and the "
-            "particle-number check still passes, because both are spin-blind."
+            "exact reversal.  Check the sampler prepared the determinant this "
+            f"Hamiltonian describes; if the producer really is {BETA_ALPHA!r}, convert "
+            "with swap_spin_halves().  See this module's docstring for the conventions."
         )
     raise ValueError(
         f"{source} sit in sector {observed}, but this Hamiltonian is nelec={nelec}. "

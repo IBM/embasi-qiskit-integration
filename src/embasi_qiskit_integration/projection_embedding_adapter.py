@@ -501,14 +501,11 @@ class ProjectionEmbeddingAdapter:
         # imaginary part, so everything downstream (einsum, sla.eigh, veff) sees
         # a bare 2-occupancy real (nao, nao) matrix.
         #
-        # TODO(open-shell, needs EmbASI): `_as_ao_total` SUMS the spin axis, so when
-        # `unrestricted=True` the alpha/beta pair EmbASI computed is collapsed here and
-        # cannot be recovered further down.  `_as_ao_matrix_spin` already splits a
-        # length-2 axis; what is missing is somewhere to keep the halves (e.g.
-        # `self._dm_a_spin`) and per-channel consumers for them -- the Fock build,
-        # `veff`, and `column_occupation_from_density` in the APC path all want the pair,
-        # not the total.  Note `dm_a`/`dm_b` here are subsystems A and B, NOT alpha/beta;
-        # each carries its own spin axis, so an unrestricted run has four blocks.
+        # TODO(open-shell, needs EmbASI): `_as_ao_total` SUMS the spin axis, so an
+        # unrestricted run collapses the pair here (blocker (2)); keeping it would need
+        # somewhere to store the halves plus per-channel Fock/veff consumers.  Note
+        # `dm_a`/`dm_b` are subsystems A and B, NOT alpha/beta -- each carries its own
+        # spin axis, so an unrestricted run has four blocks.
         self._dm_a = self._as_ao_total(dm_a)
         if self._dm_a_init is None:
             self._dm_a_init = self._as_ao_total(dm_a)
@@ -630,16 +627,8 @@ class ProjectionEmbeddingAdapter:
                     "Pass unrestricted=True to the adapter for a length-2 spin axis."
                 )
             m = m[0]
-        if np.iscomplexobj(m):
-            max_imag = float(np.abs(m.imag).max()) if m.size else 0.0
-            if max_imag > _IMAG_TOL:
-                raise ValueError(
-                    f"embedded matrix has a non-negligible imaginary part "
-                    f"(max |imag| = {max_imag:.2e} > {_IMAG_TOL:.0e}); the "
-                    "restricted single-k downfold assumes real data"
-                )
-            m = m.real
-        return np.ascontiguousarray(m)
+        # Real-part extraction is shared with the per-spin path; see _real.
+        return ProjectionEmbeddingAdapter._real(m)
 
     def _as_ao_matrix_spin(self, m) -> tuple[np.ndarray, np.ndarray]:
         """Split an EmbASI ``(nspin, nkpt, nao, nao)`` block into ``(alpha, beta)``.
@@ -714,14 +703,10 @@ class ProjectionEmbeddingAdapter:
             from embasi.ks_array import SpinKpointArray
         except ImportError:
             return block[np.newaxis, np.newaxis, :, :]
-        # TODO(open-shell, needs EmbASI): `n_spin=1` is hardcoded, so a spin-resolved
-        # density cannot be handed back to EmbASI at all -- this is the write-side half
-        # of the feedback gap (the read side sums in `_as_ao_total`).  An unrestricted
-        # loop wants an overload taking `(alpha, beta)` and building
-        # `SpinKpointArray({(0, 0): a, (1, 0): b}, n_spin=2, n_kpoints=1)`.  Verify the
-        # key convention against EmbASI first: `SpinKpointArray` is documented as
-        # `arr[spin, kpoint]`, but `qmcode_adapters.run_scf` only ever indexes `[0, 0]`,
-        # so the `n_spin=2` ingest path is unexercised upstream.
+        # TODO(open-shell, needs EmbASI): `n_spin=1` is hardcoded -- the write-side half
+        # of blocker (2).  An unrestricted loop wants `SpinKpointArray({(0, 0): a,
+        # (1, 0): b}, n_spin=2, ...)`, but verify the key convention first: EmbASI's only
+        # reader indexes `[0, 0]`, so the `n_spin=2` path is unexercised upstream.
         return SpinKpointArray({(0, 0): block}, n_spin=1, n_kpoints=1)
 
     # ---------------- MO coefficients ---------------- #
@@ -934,39 +919,11 @@ class ProjectionEmbeddingAdapter:
 
         n_occ = self.mo_a_ll.shape[1]  # inferred, never passed in
 
-        # TODO(open-shell, needs EmbASI): populate `n_occ_b` so `unrestricted=True` can
-        # complete without a FCIDUMP.  This single line is the blocker: `mo_a_ll` goes
-        # through `_as_ao_by_mo`, which takes the **alpha** channel (`c[0]`) and drops
-        # beta entirely, so one `n_occ` is all that survives and `EmbeddedOrbitals`
-        # falls back to the restricted `n_alpha = n_beta` reading.
-        #
-        # What EmbASI already provides (verified against the installed package):
-        #   * `spade_localisation` loops `for ispin in range(atomsembed.n_spins)` and
-        #     computes `max_occ_state = np.count_nonzero(occ_mat[ispin, ikpt])` per
-        #     channel -- exactly the per-spin occupied count we need.
-        #   * `mo_coeffs_A_LL` (= SPADE's `rot_evecs_occ_a`) is a `SpinKpointArray`
-        #     indexed `[ispin, ikpt]`, so an unrestricted run carries both channels.
-        #
-        # What EmbASI does NOT expose, and must be added upstream:
-        #   1. `max_occ_state` is a local in `spade_localisation`; it is never returned
-        #      or stored.  Because `rot_evecs_occ_a = evecs.copy()` is allocated at full
-        #      MO width and only the `[:, spade_ncores:max_occ_state]` columns are
-        #      written per channel, the occupied count CANNOT be recovered from the
-        #      returned array's shape -- `.shape[1]` is n_mo, not n_occ.  EmbASI needs to
-        #      surface the per-spin occupied counts (e.g. an `n_occ_per_spin` attribute
-        #      on the projection, or the `occ_mat` itself).
-        #   2. SPADE's own `# @TODOSPIN: Need to redefine occupancies` markers
-        #      (spade_localisation.py:116 and :157) sit on the density assembly that
-        #      branches on `n_spins == 1` for the factor-2 occupancy; the open-shell
-        #      branch there is unvalidated.
-        #   3. `embedding.py`'s truncation path carries `# TODO: @SPIN AND K-POINT LOOP`.
-        #
-        # Once (1) lands: read the per-spin counts here, pass `n_occ_b` into every
-        # `EmbeddedOrbitals(...)` built below, and derive the occupation pattern with
-        # `selectors.column_occupation_from_density` rather than positionally -- see the
-        # TODO on `build_orbitals_apc_concentric`.  Then validate the assembled
-        # open-shell energy against a PySCF UKS reference before removing the
-        # `NotImplementedError` in `embedded_hamiltonian`.
+        # TODO(open-shell, needs EmbASI): this line is blocker (1) in the module
+        # docstring -- `_as_ao_by_mo` keeps only the alpha channel, so one `n_occ` is all
+        # that survives and `EmbeddedOrbitals` falls back to `n_alpha = n_beta`.  Once
+        # EmbASI exposes the per-spin occupied counts, read them here and pass `n_occ_b`
+        # into every `EmbeddedOrbitals(...)` built below.
 
         n_virt_total = c.shape[1] - n_occ
         n_virt = n_virt_total if n_virtual is None else min(n_virtual, n_virt_total)
@@ -1131,26 +1088,18 @@ class ProjectionEmbeddingAdapter:
         entropies = np.full(n_orb, -1.0e18)
         entropies[cand_occ], entropies[cand_virt] = s_occ, s_virt
 
-        # TODO(open-shell, needs EmbASI): `somo_occupation_pattern` is POSITIONAL -- it
-        # assumes the SOMOs occupy the columns between `min(n_occ, n_occ_b)` and
-        # `max(...)`.  That holds only for canonical orbitals in energy order, and this
-        # method has just run concentric localization, which rotates within blocks.  A
-        # plain UHF calculation already violates it: for OH/sto-3g the projected
-        # occupation is [2,2,2,1,2,0] -- the SOMO sits at index 3, not at the top of the
-        # occupied block -- so this pattern would mark the wrong orbital as singly
-        # occupied and APC would rank the wrong candidate as un-droppable.
+        # TODO(open-shell, needs EmbASI): `somo_occupation_pattern` is POSITIONAL, and
+        # this method has just run concentric localization, which rotates within blocks.
+        # Plain UHF already breaks the assumption: for OH/sto-3g the projected occupation
+        # is [2,2,2,1,2,0] -- the SOMO is at index 3, not atop the occupied block -- so
+        # APC would protect the wrong orbital.  Latent only because nothing sets
+        # `n_occ_b`.  Replace with the rotation-invariant projection once available:
         #
-        # This is latent today only because nothing populates `n_occ_b` (see the TODO in
-        # `build_orbitals`).  When EmbASI exposes the per-spin occupied counts, replace
-        # this branch with the density projection, which is rotation-invariant:
-        #
-        #     dm_a, dm_b = selectors.per_spin_ao_rdm1(<the unrestricted low-level mf>)
+        #     dm_a, dm_b = selectors.per_spin_ao_rdm1(<unrestricted low-level mf>)
         #     occ_pattern = selectors.column_occupation_from_density(
         #         c_full, dm_a, dm_b, self._s_arr)
         #
-        # That additionally needs EmbASI to hand back the per-spin subsystem-A AO
-        # densities (it computes `density_matrix_subsys_a` per channel internally, but
-        # `_as_ao_total` sums the spin axis on the way in, so the pair is lost here).
+        # which also needs the per-spin subsystem-A densities (blocker (2)).
         if orbitals.is_open_shell:
             occ_pattern = somo_occupation_pattern(n_orb, n_occ, orbitals.n_occ_b)
         else:
@@ -1173,20 +1122,13 @@ class ProjectionEmbeddingAdapter:
     def embedded_hamiltonian(self, orbitals: EmbeddedOrbitals) -> EmbeddedHamiltonian:
         """CASCI-style downfold of h_emb + bare ERIs onto the active space."""
         if self.unrestricted and not orbitals.is_open_shell:
-            # See the TODO(open-shell, needs EmbASI) in build_orbitals for exactly what
-            # has to change upstream: SPADE computes the per-spin occupied count
-            # (max_occ_state per ispin) but never returns it, and mo_coeffs_A_LL is
-            # allocated at full MO width, so n_occ_b cannot be recovered downstream.
             raise NotImplementedError(
                 "unrestricted=True but these orbitals carry a single occupied count "
                 "(n_occ_b is None), so the downfold would silently produce the "
-                "restricted n_alpha = n_beta split.  Nothing populates n_occ_b from "
-                "EmbASI yet -- build_orbitals infers one n_occ from mo_a_ll.shape[1], "
-                "and EmbASI does not expose SPADE's per-spin occupied counts (see the "
-                "TODO in build_orbitals).  Until that lands upstream (and the assembled "
-                "energy is validated against a UKS reference), drive open shell through "
-                "a FCIDUMP: read the Hamiltonian with hamiltonian.fcidump.read, which "
-                "carries (n_alpha, n_beta) exactly."
+                "restricted n_alpha = n_beta split.  EmbASI does not yet expose the "
+                "per-spin occupied counts (see this module's docstring, blocker (1)).  "
+                "Until then, drive open shell through a FCIDUMP: read the Hamiltonian "
+                "with hamiltonian.fcidump.read, which carries (n_alpha, n_beta) exactly."
             )
         h_emb = self.h_emb
         c_in, c_act = orbitals.c_inactive, orbitals.c_active

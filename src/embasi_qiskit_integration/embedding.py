@@ -506,17 +506,13 @@ class EmbeddingWorkflow(BaseSettings):
 
             log(f"== Step 5: feed the correlated 1-RDM back into the embedding =={tag}")
 
-            # TODO(open-shell, needs EmbASI): `fed_a + fed_b` throws the spin resolution
-            # away again, one line after computing it, so the outer loop is still a
-            # spin-summed fixed point even with a spin-resolved solver.  To close the
-            # loop properly, `run_low_level` must accept a per-spin density: EmbASI's
-            # `construct_embedding_potential(dma_in=..., dmb_in=...)` takes subsystem A
-            # and B densities, each a `SpinKpointArray` -- so the pair should be wrapped
-            # with `n_spin=2` (see `_as_spin_kpoint_array`, which currently hardcodes
-            # `n_spin=1`) rather than added.  Until EmbASI's `n_spins > 1` path is
-            # validated end-to-end, the sum is the honest conservative choice: it
-            # reproduces the restricted result exactly instead of feeding a half-wired
-            # unrestricted density back into the SCF.
+            # TODO(open-shell, needs EmbASI): `fed_a + fed_b` discards the spin
+            # resolution one line after computing it, so the outer loop is still a
+            # spin-summed fixed point.  Closing it needs a per-spin density ingest --
+            # see `projection_embedding_adapter`'s docstring, blocker (2).  Until that
+            # is validated upstream the sum is the conservative choice: it reproduces
+            # the restricted result exactly rather than feeding a half-wired
+            # unrestricted density into the SCF.
             if getattr(emb, "unrestricted", False) and result.is_spin_resolved:
                 fed_a, fed_b = emb.rdm1_ao_spin(result.rdm1a, result.rdm1b, orbitals)
                 fed = fed_a + fed_b
