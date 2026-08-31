@@ -86,6 +86,11 @@ class SolverResult(BaseModel):
         energy: Total energy = electronic + ``e_core``.
         rdm1: Spin-summed one-particle RDM, shape ``(norb, norb)``.
         rdm2: Optional two-particle RDM, shape ``(norb,)*4``.
+        rdm1a: Optional alpha one-particle RDM, shape ``(norb, norb)``. Required for
+            unrestricted density feedback, where a spin-summed ``rdm1`` cannot
+            represent ``gamma_alpha != gamma_beta``. When given with ``rdm1b``, the two
+            must sum to ``rdm1``.
+        rdm1b: Optional beta one-particle RDM, shape ``(norb, norb)``.
         diagnostics: Free-form solver metadata (versions, seed, iterations, ...).
     """
 
@@ -94,9 +99,66 @@ class SolverResult(BaseModel):
     energy: float
     rdm1: np.ndarray
     rdm2: np.ndarray | None = None
+    rdm1a: np.ndarray | None = None
+    rdm1b: np.ndarray | None = None
     diagnostics: dict = Field(default_factory=dict)
 
-    @field_validator("rdm1", "rdm2", mode="before")
+    @model_validator(mode="after")
+    def _validate_spin_rdms(self) -> SolverResult:
+        """A spin-resolved pair must be complete and consistent with ``rdm1``.
+
+        Half a pair is almost certainly a plumbing slip, and a pair that does not sum to
+        the spin-summed RDM would feed two different densities into the same outer loop.
+        """
+        if (self.rdm1a is None) != (self.rdm1b is None):
+            raise ValueError("rdm1a and rdm1b must be given together, or neither")
+        if self.rdm1a is None:
+            return self
+        if not np.allclose(self.rdm1a + self.rdm1b, self.rdm1, atol=1e-8):
+            worst = float(np.abs(self.rdm1a + self.rdm1b - self.rdm1).max())
+            raise ValueError(
+                f"rdm1a + rdm1b != rdm1 (max deviation {worst:.2e}); the spin-resolved "
+                "and spin-summed densities disagree"
+            )
+        return self
+
+    @property
+    def is_spin_resolved(self) -> bool:
+        """True when the alpha/beta RDM pair is available."""
+        return self.rdm1a is not None
+
+    def check_spin_sector(self, nelec: tuple[int, int], *, atol: float = 1e-6) -> float:
+        """Verify ``trace(rdm1a) - trace(rdm1b)`` equals ``n_alpha - n_beta``.
+
+        :meth:`check_particle_number` sums the pair, so it validates the *total* only and
+        cannot tell ``(2, 2)`` from ``(3, 1)`` -- a solver that returned the wrong spin
+        sector at the right total passes it. This closes that gap, and is the only check
+        that can catch a swapped alpha/beta block once the RDMs are formed.
+
+        Returns:
+            The signed deviation ``(tr_a - tr_b) - (n_alpha - n_beta)``, for logging.
+
+        Raises:
+            ValueError: if no spin-resolved pair is present, or the deviation exceeds
+                ``atol``.
+        """
+        if self.rdm1a is None:
+            raise ValueError(
+                "check_spin_sector needs the rdm1a/rdm1b pair; this SolverResult carries "
+                "only a spin-summed rdm1"
+            )
+        observed = float(np.trace(self.rdm1a)) - float(np.trace(self.rdm1b))
+        expected = float(nelec[0] - nelec[1])
+        deviation = observed - expected
+        if abs(deviation) > atol:
+            raise ValueError(
+                f"trace(rdm1a) - trace(rdm1b) = {observed:.6f} but nelec={nelec} implies "
+                f"{expected:g} (off by {deviation:+.2e}, tolerance {atol:g}). The solver "
+                "returned the wrong spin sector; check the alpha/beta bit layout."
+            )
+        return deviation
+
+    @field_validator("rdm1", "rdm2", "rdm1a", "rdm1b", mode="before")
     @classmethod
     def _as_array(cls, value: object) -> object:
         if value is None:

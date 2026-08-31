@@ -53,7 +53,7 @@ def fermionic_op_from_integrals(ham: EmbeddedHamiltonian):
 
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "op.fcidump"
-        fcidump.write(ham, path)
+        fcidump.write(ham, path, signed_ms2=False)
         fc = FCIDump.from_file(str(path))
         return FermionOperator.from_fcidump(fc), 2 * fc.norb
 

@@ -504,10 +504,11 @@ def fragment_ao_indices(mol, active_atoms) -> np.ndarray:
 # ranked-orbital drop-until-budget procedure the paper describes) instead of
 # this module's ``_gap_cut``.
 #
-# Restricted-closed-shell only, matching this package's scope: PySCF's
-# ``apc.APC`` class handles singly-occupied orbitals (ROHF/UHF) by assigning
-# them a synthetic max-entropy value; that branch is omitted here since the
-# adapter never produces singly-occupied candidates.
+# The pair-entropy model below covers doubly-occupied/virtual pairs. PySCF's
+# ``apc.APC`` handles singly-occupied orbitals (ROHF/UHF) by assigning them a
+# synthetic max-entropy value so they are never dropped; ``apc_active_space``
+# forwards a ``1`` in ``occ_pattern`` to ``Chooser``, which applies exactly that.
+# ``somo_occupation_pattern`` builds such a pattern from per-spin counts.
 
 
 def apc_pair_coefficients(
@@ -564,6 +565,97 @@ def apc_orbital_entropies(c_pairs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return _entropy(c2.sum(axis=1)), _entropy(c2.sum(axis=0))
 
 
+def somo_occupation_pattern(n_orb: int, n_occ_a: int, n_occ_b: int) -> np.ndarray:
+    """Build an APC ``occ_pattern`` with ``2``/``1``/``0`` from per-spin occupied counts.
+
+    Doubly occupied below ``min(n_occ_a, n_occ_b)``, singly occupied (a SOMO) between the
+    two counts, empty above ``max``. This is what lets APC rank an open-shell candidate
+    set: ``Chooser`` gives every ``1`` a synthetic max entropy, so the singly-occupied
+    orbitals carrying the spin are always retained.
+
+    Args:
+        n_orb: total candidate orbitals.
+        n_occ_a: alpha occupied count.
+        n_occ_b: beta occupied count.
+
+    Returns:
+        ``(n_orb,)`` int array of occupations.
+    """
+    if min(n_occ_a, n_occ_b) < 0 or max(n_occ_a, n_occ_b) > n_orb:
+        raise ValueError(f"occupied counts ({n_occ_a}, {n_occ_b}) do not fit n_orb={n_orb}")
+    lo, hi = sorted((int(n_occ_a), int(n_occ_b)))
+    pattern = np.zeros(n_orb, dtype=int)
+    pattern[:lo] = 2
+    pattern[lo:hi] = 1
+    return pattern
+
+
+def per_spin_ao_rdm1(mf) -> tuple[np.ndarray, np.ndarray]:
+    """``(dm_alpha, dm_beta)`` in the AO basis, for any PySCF SCF flavour.
+
+    UHF/UKS hands back the pair directly (3D); RHF/ROHF/RKS return the 2D *total*, which
+    is rebuilt per spin from ``mo_occ`` (alpha where ``occ >= 1``, beta where ``occ == 2``)
+    rather than halved -- halving is exactly what cannot represent an open shell.
+
+    This is one of the two producers that can supply a real ``n_occ_b``; see
+    :func:`column_occupation_from_density`.
+    """
+    dm = np.asarray(mf.make_rdm1())
+    if dm.ndim == 3:
+        return dm[0], dm[1]
+    mo = np.asarray(mf.mo_coeff)
+    if mo.ndim == 3:  # UHF-shaped coeff with a 2D dm shouldn't happen; guard anyway
+        mo = mo[0]
+    occ = np.asarray(mf.mo_occ, dtype=float)
+    occ_a = (occ >= 0.5).astype(float)
+    occ_b = (occ >= 1.5).astype(float)
+    return (mo * occ_a) @ mo.T, (mo * occ_b) @ mo.T
+
+
+def column_occupation_from_density(
+    mo: np.ndarray, dm_a: np.ndarray, dm_b: np.ndarray, s_ao: np.ndarray
+) -> np.ndarray:
+    """Per-column occupation in ``{0, 1, 2}`` by projecting a spin density onto ``mo``.
+
+    Why this rather than a positional rule: "columns below ``n_occ`` are doubly occupied"
+    is only true for *canonical* orbitals in energy order. Any procedure that rotates
+    within blocks -- AVAS, concentric localization, SPADE, the APC path in
+    :meth:`~embasi_qiskit_integration.projection_embedding_adapter.ProjectionEmbeddingAdapter.build_orbitals_apc_concentric`
+    -- destroys that ordering while leaving the span intact, so the positional reading
+    silently mislabels which orbitals hold the unpaired electrons. Projecting the density
+    asks each column directly.
+
+    Args:
+        mo: ``(nao, ncol)`` AO expansion of the columns to characterise.
+        dm_a: alpha AO-basis 1-RDM ``(nao, nao)``.
+        dm_b: beta AO-basis 1-RDM ``(nao, nao)``.
+        s_ao: AO overlap ``(nao, nao)``.
+
+    Returns:
+        ``(ncol,)`` int array of occupations: ``2`` (both channels), ``1`` (a SOMO),
+        ``0`` (empty). Feed it straight to :func:`apc_active_space`, or derive per-spin
+        counts with :func:`spin_counts_from_occupation`.
+    """
+    mo = np.asarray(mo, dtype=float)
+    sm = np.asarray(s_ao, dtype=float) @ mo
+    na = np.einsum("ai,ab,bi->i", sm, np.asarray(dm_a, dtype=float), sm)
+    nb = np.einsum("ai,ab,bi->i", sm, np.asarray(dm_b, dtype=float), sm)
+    return ((na >= 0.5).astype(int) + (nb >= 0.5).astype(int)).astype(int)
+
+
+def spin_counts_from_occupation(occ_pattern: np.ndarray) -> tuple[int, int]:
+    """``(n_alpha, n_beta)`` from a ``{0, 1, 2}`` occupation pattern.
+
+    The inverse of :func:`somo_occupation_pattern`: an alpha electron in every
+    ``occ >= 1``, a beta electron in every ``occ == 2``. Use it to turn
+    :func:`column_occupation_from_density`'s output into the ``n_occ``/``n_occ_b`` pair
+    :class:`~embasi_qiskit_integration.projection_embedding_adapter.EmbeddedOrbitals`
+    wants.
+    """
+    occ = np.asarray(occ_pattern)
+    return int(np.count_nonzero(occ >= 1)), int(np.count_nonzero(occ >= 2))
+
+
 def apc_active_space(
     occ_pattern: np.ndarray,
     entropies: np.ndarray,
@@ -596,8 +688,11 @@ def apc_active_space(
     (e.g. a large negative sentinel) so ``Chooser`` always drops them first.
 
     Args:
-        occ_pattern: ``(n_orb,)`` occupation of each orbital (``2`` or ``0``; this
-            package is restricted-closed-shell only).
+        occ_pattern: ``(n_orb,)`` occupation of each orbital -- ``2`` (doubly
+            occupied), ``1`` (singly occupied, ROHF/UHF) or ``0`` (empty). PySCF's
+            ``Chooser`` handles a singly-occupied entry by assigning it a synthetic
+            max-entropy value, so a SOMO is always kept; see
+            :func:`apc_orbital_entropies` for how the entropies themselves are built.
         entropies: ``(n_orb,)`` importance ranking from :func:`apc_orbital_entropies`
             (occupied and virtual entropies scattered back to matching positions).
         max_size: ``Chooser``'s size constraint -- an int ceiling on the *number of

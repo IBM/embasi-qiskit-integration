@@ -122,6 +122,30 @@ def _broadcast(obj):
 
 # --------------------------------------------------------------------------- #
 # CLI
+def _check_shell_consistency(spin: int, unrestricted: bool) -> None:
+    """Refuse a spin state the restricted downfold cannot represent.
+
+    Runs *before* any SCF, so the failure it prevents costs nothing: the restricted path
+    derives ``nelec`` by halving the active electron count, so a doublet would silently
+    become a closed shell with a plausible energy and nothing to flag it.
+
+    A negative ``spin`` is rejected outright, since this reaches us from a
+    ``BaseSettings`` field a caller can set freely.
+
+    Raises:
+        ValueError: if ``spin != 0`` without ``unrestricted=True``.
+    """
+    if spin < 0:
+        raise ValueError(f"spin must be non-negative (2*S = unpaired electrons); got {spin}")
+    if spin != 0 and not unrestricted:
+        raise ValueError(
+            f"spin={spin} needs unrestricted=True: the restricted downfold assigns "
+            "n_alpha = n_beta = n_active_electrons // 2, which cannot represent an open "
+            "shell and would return a closed-shell answer for an open-shell system. "
+            "Set unrestricted=True (spin-resolved path), or spin=0."
+        )
+
+
 # --------------------------------------------------------------------------- #
 class EmbeddingWorkflow(BaseSettings):
     """Run an EmbASI projection-embedding calculation through this package."""
@@ -131,6 +155,11 @@ class EmbeddingWorkflow(BaseSettings):
     # --- embedding system (mirrors the EmbASI PySCF example) --- #
     xyz: Path | None = None
     charge: int | None = None  # override the charge derived from the .xyz metadata
+    spin: int = 0
+    # Opt in to the spin-resolved embedding path (alpha/beta orbital sets, an
+    # ``(h1a, h1b)`` pair).  Off by default: the closed-shell path stays bit-identical,
+    # and the open-shell energy assembly is not yet validated against a UKS reference.
+    unrestricted: bool = False
     s26_index: int = 22  # methanol dimer in the s26 set
     n_atoms: int | None = 6  # first N atoms -> monomer; None for the dimer
     active_atoms: list[int] = [1, 5]  # O and its hydroxyl H -> the OH fragment
@@ -428,6 +457,9 @@ class EmbeddingWorkflow(BaseSettings):
                 f"(solver={result.diagnostics.get('solver', self.solver)})"
             )
             deviation = result.check_particle_number(ham.nelec, atol=self.rdm_trace_tol)
+            if result.is_spin_resolved:
+                sz_dev = result.check_spin_sector(ham.nelec, atol=self.rdm_trace_tol)
+                log(f"   Sz check: tr(γa) - tr(γb) matches nelec (off by {sz_dev:+.1e})")
             log(
                 f"   trace(rdm1) = {np.trace(result.rdm1):.4f} "
                 f"(expected {sum(ham.nelec)}, off by {deviation:+.1e})"
@@ -474,8 +506,22 @@ class EmbeddingWorkflow(BaseSettings):
 
             log(f"== Step 5: feed the correlated 1-RDM back into the embedding =={tag}")
 
-            # Single-core implementation of DIIS.
-            fed = emb.rdm1_ao(result.rdm1, orbitals)
+            # TODO(open-shell, needs EmbASI): `fed_a + fed_b` throws the spin resolution
+            # away again, one line after computing it, so the outer loop is still a
+            # spin-summed fixed point even with a spin-resolved solver.  To close the
+            # loop properly, `run_low_level` must accept a per-spin density: EmbASI's
+            # `construct_embedding_potential(dma_in=..., dmb_in=...)` takes subsystem A
+            # and B densities, each a `SpinKpointArray` -- so the pair should be wrapped
+            # with `n_spin=2` (see `_as_spin_kpoint_array`, which currently hardcodes
+            # `n_spin=1`) rather than added.  Until EmbASI's `n_spins > 1` path is
+            # validated end-to-end, the sum is the honest conservative choice: it
+            # reproduces the restricted result exactly instead of feeding a half-wired
+            # unrestricted density back into the SCF.
+            if getattr(emb, "unrestricted", False) and result.is_spin_resolved:
+                fed_a, fed_b = emb.rdm1_ao_spin(result.rdm1a, result.rdm1b, orbitals)
+                fed = fed_a + fed_b
+            else:
+                fed = emb.rdm1_ao(result.rdm1, orbitals)
             mixing_desc = f"mix_alpha={self.mix_alpha}"
             extrapolated = None
             if self.diis:
@@ -580,9 +626,21 @@ class EmbeddingWorkflow(BaseSettings):
         # neutral system.  ASK: accept a charge (or read it off the ASE Atoms'
         # initial_charges).  Until that is confirmed against a live EmbASI, treat
         # non-zero-charge embedding runs as unvalidated.
-        mol = pyscf.M(atom=ase_atoms_to_pyscf(atoms), basis=self.basis, charge=charge)
-        mf_ll = mol.KS(xc=self.xc_ll)
-        mf_hl = mol.KS(xc=self.xc_hl)
+        _check_shell_consistency(self.spin, self.unrestricted)
+        mol = pyscf.M(
+            atom=ase_atoms_to_pyscf(atoms),
+            basis=self.basis,
+            charge=charge,
+            spin=self.spin,
+        )
+        # A non-zero spin needs an unrestricted low level; PySCF's UKS carries the
+        # spin axis EmbASI already threads through SPADE (n_spins > 1).
+        if self.spin != 0 or self.unrestricted:
+            mf_ll = mol.UKS(xc=self.xc_ll)
+            mf_hl = mol.UKS(xc=self.xc_hl)
+        else:
+            mf_ll = mol.KS(xc=self.xc_ll)
+            mf_hl = mol.KS(xc=self.xc_hl)
 
         projection = ProjectionEmbedding(
             atoms,
@@ -596,7 +654,9 @@ class EmbeddingWorkflow(BaseSettings):
         # what EmbASI folded into F_emb, whether that is KS or HF.
         density_fit: bool | str = self.df_auxbasis or self.density_fit
         integrals = PySCFIntegrals(mf_hl, density_fit=density_fit)
-        return ProjectionEmbeddingAdapter(projection, integrals, mu=self.mu)
+        return ProjectionEmbeddingAdapter(
+            projection, integrals, mu=self.mu, unrestricted=self.unrestricted
+        )
 
     def _build_atoms(self) -> tuple[Any, int]:
         """Return ``(ase.Atoms, charge)`` for the requested geometry source."""

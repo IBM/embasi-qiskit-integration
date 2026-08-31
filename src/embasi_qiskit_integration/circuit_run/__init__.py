@@ -16,6 +16,15 @@ from embasi_qiskit_integration.circuit_run.base import (
     SamplerKind,
     SamplerMixin,
 )
+from embasi_qiskit_integration.circuit_run.spin_layout import (
+    ALPHA_BETA,
+    BETA_ALPHA,
+    NATIVE_SPIN_LAYOUT,
+    counts_sector,
+    create_hf_reference,
+    swap_spin_halves,
+    verify_counts_sector,
+)
 from embasi_qiskit_integration.circuit_run.counts import merge_counts
 from embasi_qiskit_integration.circuit_run.permutation import (
     unpermute_bitstrings,
@@ -30,6 +39,9 @@ from embasi_qiskit_integration.circuit_run.prep import (
 )
 
 __all__ = [
+    "ALPHA_BETA",
+    "BETA_ALPHA",
+    "NATIVE_SPIN_LAYOUT",
     "BitstringSampler",
     "MockSampler",
     "SamplerKind",
@@ -38,6 +50,8 @@ __all__ = [
     "build_sampler",
     "characterise_readout",
     "compose_full_circuit",
+    "counts_sector",
+    "create_hf_reference",
     "find_lines",
     "hf_prep_circuit",
     "merge_counts",
@@ -45,9 +59,11 @@ __all__ = [
     "read_noise_from_backend",
     "resolve_initial_state",
     "select_layout",
+    "swap_spin_halves",
     "unpermute_bitstrings",
     "unpermute_counts",
     "unpermute_counts_list",
+    "verify_counts_sector",
 ]
 
 
