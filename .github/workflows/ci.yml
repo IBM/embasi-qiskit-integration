@@ -18,7 +18,7 @@ jobs:
         run: uv venv --python 3.12
 
       - name: Install project
-        run: uv pip install -e ".[dev,quantum]"
+        run: uv pip install -e ".[dev,quantum,fermions]"
 
       - name: Check formatting (ruff)
         run: uv run ruff format --check src scripts tests
