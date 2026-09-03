@@ -340,6 +340,69 @@ class EmbeddedOrbitals:
         )
 
 
+def projection_energy_from_state(
+    state: dict[str, Any],
+    *,
+    solver_energy: float,
+    rdm1_ao: np.ndarray,
+) -> "ProjectionEnergy":
+    """Assemble paper Eq. 8 from an :meth:`ProjectionEmbeddingAdapter.export_state`
+    snapshot, with no live EmbASI.
+
+    :meth:`ProjectionEmbeddingAdapter.projection_energy` needs the live
+    ``ProjectionEmbedding`` for two things only -- the ghosted-subsystem-A footing and
+    EmbASI's low-level energies -- and ``export_state`` carries both.  So an
+    out-of-process consumer can assemble the *same* energy from the snapshot, which is
+    what keeps the footing shift, the Eq. 8 correction and the projector leak in one
+    implementation instead of two.  Reimplementing them downstream is exactly how a
+    ~4 Ha footing error gets reintroduced silently: the outer loop still converges on
+    the density while carrying the offset in the energy.
+
+    Args:
+        state: an ``export_state`` mapping (or an ``np.load``ed ``.npz`` of one).
+        solver_energy: the correlated solver's total energy for the embedded fragment.
+        rdm1_ao: the solver 1-RDM lifted to the AO basis (see
+            :meth:`ProjectionEmbeddingAdapter.rdm1_ao`).
+
+    Returns:
+        The same :class:`ProjectionEnergy` breakdown the in-process path returns.
+    """
+
+    def _array(key: str) -> np.ndarray:
+        if key not in state:
+            raise KeyError(
+                f"state snapshot has no {key!r}; it must come from export_state() "
+                f"(keys present: {sorted(state)})"
+            )
+        return np.asarray(state[key], dtype=float)
+
+    dm_hl = np.asarray(rdm1_ao, dtype=float)
+    p_b = _array("p_b")
+    # The adapter's own `v_emb` (`h_emb - hcore - P_B`), exported directly -- NOT
+    # EmbASI's `_v_emb_embasi`, which follows a different convention (it omits
+    # subsystem A's nuclear-electron term).  Mixing the two is a silent energy error.
+    v_emb = _array("v_emb")
+
+    leak = float(np.einsum("ij,ji->", dm_hl, p_b))
+    e_high_a = float(solver_energy) - np.einsum("ij,ji->", dm_hl, v_emb) - leak
+    correction = float(np.einsum("ij,ji->", dm_hl - _array("dm_a_init"), v_emb))
+
+    footing_shift = float(
+        (float(_array("enuc_full")) - float(_array("enuc_a")))
+        + np.einsum("ij,ji->", dm_hl, _array("hcore_full") - _array("hcore_a"))
+    )
+    e_high_a -= footing_shift
+
+    return ProjectionEnergy(
+        e_low_total=float(_array("e_low_total")),
+        e_low_A=float(_array("e_low_a")),
+        e_high_A=float(e_high_a),
+        correction=correction,
+        projector_leak=leak,
+        footing_shift=footing_shift,
+    )
+
+
 @dataclass(frozen=True)
 class ProjectionEnergy:
     """Term-by-term breakdown of paper Eq. 8."""
@@ -657,6 +720,28 @@ class ProjectionEmbeddingAdapter:
         state: dict[str, Any] = {
             name.lstrip("_"): np.asarray(getattr(self, name)) for name in self._STATE_ARRAYS
         }
+        # The ghosted-subsystem-A footing and the two low-level energies are the only
+        # things `projection_energy` reads off the *live* ProjectionEmbedding
+        # (`_a_fragment_footing` reaches through `A_LL.atoms.calc.mol`;
+        # `_low_level_energies` reads EmbASI's own scalars).  Both reduce to one array
+        # and three scalars, so exporting them is what lets a separate process assemble
+        # the energy from a snapshot alone -- no live EmbASI, no second SCF.
+        hcore_a, enuc_a = self._a_fragment_footing()
+        e_low_ab, e_low_a = self._low_level_energies()
+        # `v_emb` (and `h_emb`) are exported as arrays rather than left to be rebuilt
+        # downstream: the adapter's `v_emb` is `h_emb - hcore - P_B` and `h_emb` needs
+        # `veff_hl(gamma^A)`, i.e. a live PySCF mean field.  It also uses a *different
+        # convention* from EmbASI's exported `_v_emb_embasi` (which omits subsystem A's
+        # nuclear-electron term), so a consumer reconstructing it from the snapshot is
+        # one convention slip away from a silently wrong energy.
+        state["v_emb"] = np.asarray(self.v_emb)
+        state["h_emb"] = np.asarray(self.h_emb)
+        state["hcore_a"] = np.asarray(hcore_a)
+        state["hcore_full"] = np.asarray(self.ints.hcore())
+        state["enuc_a"] = np.asarray(float(enuc_a))
+        state["enuc_full"] = np.asarray(float(self.ints.energy_nuc()))
+        state["e_low_total"] = np.asarray(e_low_ab)
+        state["e_low_a"] = np.asarray(e_low_a)
         state["fingerprint"] = self.state_fingerprint()
         return state
 

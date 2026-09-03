@@ -566,3 +566,68 @@ def test_restore_state_refuses_a_different_functional():
     other.run_low_level()
     with pytest.raises(ValueError, match="does not match this adapter"):
         other.restore_state(state)
+
+
+def test_projection_energy_from_state_matches_the_live_assembly():
+    """The out-of-process energy assembly must reproduce the in-process one exactly.
+
+    ``projection_energy`` reads the live ``ProjectionEmbedding`` for two things -- the
+    ghosted-subsystem-A footing and EmbASI's low-level energies -- and ``export_state``
+    carries both, so a separate process can assemble the same energy from a snapshot.
+    This pins that it *is* the same energy, term by term.
+
+    The footing shift is why this matters rather than being a convenience: it is ~3.8 Ha
+    here, it enters ``e_high_A``, and the outer loop converges on the density while
+    carrying any error in the energy -- so a reimplementation that got the ``v_emb``
+    convention wrong (EmbASI's ``_v_emb_embasi`` omits subsystem A's nuclear-electron
+    term; the adapter's ``v_emb`` does not) would produce a plausible, wrong total with
+    no other symptom.
+    """
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        projection_energy_from_state,
+    )
+    from embasi_qiskit_integration.solvers import FCISolver
+
+    adapter = _build_adapter()
+    adapter.run_low_level()
+    orbitals = adapter.build_orbitals(n_frozen_occ=0, n_virtual=None)
+    result = FCISolver().solve(adapter.embedded_hamiltonian(orbitals))
+
+    live = adapter.projection_energy(result, orbitals)
+    # Round-trip the snapshot through an .npz, which is how it actually travels (and
+    # without allow_pickle, as a consumer reading another process's file should).
+    state = {k: v for k, v in adapter.export_state().items() if k != "fingerprint"}
+    from_state = projection_energy_from_state(
+        state,
+        solver_energy=result.energy,
+        rdm1_ao=adapter.rdm1_ao(result.rdm1, orbitals),
+    )
+
+    for term in (
+        "e_low_total",
+        "e_low_A",
+        "e_high_A",
+        "correction",
+        "projector_leak",
+        "footing_shift",
+        "total",
+    ):
+        assert getattr(from_state, term) == pytest.approx(getattr(live, term), abs=1e-12), term
+    # The shift is genuinely large here, so the agreement above is a real test of it.
+    assert abs(live.footing_shift) > 1.0
+
+
+def test_projection_energy_from_state_reports_a_missing_key_by_name():
+    """A snapshot that did not come from ``export_state`` must fail clearly."""
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        projection_energy_from_state,
+    )
+
+    adapter = _build_adapter()
+    adapter.run_low_level()
+    state = {k: v for k, v in adapter.export_state().items() if k != "fingerprint"}
+    del state["hcore_a"]
+    with pytest.raises(KeyError, match="hcore_a"):
+        projection_energy_from_state(
+            state, solver_energy=-1.0, rdm1_ao=np.asarray(adapter._dm_a)
+        )
