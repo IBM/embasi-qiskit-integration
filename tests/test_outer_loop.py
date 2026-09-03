@@ -43,7 +43,7 @@ pyscf = pytest.importorskip("pyscf")
 
 # Imported after the importorskip above, so the module skips cleanly without
 # pyscf rather than failing at import time -- hence the E402 waivers.
-from embasi_qiskit_integration.embedding import EmbeddingWorkflow  # noqa:E402
+from embasi_qiskit_integration.embedding import EmbeddingWorkflow, seed_for_cycle  # noqa:E402
 from embasi_qiskit_integration.projection_embedding_adapter import (  # noqa:E402
     ProjectionEmbeddingAdapter,
     PySCFIntegrals,
@@ -454,20 +454,32 @@ def test_reseed_policy_advances_fci_noop():
 
 
 def test_reseed_advances_seed_when_solver_has_one():
-    """_maybe_reseed bumps a stochastic solver's seed under reseed_sqd."""
+    """_maybe_reseed advances a stochastic solver's seed under reseed_sqd.
+
+    The stub's starting seed is ``wf.seed``, matching how ``_build_solver`` builds the
+    real one (``SQDSolver(..., seed=self.seed)``): the schedule is a pure function of
+    the *configured* base and the cycle index, so the stub has to start where the real
+    solver starts for the assertion to mean anything.
+
+    Cycle 3's seed is ``base + 3`` only if each cycle is reached in order from cycle 0
+    -- the schedule accumulates (``base + k(k+1)/2``), so jumping straight to cycle 3
+    lands on ``base + 6``.  See :func:`seed_for_cycle`, and
+    ``tests/test_state_roundtrip.py`` for the full-sequence equivalence test.
+    """
     wf = _workflow(solver="fci", reseed_sqd=True)
+    base = wf.seed
 
     class _StubSeeded:
-        seed = 100
+        seed = base
 
     stub = _StubSeeded()
     wf._maybe_reseed(stub, cycle=0)  # cycle 0 never changes the seed
-    assert stub.seed == 100
+    assert stub.seed == base
     wf._maybe_reseed(stub, cycle=3)
-    assert stub.seed == 103
+    assert stub.seed == seed_for_cycle(base, 3) == base + 6
 
     # With reseeding off, the seed is held (subspace carried over).
     wf_off = _workflow(solver="fci", reseed_sqd=False)
     stub2 = _StubSeeded()
     wf_off._maybe_reseed(stub2, cycle=3)
-    assert stub2.seed == 100
+    assert stub2.seed == base

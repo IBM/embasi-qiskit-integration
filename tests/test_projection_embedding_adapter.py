@@ -510,3 +510,59 @@ def test_restricted_span_reproduces_full_basis_orbitals(adapter):
     for orb in (orb_restricted, orb_full):
         gram = orb.coeff.T @ adapter._s @ orb.coeff
         assert np.allclose(gram, np.eye(gram.shape[0]), atol=1e-8)
+
+
+# --------------------------------------------------------------------------- #
+# The cross-process state seam, against live EmbASI.
+#
+# ``tests/test_state_roundtrip.py`` pins export/restore against the partitioned-RHF
+# mock (no EmbASI).  These two go further and pin it against the real thing, because
+# the mock cannot exercise what actually makes the seam necessary: EmbASI's A_LL
+# one-electron blocks live outside this repo and are only populated by an SCF, which
+# is why ``restore_state`` must be called *after* a fresh ``run_low_level`` rather
+# than instead of one.
+# --------------------------------------------------------------------------- #
+def test_restore_state_reproduces_the_live_downfold():
+    """A restored snapshot reassembles ``F_emb`` bit-identically on real EmbASI.
+
+    Two independently built adapters stand in for two OS processes: an out-of-process
+    outer loop re-runs the supersystem SCF each round (nothing else can populate
+    A_LL), then restores the carried ``v_emb``/``P_B``/densities over it.  If this
+    drifted, every round after the first would downfold a subtly different
+    Hamiltonian and the loop's trajectory would move for plumbing reasons rather than
+    physics ones.
+
+    Measured 0.0 here (the supersystem SCF is bit-reproducible on this system), which
+    is a bonus rather than the guarantee -- the promise is agreement to SCF
+    convergence tolerance, and a larger or density-fitted case may only reach that.
+    """
+    source = _build_adapter()
+    source.run_low_level()
+    reference = np.array(source.h_emb, copy=True)
+    state = source.export_state()
+
+    fresh = _build_adapter()
+    fresh.run_low_level()  # a fresh round's own SCF, as a new process must run
+    fresh.restore_state(state)
+
+    np.testing.assert_allclose(fresh.h_emb, reference, atol=1e-12, rtol=0.0)
+    np.testing.assert_allclose(fresh._dm_a_init, state["dm_a_init"], atol=1e-12, rtol=0.0)
+
+
+def test_restore_state_refuses_a_different_functional():
+    """A snapshot must not be paired across a change in the high-level functional.
+
+    Every array keeps its shape when ``xc_hl`` changes, so the mismatch is invisible
+    to a shape check and would assemble a plausible, wrong energy -- ``veff_hl``
+    would subtract a different functional than the one folded into the carried
+    ``v_emb``.  Regression: an earlier fingerprint omitted ``xc_hl`` and this pairing
+    was accepted.
+    """
+    source = _build_adapter(xc_hl="PBE")
+    source.run_low_level()
+    state = source.export_state()
+
+    other = _build_adapter(xc_hl="PBE0")
+    other.run_low_level()
+    with pytest.raises(ValueError, match="does not match this adapter"):
+        other.restore_state(state)

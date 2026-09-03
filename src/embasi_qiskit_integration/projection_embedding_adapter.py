@@ -123,6 +123,7 @@ assembled open-shell energy against a UKS reference.  See :meth:`_as_ao_by_mo`.
 
 from __future__ import annotations
 
+import hashlib
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -443,10 +444,22 @@ class ProjectionEmbeddingAdapter:
         self._v_emb_embasi = self._v_emb_embasi
         self._p_b = self._p_b
 
-        # Assemble F_emb exactly as EmbASI's construct_embedded_fock does, from the
-        # A_LL one-electron blocks plus the exported v_emb and P_B.  Reading these
-        # off the same A_LL object EmbASI integrated keeps the downfold bit-identical
-        # to the previous construct_embedded_fock() path.
+        self._assemble_fock_a_only()
+
+    def _assemble_fock_a_only(self) -> None:
+        """Assemble ``F_emb`` from the A_LL one-electron blocks plus ``v_emb``/``P_B``.
+
+        Split out of :meth:`run_low_level_a_only` so a *restored* adapter (one whose
+        ``v_emb``/``P_B`` came from :meth:`restore_state` rather than from a prior
+        ``run_low_level`` in the same process) reassembles the Fock through exactly
+        the same arithmetic.  Sharing the code is the point: an out-of-process
+        embedding loop must not get a second, subtly different downfold.
+
+        Assembles it exactly as EmbASI's ``construct_embedded_fock`` does, from the
+        A_LL one-electron blocks plus the exported ``v_emb`` and ``P_B``.  Reading
+        these off the same A_LL object EmbASI integrated keeps the downfold
+        bit-identical to the previous ``construct_embedded_fock()`` path.
+        """
         h_kin_a = self._as_ao_total(self.p.A_LL.hamiltonian_kinetic)
         h_estat_xc_a = self._as_ao_total(self.p.A_LL.hamiltonian_estat_plus_xc)
         self._fock = h_kin_a + h_estat_xc_a + self._v_emb_embasi + self._p_b
@@ -524,25 +537,203 @@ class ProjectionEmbeddingAdapter:
         self._p_b = self._as_ao_total(p_b_embasi)
         self._v_emb_embasi = self._as_ao_total(v_emb_embasi)
 
-        # Assemble F_emb exactly as EmbASI's construct_embedded_fock does, from the
-        # A_LL one-electron blocks plus the exported v_emb and P_B.  Reading these
-        # off the same A_LL object EmbASI integrated keeps the downfold bit-identical
-        # to the previous construct_embedded_fock() path.
-        h_kin_a = self._as_ao_total(self.p.A_LL.hamiltonian_kinetic)
-        h_estat_xc_a = self._as_ao_total(self.p.A_LL.hamiltonian_estat_plus_xc)
-        self._fock = h_kin_a + h_estat_xc_a + self._v_emb_embasi + self._p_b
-        self._validate_densities()
+        self._assemble_fock_a_only()
 
-        # Cross-check our level-shift mu against the value EmbASI used inside the
-        # SCF.  We now read P_B directly, but self.mu still parameterises the
-        # adapter (e.g. the p_b property fallback and meta), so a silent mismatch
-        # would be confusing; keep the loud check.
-        mu_embasi = getattr(self.p, "mu_val", None)
-        if mu_embasi is not None and not np.isclose(float(mu_embasi), self.mu, rtol=1e-9, atol=0.0):
+    # ---------------- cross-process state seam ---------------- #
+    # An out-of-process embedding loop (one round per OS process, e.g. a workflow
+    # engine driving `max_cycles=1` repeatedly) cannot carry a live adapter across a
+    # round boundary: it holds a live ProjectionEmbedding and two PySCF KS objects,
+    # none of them picklable.  What it *can* carry is the handful of arrays the
+    # downfold needs.  These two methods are that seam.
+    #
+    # Deliberately not property setters: the arrays are only meaningful as a *set*
+    # (F_emb is assembled from v_emb + P_B against a specific basis and geometry), so
+    # pairing a snapshot with a mismatched adapter must be refused, not silently
+    # assembled into a wrong energy.  A fingerprint is what makes that refusal possible.
+
+    _STATE_ARRAYS = ("_dm_a", "_dm_a_init", "_dm_b", "_fock", "_s", "_p_b", "_v_emb_embasi")
+
+    def state_fingerprint(self) -> dict[str, Any]:
+        """Identify the adapter a snapshot may be restored into.
+
+        Everything here changes the *meaning* of the exported arrays: a different
+        basis or geometry makes them a different-sized (or same-sized but wrong)
+        operator, and a different projection kind or spin treatment changes how
+        ``P_B``/``v_emb`` were built.  Compared as a whole by :meth:`restore_state`.
+        """
+        mol = getattr(self.ints, "mol", None)
+        mf = getattr(self.ints, "mf", None)
+        fingerprint: dict[str, Any] = {
+            "nao": int(np.asarray(self.ints.overlap()).shape[-1]),
+            "projection": str(getattr(self.p, "projection", None)),
+            "unrestricted": bool(self.unrestricted),
+            "mu": float(self.mu),
+            # The high-level functional and the DF setting both change what veff_hl
+            # subtracts, so a snapshot paired across a change in either assembles a
+            # wrong energy while every array keeps its shape.  Verified live: without
+            # these an xc_hl mismatch was accepted.
+            "xc_hl": str(getattr(mf, "xc", None)),
+            "density_fit": str(getattr(self.ints, "_density_fit", None)),
+        }
+        if mol is not None:
+            # Round coordinates before hashing: PySCF stores them in bohr as floats,
+            # and a re-read geometry can differ in the last bit without being a
+            # different molecule.
+            coords = np.round(np.asarray(mol.atom_coords(), dtype=float), 8)
+            fingerprint["basis"] = str(mol.basis)
+            fingerprint["natm"] = int(mol.natm)
+            fingerprint["charge"] = int(mol.charge)
+            fingerprint["spin"] = int(mol.spin)
+            fingerprint["geometry_hash"] = hashlib.sha256(
+                np.ascontiguousarray(coords).tobytes()
+                + str([mol.atom_symbol(i) for i in range(mol.natm)]).encode()
+            ).hexdigest()[:16]
+        return fingerprint
+
+    def low_level_diagnostics(self) -> dict[str, Any]:
+        """What can be said about the low-level SCF's convergence, honestly.
+
+        An out-of-process outer loop needs this per round: an unconverged low-level
+        SCF is a fixed bias in a single shot, but in a *k*-round loop it is a
+        per-round term that a plain ``|ΔE|`` stop criterion cannot distinguish from
+        genuine slow convergence.  Surfacing it means an unconverged round is visible
+        in the round's diagnostics rather than mistaken for a plateau.
+
+        **EmbASI exposes no convergence flag for its own subsystem SCF** (``A_LL``
+        carries only ``no_scf``), and its low-level SCF is observed not to converge
+        even on a 6-atom sto-3g monomer -- it prints ``SCF not converged.`` and
+        continues.  So this reports what is actually available rather than
+        synthesising a flag: the two low-level energies the energy assembly reads, and
+        the PySCF high-level mean field's own convergence state.  ``a_ll_no_scf``
+        distinguishes a genuine SCF from the ``run_noscf`` path
+        ``run_low_level_a_only`` uses.
+
+        Returns:
+            A JSON-serialisable mapping; every value may be ``None`` when the
+            underlying object does not expose it.
+        """
+        mf = getattr(self.ints, "mf", None)
+        diagnostics: dict[str, Any] = {
+            "a_ll_no_scf": getattr(self.p.A_LL, "no_scf", None),
+            "mf_hl_converged": getattr(mf, "converged", None),
+            "mf_hl_conv_tol": getattr(mf, "conv_tol", None),
+            "mf_hl_max_cycle": getattr(mf, "max_cycle", None),
+        }
+        try:
+            e_low_a, e_low_total = self._low_level_energies()
+            diagnostics["e_low_A"] = e_low_a
+            diagnostics["e_low_total"] = e_low_total
+        except Exception:  # noqa: BLE001 -- diagnostics must never break a run
+            diagnostics["e_low_A"] = None
+            diagnostics["e_low_total"] = None
+        return diagnostics
+
+    def export_state(self) -> dict[str, Any]:
+        """Snapshot the low-level state needed to reassemble ``F_emb`` elsewhere.
+
+        Call after :meth:`run_low_level` (the arrays are ``None`` before it).  The
+        returned mapping is plain arrays and scalars, so it serialises with
+        ``np.savez`` and survives a process boundary.
+
+        ``_dm_a`` is in the snapshot for three reasons beyond re-deriving the Fock:
+        an out-of-process outer loop needs it as the DIIS input vector, as the
+        ``prev_dm_a`` of its ``max|Δγ^A|`` diagnostic, and -- crucially -- it must be
+        the density the *previous* cycle fed in, not the one this round's fresh
+        supersystem SCF just wrote.  A consumer that reads the post-SCF value instead
+        builds its DIIS residual against the wrong reference, which is silent.
+
+        ``_dm_a_init`` matters for a subtler reason: :meth:`projection_energy` computes
+        the Eq. 8 correction as ``tr[(γ̃^A - γ^A_init) v_emb]`` against it, and it is
+        set once, on the first ``run_low_level`` ever.  A fresh process re-runs the SCF
+        and would reset it to *this* round's density, silently zeroing the drift the
+        correction is meant to measure.  So it is carried from round 0, not recomputed.
+        """
+        missing = [n for n in self._STATE_ARRAYS if getattr(self, n) is None]
+        if missing:
+            raise RuntimeError(
+                f"export_state() before run_low_level(): {missing} are unset. The "
+                f"snapshot is only meaningful after the supersystem SCF has run."
+            )
+        state: dict[str, Any] = {
+            name.lstrip("_"): np.asarray(getattr(self, name)) for name in self._STATE_ARRAYS
+        }
+        state["fingerprint"] = self.state_fingerprint()
+        return state
+
+    def restore_state(self, state: dict[str, Any], *, strict: bool = True) -> None:
+        """Install a snapshot from :meth:`export_state` into this adapter.
+
+        **Call this *after* a fresh :meth:`run_low_level`, not instead of one.** The
+        A_LL one-electron blocks (``hamiltonian_kinetic``,
+        ``hamiltonian_estat_plus_xc``) live in EmbASI proper and are only populated
+        once EmbASI has integrated the subsystem; they depend on geometry and basis,
+        not on cycle history, so re-running the SCF is how they get there.  Restoring
+        then overwrites that fresh SCF's ``v_emb``/``P_B``/densities with the carried
+        ones, and :meth:`_assemble_fock_a_only` rebuilds ``F_emb`` from the pair.
+        Restoring into an adapter that never ran will raise from the assembly.
+
+        Args:
+            state: an :meth:`export_state` mapping (or an ``np.load``ed ``.npz`` of one).
+            strict: verify the fingerprint against this adapter and raise on mismatch.
+                Only pass ``False`` when a *deliberate* re-pairing is intended; a
+                mismatched basis or geometry otherwise assembles a wrong ``F_emb``
+                and reports a plausible, wrong energy.
+
+        Raises:
+            KeyError: the snapshot is missing an array.
+            ValueError: ``strict`` and the fingerprint disagrees with this adapter.
+        """
+        arrays = {}
+        for name in self._STATE_ARRAYS:
+            key = name.lstrip("_")
+            if key not in state:
+                raise KeyError(f"state snapshot has no {key!r}; keys: {sorted(state)}")
+            arrays[name] = np.asarray(state[key], dtype=float)
+
+        if strict:
+            self._check_fingerprint(state)
+
+        # nao is checked even when not strict: a shape mismatch is not a judgement
+        # call, it is an array that cannot be contracted with this adapter's.
+        nao = int(np.asarray(self.ints.overlap()).shape[-1])
+        for name, arr in arrays.items():
+            if arr.shape[-2:] != (nao, nao):
+                raise ValueError(
+                    f"snapshot {name.lstrip('_')!r} has shape {arr.shape}, but this "
+                    f"adapter's basis has nao={nao}; refusing to assemble F_emb from "
+                    f"a different basis"
+                )
+
+        for name, arr in arrays.items():
+            setattr(self, name, arr)
+        self._assemble_fock_a_only()
+
+    def _check_fingerprint(self, state: dict[str, Any]) -> None:
+        """Raise if ``state``'s fingerprint disagrees with this adapter's."""
+        stored = state.get("fingerprint")
+        if stored is None:
             raise ValueError(
-                f"level-shift mu mismatch: adapter mu={self.mu:g} but EmbASI "
-                f"used mu_val={float(mu_embasi):g}; the exported P_B was built "
-                f"with mu_val, not the adapter's mu"
+                "state snapshot carries no 'fingerprint', so it cannot be verified "
+                "against this adapter; pass strict=False only if the pairing is "
+                "deliberate and independently checked"
+            )
+        # np.savez round-trips a dict through a 0-d object array; unwrap it.
+        if isinstance(stored, np.ndarray):
+            stored = stored.item()
+        current = self.state_fingerprint()
+        differing = {
+            k: (stored.get(k), current.get(k))
+            for k in sorted(set(stored) | set(current))
+            if stored.get(k) != current.get(k)
+        }
+        if differing:
+            detail = ", ".join(
+                f"{k}: snapshot={s!r} adapter={c!r}" for k, (s, c) in differing.items()
+            )
+            raise ValueError(
+                f"state snapshot does not match this adapter ({detail}); restoring it "
+                f"would assemble F_emb from a different system and report a plausible "
+                f"but wrong energy"
             )
 
     # ---------------- low-level state accessors ---------------- #

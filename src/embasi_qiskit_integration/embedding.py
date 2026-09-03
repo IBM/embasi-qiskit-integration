@@ -83,7 +83,7 @@ Comput. 8, 2564 (2012), doi:10.1021/ct300544e.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import numpy as np
 from pydantic_settings import BaseSettings, CliApp, SettingsConfigDict
@@ -144,6 +144,337 @@ def _check_shell_consistency(spin: int, unrestricted: bool) -> None:
             "shell and would return a closed-shell answer for an open-shell system. "
             "Set unrestricted=True (spin-resolved path), or spin=0."
         )
+
+
+def seed_for_cycle(base_seed: int, cycle: int, *, reseed: bool = True) -> int:
+    """Absolute SQD seed for a given outer-loop cycle.
+
+    The seed selects the SQD sampled subspace, so it is part of what defines the
+    problem each cycle solves -- which makes reproducing the *schedule* a
+    correctness requirement for any driver that re-implements the outer loop
+    (e.g. an out-of-process one running a single cycle per round).
+
+    The schedule is triangular, not linear.  :meth:`EmbeddingWorkflow._maybe_reseed`
+    historically bumped the solver's *own* attribute in place
+    (``solver.seed = solver.seed + cycle``), so each cycle adds ``cycle`` to the
+    already-bumped value:
+
+        cycle:  0   1   2   3   4   5
+        seed:  24  25  27  30  34  39      (base=24, i.e. base + k(k+1)/2)
+
+    It reads as ``base + cycle`` at a glance and is not; expressing it as a pure
+    function of ``(base_seed, cycle)`` is what lets a fresh process compute round
+    *n*'s seed without having run rounds 0..*n*-1.
+
+    Args:
+        base_seed: the configured seed (the cycle-0 value).
+        cycle: zero-based cycle index.
+        reseed: when False the subspace is deliberately reused, so the seed is
+            held at ``base_seed`` for every cycle.
+
+    Returns:
+        The absolute seed for ``cycle``; ``base_seed`` at cycle 0 either way.
+    """
+    if not reseed:
+        return base_seed
+    return base_seed + (cycle * (cycle + 1)) // 2
+
+
+def diis_extrapolate(residuals: list[np.ndarray], outputs: list[np.ndarray]) -> np.ndarray | None:
+    """Pulay/DIIS extrapolation of the density-feedback fixed point.
+
+    Module-level so an out-of-process outer loop can reuse the *same* extrapolation
+    rather than reimplementing it; :meth:`EmbeddingWorkflow._diis_extrapolate`
+    delegates here.
+
+    Standard DIIS: find coefficients ``c`` (summing to 1) minimising
+    ``|| sum_i c_i * residuals[i] ||``, by solving the bordered linear system
+
+        [B  -1] [c]   [0]
+        [-1  0] [λ] = [-1]
+    Returns ``None`` (caller falls back to linear mixing) if ``B`` is
+    singular -- expected once residuals shrink toward linear dependence
+    near convergence, and routine if two cycles happen to produce
+    near-identical residuals.
+    """
+    n = len(residuals)
+    b = np.empty((n + 1, n + 1))
+    for i, ri in enumerate(residuals):
+        for j, rj in enumerate(residuals):
+            b[i, j] = float(np.vdot(ri, rj).real)
+    b[:n, n] = -1.0
+    b[n, :n] = -1.0
+    b[n, n] = 0.0
+    rhs = np.zeros(n + 1)
+    rhs[n] = -1.0
+    try:
+        coeffs = np.linalg.solve(b, rhs)[:n]
+    except np.linalg.LinAlgError:
+        return None
+    return sum(c * o for c, o in zip(coeffs, outputs))
+
+
+class EmbeddingSetup(Protocol):
+    """The settings :func:`build_adapter` / :func:`build_selector` actually read.
+
+    Structural, not a base class: :class:`EmbeddingWorkflow` satisfies it as-is (it
+    is the CLI ``BaseSettings``), and so does any plain dataclass or simple namespace
+    carrying these attributes.  That is the point of the seam -- an external driver
+    (a workflow engine assembling its own settings model, say) can call the builders
+    without importing or instantiating a ``BaseSettings`` whose
+    ``cli_parse_args=True`` would try to read ``sys.argv``.
+
+    Only the geometry/adapter/selector fields appear here; the solver and outer-loop
+    fields stay private to :class:`EmbeddingWorkflow`, which owns that loop.
+    """
+
+    # Declared as read-only properties rather than plain attributes: a mutable
+    # Protocol attribute is *invariant*, which would reject ``EmbeddingWorkflow``
+    # itself (its ``selector`` is a narrower ``Literal[...]`` and its ``xyz`` a
+    # ``Path``).  The builders only ever read these, so read-only is both accurate
+    # and what makes the structural match work.
+
+    # geometry source (build_atoms)
+    @property
+    def xyz(self) -> Any: ...
+    @property
+    def charge(self) -> int | None: ...
+    @property
+    def s26_index(self) -> int: ...
+    @property
+    def n_atoms(self) -> int | None: ...
+
+    # adapter (build_adapter)
+    @property
+    def basis(self) -> str: ...
+    @property
+    def active_atoms(self) -> list[int]: ...
+    @property
+    def xc_ll(self) -> str: ...
+    @property
+    def xc_hl(self) -> str: ...
+    @property
+    def mu(self) -> float: ...
+    @property
+    def spin(self) -> int: ...
+    @property
+    def unrestricted(self) -> bool: ...
+    @property
+    def density_fit(self) -> bool: ...
+    @property
+    def df_auxbasis(self) -> str | None: ...
+
+    # selector (build_selector)
+    @property
+    def selector(self) -> str: ...
+    @property
+    def active_fragment_sizes(self) -> list[int] | None: ...
+    @property
+    def n_virtual(self) -> int | None: ...
+    @property
+    def n_shells(self) -> int: ...
+    @property
+    def apc_max_size(self) -> tuple[int, int] | None: ...
+    @property
+    def apc_fixed(self) -> Any: ...
+
+
+# --------------------------------------------------------------------------- #
+# Module-level construction seams.
+#
+# These three were private methods on the CLI ``BaseSettings``.  They are pure
+# construction -- they read settings and return an adapter/selector -- so they are
+# module-level functions taking an :class:`EmbeddingSetup`, and the
+# ``EmbeddingWorkflow`` methods are one-line delegations.  An external driver can
+# then reuse the *exact* construction (including the atom reorder, the
+# region-1-first mask and the open-shell guard) as public API, rather than
+# reaching into privates or reimplementing it and drifting.
+
+
+def build_atoms(cfg: EmbeddingSetup) -> tuple[Any, int]:
+    """Return ``(ase.Atoms, charge)`` for the requested geometry source."""
+    if cfg.xyz is not None:
+        from embasi_qiskit_integration.molecule import geometry
+
+        atoms, charge, _smiles = geometry.read_atoms_from_xyz(cfg.xyz, charge_override=cfg.charge)
+        return atoms, charge
+
+    from ase.data.s22 import create_s22_system, s26
+
+    atoms = create_s22_system(s26[cfg.s26_index])
+    if cfg.n_atoms is not None:
+        atoms = atoms[: cfg.n_atoms]
+    return atoms, cfg.charge or 0
+
+
+def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbeddingAdapter:
+    """Set up ProjectionEmbedding exactly as the EmbASI PySCF example does."""
+    import pyscf
+    from embasi.embedding import ProjectionEmbedding
+    from pyscf.pbc.tools.pyscf_ase import PySCF, ase_atoms_to_pyscf
+
+    atoms, charge = build_atoms(cfg)
+
+    # Embedding mask: 1 = high-level, 2 = low-level.
+    embed_mask = len(atoms) * [2]
+    for idx in cfg.active_atoms:
+        embed_mask[idx] = 1
+
+    # ProjectionEmbedding requires embed_mask sorted so that region 1 atoms
+    # come first; reorder atoms to match before building the PySCF Mole so
+    # the two stay in sync.
+    idx_list = np.argsort(embed_mask)
+    sort_embed_mask = np.sort(embed_mask)
+    atoms = atoms[idx_list]
+
+    # TODO(embasi-api): the charge is set on the PySCF Mole (which needs it to
+    # get nelec right), but ProjectionEmbedding is handed only the ASE Atoms and
+    # exposes no charge argument, so its own low-level SCF may still assume a
+    # neutral system.  ASK: accept a charge (or read it off the ASE Atoms'
+    # initial_charges).  Until that is confirmed against a live EmbASI, treat
+    # non-zero-charge embedding runs as unvalidated.
+    _check_shell_consistency(cfg.spin, cfg.unrestricted)
+    mol = pyscf.M(
+        atom=ase_atoms_to_pyscf(atoms),
+        basis=cfg.basis,
+        charge=charge,
+        spin=cfg.spin,
+    )
+    # A non-zero spin needs an unrestricted low level; PySCF's UKS carries the
+    # spin axis EmbASI already threads through SPADE (n_spins > 1).
+    if cfg.spin != 0 or cfg.unrestricted:
+        mf_ll = mol.UKS(xc=cfg.xc_ll)
+        mf_hl = mol.UKS(xc=cfg.xc_hl)
+    else:
+        mf_ll = mol.KS(xc=cfg.xc_ll)
+        mf_hl = mol.KS(xc=cfg.xc_hl)
+
+    projection = ProjectionEmbedding(
+        atoms,
+        embed_mask=sort_embed_mask,
+        calc_base_ll=PySCF(method=mf_ll),
+        calc_base_hl=PySCF(method=mf_hl),
+        projection="level-shift",
+        parallel=parallel,
+    )
+    # PySCFIntegrals wraps the *same* mf_hl object, so veff_hl undoes exactly
+    # what EmbASI folded into F_emb, whether that is KS or HF.
+    density_fit: bool | str = cfg.df_auxbasis or cfg.density_fit
+    integrals = PySCFIntegrals(mf_hl, density_fit=density_fit)
+    return ProjectionEmbeddingAdapter(
+        projection, integrals, mu=cfg.mu, unrestricted=cfg.unrestricted
+    )
+
+
+def build_selector(cfg: EmbeddingSetup, emb: ProjectionEmbeddingAdapter, *, log=None):
+    """Build the active-virtual shaping hook from ``cfg.selector``.
+
+    Returns a ``(selector, virtual_localizer, orbital_builder)`` triple with at
+    most one non-None (all ``None`` for the fixed ``--n_virtual`` cut):
+
+    * ``mulliken`` -> a ``Selector`` (per-fragment single-shell Mulliken cut),
+    * ``spade`` -> a ``VirtualLocalizer`` (SPADE rotation + σ² gap cut),
+    * ``concentric-cl`` -> a ``VirtualLocalizer`` (iterative CL, ``n_shells``),
+    * ``apc-concentric`` -> an ``orbital_builder`` (``emb -> EmbeddedOrbitals``):
+      CL locality pre-filter then APC ranking, see
+      ``ProjectionEmbeddingAdapter.build_orbitals_apc_concentric``,
+    * ``none`` -> ``(None, None, None)``.
+
+    A rotation cannot be expressed as a column-index ``Selector``, so ``spade``
+    and ``concentric-cl`` go through the ``build_orbitals(virtual_localizer=...)``
+    hook instead, anchored on the fragment UNION (a rotation cannot be unioned
+    per-fragment the way index selection can); ``apc-concentric`` needs a full
+    ``EmbeddedOrbitals`` (it calls ``build_orbitals`` itself, then re-selects),
+    so it returns a third kind of hook the caller invokes directly on ``emb``.
+
+    After the atom reorder in ``_build_adapter`` the region-1 (active) atoms
+    occupy the first ``len(active_atoms)`` positions of ``mol``, so the
+    fragment AO indices come straight from the leading atom slices.
+    """
+    if cfg.selector == "none":
+        return None, None, None
+    from embasi_qiskit_integration.selectors import (
+        concentric_localization_selector,
+        fragment_ao_indices,
+        per_fragment_mulliken_selector,
+        spade_virtual_selector,
+    )
+
+    mol = emb.ints.mol
+    # run_low_level() (called before this) populates the overlap and F_emb; assert
+    # for the type-checker and to fail loudly if the call order is ever broken.
+    assert emb._s is not None, "run_low_level() must run before _build_selector()"
+    overlap = emb._s
+    # Reordered active-atom positions lead, ascending: 0..len(active_atoms)-1.
+    # Partition them into PHYSICAL fragments per ``active_fragment_sizes`` (one
+    # group by default).
+    n_active = len(cfg.active_atoms)
+    sizes = cfg.active_fragment_sizes or [n_active]
+    if sum(sizes) != n_active:
+        raise ValueError(
+            f"active_fragment_sizes {sizes} sum to {sum(sizes)}, but there are "
+            f"{n_active} active atoms"
+        )
+    groups, start = [], 0
+    for sz in sizes:
+        positions = list(range(start, start + sz))
+        groups.append(fragment_ao_indices(mol, positions))
+        start += sz
+
+    if cfg.selector in ("spade", "concentric-cl", "apc-concentric"):
+        # A rotation cannot be unioned per-fragment the way index selection can,
+        # so all three localisers anchor on the UNION of the fragment AOs.
+        frag_union = np.unique(np.concatenate(groups)) if groups else np.empty(0, int)
+        if cfg.selector == "spade":
+            # ``n_virtual`` caps the kept rotated shell.
+            return (
+                None,
+                spade_virtual_selector(overlap, frag_union, max_virtual=cfg.n_virtual),
+                None,
+            )
+        assert emb._fock is not None, "run_low_level() must run before _build_selector()"
+        if cfg.selector == "apc-concentric":
+            if cfg.apc_max_size is None:
+                raise ValueError("--selector apc-concentric requires --apc_max_size (nelec,norb)")
+            n_shells, max_size, fixed = cfg.n_shells, cfg.apc_max_size, cfg.apc_fixed
+
+            def _orbital_builder(
+                emb, frag=frag_union, n_shells=n_shells, max_size=max_size, fixed=fixed
+            ):
+                return emb.build_orbitals_apc_concentric(
+                    fragment_ao=frag, n_shells=n_shells, max_size=max_size, fixed=fixed
+                )
+
+            return None, None, _orbital_builder
+        # concentric-cl: the shell count sets the physically-motivated k; if
+        # ``n_virtual`` is given it is a solver-budget CEILING on top of that
+        # (for small simulations), truncating the outermost shell tail -- not a
+        # replacement for the shell structure.
+        if cfg.n_virtual is not None and log is not None:
+            log(
+                f"   [selector] concentric-cl: capping the shell-determined virtuals "
+                f"at n_virtual={cfg.n_virtual} (solver budget)"
+            )
+        return (
+            None,
+            concentric_localization_selector(
+                overlap,
+                frag_union,
+                emb._fock,
+                n_shells=cfg.n_shells,
+                max_virtual=cfg.n_virtual,
+            ),
+            None,
+        )
+
+    # mulliken: run the per-fragment single-shell Mulliken cut and union.
+    # ``n_virtual`` is the per-FRAGMENT ceiling here (additivity: each fragment
+    # gets its own shell, matched to the monomer leg's cut), not a global cap.
+    return (
+        per_fragment_mulliken_selector(overlap, groups, max_virtual_per_fragment=cfg.n_virtual),
+        None,
+        None,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -554,236 +885,44 @@ class EmbeddingWorkflow(BaseSettings):
     def _diis_extrapolate(
         residuals: list[np.ndarray], outputs: list[np.ndarray]
     ) -> np.ndarray | None:
-        """Pulay/DIIS extrapolation of the density-feedback fixed point.
-
-        Standard DIIS: find coefficients ``c`` (summing to 1) minimising
-        ``|| sum_i c_i * residuals[i] ||``, by solving the bordered linear system
-
-            [B  -1] [c]   [0]
-            [-1  0] [λ] = [-1]
-        Returns ``None`` (caller falls back to linear mixing) if ``B`` is
-        singular -- expected once residuals shrink toward linear dependence
-        near convergence, and routine if two cycles happen to produce
-        near-identical residuals.
-        """
-        n = len(residuals)
-        b = np.empty((n + 1, n + 1))
-        for i, ri in enumerate(residuals):
-            for j, rj in enumerate(residuals):
-                b[i, j] = float(np.vdot(ri, rj).real)
-        b[:n, n] = -1.0
-        b[n, :n] = -1.0
-        b[n, n] = 0.0
-        rhs = np.zeros(n + 1)
-        rhs[n] = -1.0
-        try:
-            coeffs = np.linalg.solve(b, rhs)[:n]
-        except np.linalg.LinAlgError:
-            return None
-        return sum(c * o for c, o in zip(coeffs, outputs))
+        """Pulay/DIIS extrapolation; see :func:`diis_extrapolate`."""
+        return diis_extrapolate(residuals, outputs)
 
     def _maybe_reseed(self, solver, cycle: int) -> None:
         """Advance the SQD seed each cycle unless the subspace is carried over.
 
         Only SQDSolver has a ``seed``; FCI is deterministic and ignores this.
-        With ``reseed_sqd`` the seed is bumped per cycle so each iteration draws a
+        With ``reseed_sqd`` the seed advances per cycle so each iteration draws a
         fresh sampled subspace; without it the seed is held so the subspace is
         reused (frozen at the cycle-0 density).
+
+        Assigns :func:`seed_for_cycle`'s *absolute* value rather than bumping
+        ``solver.seed`` in place.  Same sequence, but now a pure function of
+        ``(self.seed, cycle)``, so an out-of-process driver reproduces the schedule
+        from the cycle index alone.  Note it must read ``self.seed`` (the configured
+        base), never ``solver.seed`` (already advanced) -- otherwise the triangular
+        accumulation happens twice.
         """
         if cycle == 0 or not hasattr(solver, "seed"):
             return
         if self.reseed_sqd and solver.seed is not None:
-            solver.seed = solver.seed + cycle
+            solver.seed = seed_for_cycle(self.seed, cycle, reseed=self.reseed_sqd)
 
     # ---------------- construction ---------------- #
     def _build_adapter(self, *, parallel: bool) -> ProjectionEmbeddingAdapter:
         """Set up ProjectionEmbedding exactly as the EmbASI PySCF example does."""
-        import pyscf
-        from embasi.embedding import ProjectionEmbedding
-        from pyscf.pbc.tools.pyscf_ase import PySCF, ase_atoms_to_pyscf
-
-        atoms, charge = self._build_atoms()
-
-        # Embedding mask: 1 = high-level, 2 = low-level.
-        embed_mask = len(atoms) * [2]
-        for idx in self.active_atoms:
-            embed_mask[idx] = 1
-
-        # ProjectionEmbedding requires embed_mask sorted so that region 1 atoms
-        # come first; reorder atoms to match before building the PySCF Mole so
-        # the two stay in sync.
-        idx_list = np.argsort(embed_mask)
-        sort_embed_mask = np.sort(embed_mask)
-        atoms = atoms[idx_list]
-
-        # TODO(embasi-api): the charge is set on the PySCF Mole (which needs it to
-        # get nelec right), but ProjectionEmbedding is handed only the ASE Atoms and
-        # exposes no charge argument, so its own low-level SCF may still assume a
-        # neutral system.  ASK: accept a charge (or read it off the ASE Atoms'
-        # initial_charges).  Until that is confirmed against a live EmbASI, treat
-        # non-zero-charge embedding runs as unvalidated.
-        _check_shell_consistency(self.spin, self.unrestricted)
-        mol = pyscf.M(
-            atom=ase_atoms_to_pyscf(atoms),
-            basis=self.basis,
-            charge=charge,
-            spin=self.spin,
-        )
-        # A non-zero spin needs an unrestricted low level; PySCF's UKS carries the
-        # spin axis EmbASI already threads through SPADE (n_spins > 1).
-        if self.spin != 0 or self.unrestricted:
-            mf_ll = mol.UKS(xc=self.xc_ll)
-            mf_hl = mol.UKS(xc=self.xc_hl)
-        else:
-            mf_ll = mol.KS(xc=self.xc_ll)
-            mf_hl = mol.KS(xc=self.xc_hl)
-
-        projection = ProjectionEmbedding(
-            atoms,
-            embed_mask=sort_embed_mask,
-            calc_base_ll=PySCF(method=mf_ll),
-            calc_base_hl=PySCF(method=mf_hl),
-            projection="level-shift",
-            parallel=parallel,
-        )
-        # PySCFIntegrals wraps the *same* mf_hl object, so veff_hl undoes exactly
-        # what EmbASI folded into F_emb, whether that is KS or HF.
-        density_fit: bool | str = self.df_auxbasis or self.density_fit
-        integrals = PySCFIntegrals(mf_hl, density_fit=density_fit)
-        return ProjectionEmbeddingAdapter(
-            projection, integrals, mu=self.mu, unrestricted=self.unrestricted
-        )
+        return build_adapter(self, parallel=parallel)
 
     def _build_atoms(self) -> tuple[Any, int]:
         """Return ``(ase.Atoms, charge)`` for the requested geometry source."""
-        if self.xyz is not None:
-            from embasi_qiskit_integration.molecule import geometry
-
-            atoms, charge, _smiles = geometry.read_atoms_from_xyz(
-                self.xyz, charge_override=self.charge
-            )
-            return atoms, charge
-
-        from ase.data.s22 import create_s22_system, s26
-
-        atoms = create_s22_system(s26[self.s26_index])
-        if self.n_atoms is not None:
-            atoms = atoms[: self.n_atoms]
-        return atoms, self.charge or 0
+        return build_atoms(self)
 
     def _build_selector(self, emb: ProjectionEmbeddingAdapter, *, log=None):
         """Build the active-virtual shaping hook from ``self.selector``.
 
-        Returns a ``(selector, virtual_localizer, orbital_builder)`` triple with at
-        most one non-None (all ``None`` for the fixed ``--n_virtual`` cut):
-
-        * ``mulliken`` -> a ``Selector`` (per-fragment single-shell Mulliken cut),
-        * ``spade`` -> a ``VirtualLocalizer`` (SPADE rotation + σ² gap cut),
-        * ``concentric-cl`` -> a ``VirtualLocalizer`` (iterative CL, ``n_shells``),
-        * ``apc-concentric`` -> an ``orbital_builder`` (``emb -> EmbeddedOrbitals``):
-          CL locality pre-filter then APC ranking, see
-          ``ProjectionEmbeddingAdapter.build_orbitals_apc_concentric``,
-        * ``none`` -> ``(None, None, None)``.
-
-        A rotation cannot be expressed as a column-index ``Selector``, so ``spade``
-        and ``concentric-cl`` go through the ``build_orbitals(virtual_localizer=...)``
-        hook instead, anchored on the fragment UNION (a rotation cannot be unioned
-        per-fragment the way index selection can); ``apc-concentric`` needs a full
-        ``EmbeddedOrbitals`` (it calls ``build_orbitals`` itself, then re-selects),
-        so it returns a third kind of hook the caller invokes directly on ``emb``.
-
-        After the atom reorder in ``_build_adapter`` the region-1 (active) atoms
-        occupy the first ``len(active_atoms)`` positions of ``mol``, so the
-        fragment AO indices come straight from the leading atom slices.
+        See :func:`build_selector`, which this delegates to.
         """
-        if self.selector == "none":
-            return None, None, None
-        from embasi_qiskit_integration.selectors import (
-            concentric_localization_selector,
-            fragment_ao_indices,
-            per_fragment_mulliken_selector,
-            spade_virtual_selector,
-        )
-
-        mol = emb.ints.mol
-        # run_low_level() (called before this) populates the overlap and F_emb; assert
-        # for the type-checker and to fail loudly if the call order is ever broken.
-        assert emb._s is not None, "run_low_level() must run before _build_selector()"
-        overlap = emb._s
-        # Reordered active-atom positions lead, ascending: 0..len(active_atoms)-1.
-        # Partition them into PHYSICAL fragments per ``active_fragment_sizes`` (one
-        # group by default).
-        n_active = len(self.active_atoms)
-        sizes = self.active_fragment_sizes or [n_active]
-        if sum(sizes) != n_active:
-            raise ValueError(
-                f"active_fragment_sizes {sizes} sum to {sum(sizes)}, but there are "
-                f"{n_active} active atoms"
-            )
-        groups, start = [], 0
-        for sz in sizes:
-            positions = list(range(start, start + sz))
-            groups.append(fragment_ao_indices(mol, positions))
-            start += sz
-
-        if self.selector in ("spade", "concentric-cl", "apc-concentric"):
-            # A rotation cannot be unioned per-fragment the way index selection can,
-            # so all three localisers anchor on the UNION of the fragment AOs.
-            frag_union = np.unique(np.concatenate(groups)) if groups else np.empty(0, int)
-            if self.selector == "spade":
-                # ``n_virtual`` caps the kept rotated shell.
-                return (
-                    None,
-                    spade_virtual_selector(overlap, frag_union, max_virtual=self.n_virtual),
-                    None,
-                )
-            assert emb._fock is not None, "run_low_level() must run before _build_selector()"
-            if self.selector == "apc-concentric":
-                if self.apc_max_size is None:
-                    raise ValueError(
-                        "--selector apc-concentric requires --apc_max_size (nelec,norb)"
-                    )
-                n_shells, max_size, fixed = self.n_shells, self.apc_max_size, self.apc_fixed
-
-                def _orbital_builder(
-                    emb, frag=frag_union, n_shells=n_shells, max_size=max_size, fixed=fixed
-                ):
-                    return emb.build_orbitals_apc_concentric(
-                        fragment_ao=frag, n_shells=n_shells, max_size=max_size, fixed=fixed
-                    )
-
-                return None, None, _orbital_builder
-            # concentric-cl: the shell count sets the physically-motivated k; if
-            # ``n_virtual`` is given it is a solver-budget CEILING on top of that
-            # (for small simulations), truncating the outermost shell tail -- not a
-            # replacement for the shell structure.
-            if self.n_virtual is not None and log is not None:
-                log(
-                    f"   [selector] concentric-cl: capping the shell-determined virtuals "
-                    f"at n_virtual={self.n_virtual} (solver budget)"
-                )
-            return (
-                None,
-                concentric_localization_selector(
-                    overlap,
-                    frag_union,
-                    emb._fock,
-                    n_shells=self.n_shells,
-                    max_virtual=self.n_virtual,
-                ),
-                None,
-            )
-
-        # mulliken: run the per-fragment single-shell Mulliken cut and union.
-        # ``n_virtual`` is the per-FRAGMENT ceiling here (additivity: each fragment
-        # gets its own shell, matched to the monomer leg's cut), not a global cap.
-        return (
-            per_fragment_mulliken_selector(
-                overlap, groups, max_virtual_per_fragment=self.n_virtual
-            ),
-            None,
-            None,
-        )
+        return build_selector(self, emb, log=log)
 
     def _build_solver(self):
         from embasi_qiskit_integration.solvers import FCISolver, SQDSolver
