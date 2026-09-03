@@ -38,10 +38,13 @@ class FCISolver(ActiveSpaceSolver):
         norb = ham.norb
         e, ci = fci.direct_spin1.kernel(ham.h1, ham.h2, norb, ham.nelec)
         rdm1, rdm2 = fci.direct_spin1.make_rdm12(ci, norb, ham.nelec)
+        rdm1a, rdm1b = fci.direct_spin1.make_rdm1s(ci, norb, ham.nelec)
         return SolverResult(
             energy=e + ham.e_core,
             rdm1=np.asarray(rdm1),
             rdm2=np.asarray(rdm2),
+            rdm1a=np.asarray(rdm1a),
+            rdm1b=np.asarray(rdm1b),
             diagnostics={"solver": "pyscf-fci"},
         )
 
@@ -52,6 +55,10 @@ def _rhf_from_integrals(ham: EmbeddedHamiltonian):
     Follows the custom-Hamiltonian route: a bare ``Mole`` with the electron
     count set, overridden ``get_hcore``/``get_ovlp``/``energy_nuc`` and the
     two-electron integrals injected via ``_eri`` (8-fold packed).
+
+    Restricted: this seeds the deferred LUCJ ansatz only. An open-shell ``nelec`` sets
+    ``mol.spin`` and PySCF will dispatch accordingly, but the resulting amplitudes are
+    not validated for that case -- see the LUCJ note in the module docstring.
     """
     from pyscf import ao2mo, gto, scf
 
@@ -76,8 +83,8 @@ def _rhf_from_integrals(ham: EmbeddedHamiltonian):
 def cheap_ccsd_t2(ham: EmbeddedHamiltonian) -> np.ndarray:
     """RHF + CCSD on the bare integrals, returning the t2 amplitudes.
 
-    Used to seed the LUCJ ansatz (Phase 4). The active space is treated as a
-    closed/open shell as implied by ``nelec``.
+    Used to seed the LUCJ ansatz (Phase 4), which is on hold; this stays
+    closed-shell, matching :func:`_rhf_from_integrals`'s restricted reference.
     """
     from pyscf import cc
 
@@ -138,6 +145,8 @@ class SQDSolver(ActiveSpaceSolver):
         time_limit: float = 10.0,
         canonical_permutation: bool = False,
         workers: int = 1,
+        symmetrize_spin: bool | None = None,
+        spin_sq: float | None = None,
     ):
         self.sampler = sampler
         self.shots = shots
@@ -158,6 +167,12 @@ class SQDSolver(ActiveSpaceSolver):
         # pass-manager run per randomization. See build_sqdrift_circuits.
         self.canonical_permutation = canonical_permutation
         self.workers = workers
+        # None -> run_sqd derives it from the sector (an open shell must not merge the
+        # alpha/beta CI pools).  Forwarded verbatim so an explicit choice still wins.
+        self.symmetrize_spin = symmetrize_spin
+        # Target S(S+1). None (default) imposes no projection: nelec fixes Sz, not S, so
+        # set this when a wrong-multiplicity state could lie below the intended one.
+        self.spin_sq = spin_sq
         self._permutations: list[list[int] | None] = []
 
     def solve(self, ham: EmbeddedHamiltonian) -> SolverResult:
@@ -178,6 +193,8 @@ class SQDSolver(ActiveSpaceSolver):
             samples_per_batch=self.samples_per_batch,
             num_batches=self.num_batches,
             max_iterations=self.max_iterations,
+            symmetrize_spin=self.symmetrize_spin,
+            spin_sq=self.spin_sq,
             seed=self.seed,
         )
         res.diagnostics.update(

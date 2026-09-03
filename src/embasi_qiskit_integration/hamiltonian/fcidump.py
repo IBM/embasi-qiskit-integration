@@ -9,16 +9,20 @@ We therefore write a ``.npz`` sidecar with the same stem that carries ``e_core``
 ``nelec`` and ``meta`` authoritatively; the FCIDUMP remains the source of truth
 for the integrals themselves.
 
-``MS2`` is written unsigned, as the ecosystem expects, so it pins ``|n_alpha -
-n_beta|`` but not which spin is in excess. A sidecar-less read therefore recovers
-the split exactly for a closed shell and *refuses to guess* for an open one,
-rather than silently returning the alpha-rich reading (see
-:func:`_nelec_from_header`).
+``MS2`` is written **signed** (``n_alpha - n_beta``), so the header alone pins the spin
+sector unambiguously.  Note that PySCF's ``write_head`` derives an *unsigned* ``MS2``
+when handed an ``(na, nb)`` tuple, so :func:`write` passes the total electron count plus
+an explicit signed ``ms`` instead.
+
+A sidecar-less read of a file written *elsewhere* may still carry an unsigned ``MS2``, in
+which case a positive value is genuinely ambiguous; :func:`_nelec_from_header` reads it as
+alpha-rich and warns, rather than refusing every open-shell file that lacks a sidecar.
 """
 
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -30,11 +34,21 @@ def _sidecar_path(path: str | Path) -> Path:
     return Path(path).with_suffix(".npz")
 
 
-def write(ham: EmbeddedHamiltonian, path: str | Path) -> None:
+def write(ham: EmbeddedHamiltonian, path: str | Path, *, signed_ms2: bool = True) -> None:
     """Write ``ham`` to a FCIDUMP file at ``path`` plus a ``.npz`` sidecar.
 
     The integrals go into the FCIDUMP; ``e_core``, ``nelec`` and ``meta`` go
     into ``<stem>.npz`` so metadata survives the round-trip losslessly.
+
+    Args:
+        signed_ms2: write ``MS2 = n_alpha - n_beta`` (default), which pins the spin
+            sector so the header alone round-trips exactly.  Set ``False`` for the
+            unsigned ``|n_alpha - n_beta|`` the wider ecosystem expects -- notably
+            ``qiskit_fermions``' ``FCIDump.from_file``, whose Rust header parse
+            *panics* (not raises) on a negative value.  The internal temp file in
+            :mod:`~embasi_qiskit_integration.circuit_generator.operator` therefore
+            writes unsigned; that path takes ``nelec`` from the live ``ham`` and never
+            re-reads it from the header, so no spin information is lost.
     """
     from pyscf.tools import fcidump as pyscf_fcidump
 
@@ -46,8 +60,9 @@ def write(ham: EmbeddedHamiltonian, path: str | Path) -> None:
         ham.h1,
         ham.h2,
         norb,
-        (na, nb),
+        na + nb,
         nuc=ham.e_core,
+        ms=(na - nb) if signed_ms2 else abs(na - nb),
     )
 
     meta_json = json.dumps(ham.meta, default=_json_default)
@@ -92,35 +107,44 @@ def read(path: str | Path) -> EmbeddedHamiltonian:
 
 
 def _nelec_from_header(nelec_total: int, ms2: int, path: Path) -> tuple[int, int]:
-    """``(NELEC, MS2)`` -> ``(n_alpha, n_beta)``, taking MS2 as ``n_alpha - n_beta``.
+    """``(NELEC, MS2)`` -> ``(n_alpha, n_beta)``, taking ``MS2`` as ``n_alpha - n_beta``.
 
-    ``MS2`` is conventionally written unsigned (see :func:`write`), so a non-zero
-    value is genuinely ambiguous: ``MS2=1`` with ``NELEC=3`` fits both ``(2, 1)``
-    and ``(1, 2)``. Rather than silently assume the alpha-rich reading -- which
-    would return the wrong spin sector for half of all open-shell inputs, with a
-    plausible-looking energy and nothing to flag it -- this raises and points at the
-    sidecar that records the split authoritatively.
+    :func:`write` emits a **signed** ``MS2``, so a file from this module round-trips
+    exactly through the header alone, with no sidecar needed.  ``MS2`` is taken at face
+    value in both directions.
 
-    A negative ``MS2`` is accepted (some writers do emit one) and taken at face
-    value, since it is then unambiguous.
+    The residual ambiguity is external: much of the ecosystem (PySCF's own
+    ``write_head`` among them) writes ``MS2`` unsigned, and a positive value from such
+    a writer could equally mean the beta-rich sector.  We cannot tell the two apart
+    from the header, so a positive ``MS2`` is read as alpha-rich -- the near-universal
+    convention -- and the caller is warned, since the alternative (refusing every
+    open-shell file lacking a sidecar, including our own) is worse.  Pass the sidecar,
+    or construct the Hamiltonian directly, when the producer is known to write
+    unsigned and the system is beta-rich.
     """
     if ms2 == 0:
         # Closed shell (or an equal-spin open shell): unambiguous.
         return (nelec_total // 2, nelec_total - nelec_total // 2)
 
-    if ms2 < 0:
-        na = (nelec_total + ms2) // 2
-        return (na, nelec_total - na)
+    if abs(ms2) > nelec_total or (nelec_total - ms2) % 2 != 0:
+        raise ValueError(
+            f"{path.name} has an inconsistent header: MS2={ms2} cannot be "
+            f"n_alpha - n_beta for NELEC={nelec_total} (needs |MS2| <= NELEC and "
+            "NELEC - MS2 even)."
+        )
 
-    alpha_rich = (nelec_total + ms2) // 2
-    raise ValueError(
-        f"{path.name} has MS2={ms2} (NELEC={nelec_total}) and no .npz sidecar, so the "
-        f"(n_alpha, n_beta) split is ambiguous: both ({alpha_rich}, "
-        f"{nelec_total - alpha_rich}) and ({nelec_total - alpha_rich}, {alpha_rich}) "
-        "match this header, because MS2 is written unsigned. Provide the sidecar "
-        f"({_sidecar_path(path).name}, written by this module's `write`), or construct "
-        "the EmbeddedHamiltonian directly with the intended nelec."
-    )
+    na = (nelec_total + ms2) // 2
+    if ms2 > 0:
+        warnings.warn(
+            f"{path.name} has MS2={ms2} and no .npz sidecar; reading it as the "
+            f"alpha-rich sector ({na}, {nelec_total - na}). This module writes MS2 "
+            "signed, so its own files are exact -- but a writer that emits MS2 "
+            "unsigned (PySCF's from_integrals with an (na, nb) tuple, among others) "
+            f"would produce the same header for ({nelec_total - na}, {na}). Pass the "
+            "sidecar or build the EmbeddedHamiltonian directly if that is the case.",
+            stacklevel=3,
+        )
+    return (na, nelec_total - na)
 
 
 def _json_default(obj: object) -> object:
