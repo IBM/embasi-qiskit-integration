@@ -113,10 +113,6 @@ def test_restore_state_preserves_dm_a_init_against_the_fresh_scf():
     zero the drift the correction measures.
     """
     source = _ran_adapter()
-    # Move the source's γ^A away from its initial value, as a feedback cycle does,
-    # so `_dm_a_init` and `_dm_a` are genuinely distinguishable.  The perturbation
-    # must preserve tr(γ^A S) -- the adapter validates it is integral -- so nudge the
-    # density by a similarity transform rather than scaling it.
     fed = _trace_preserving_nudge(source)
     source.run_low_level_a_only(dma_in=fed, dmb_in=source._dm_b)
     state = source.export_state()

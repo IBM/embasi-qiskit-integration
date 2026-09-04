@@ -602,18 +602,6 @@ class ProjectionEmbeddingAdapter:
 
         self._assemble_fock_a_only()
 
-    # ---------------- cross-process state seam ---------------- #
-    # An out-of-process embedding loop (one round per OS process, e.g. a workflow
-    # engine driving `max_cycles=1` repeatedly) cannot carry a live adapter across a
-    # round boundary: it holds a live ProjectionEmbedding and two PySCF KS objects,
-    # none of them picklable.  What it *can* carry is the handful of arrays the
-    # downfold needs.  These two methods are that seam.
-    #
-    # Deliberately not property setters: the arrays are only meaningful as a *set*
-    # (F_emb is assembled from v_emb + P_B against a specific basis and geometry), so
-    # pairing a snapshot with a mismatched adapter must be refused, not silently
-    # assembled into a wrong energy.  A fingerprint is what makes that refusal possible.
-
     _STATE_ARRAYS = ("_dm_a", "_dm_a_init", "_dm_b", "_fock", "_s", "_p_b", "_v_emb_embasi")
 
     def state_fingerprint(self) -> dict[str, Any]:
@@ -631,17 +619,10 @@ class ProjectionEmbeddingAdapter:
             "projection": str(getattr(self.p, "projection", None)),
             "unrestricted": bool(self.unrestricted),
             "mu": float(self.mu),
-            # The high-level functional and the DF setting both change what veff_hl
-            # subtracts, so a snapshot paired across a change in either assembles a
-            # wrong energy while every array keeps its shape.  Verified live: without
-            # these an xc_hl mismatch was accepted.
             "xc_hl": str(getattr(mf, "xc", None)),
             "density_fit": str(getattr(self.ints, "_density_fit", None)),
         }
         if mol is not None:
-            # Round coordinates before hashing: PySCF stores them in bohr as floats,
-            # and a re-read geometry can differ in the last bit without being a
-            # different molecule.
             coords = np.round(np.asarray(mol.atom_coords(), dtype=float), 8)
             fingerprint["basis"] = str(mol.basis)
             fingerprint["natm"] = int(mol.natm)
@@ -720,20 +701,8 @@ class ProjectionEmbeddingAdapter:
         state: dict[str, Any] = {
             name.lstrip("_"): np.asarray(getattr(self, name)) for name in self._STATE_ARRAYS
         }
-        # The ghosted-subsystem-A footing and the two low-level energies are the only
-        # things `projection_energy` reads off the *live* ProjectionEmbedding
-        # (`_a_fragment_footing` reaches through `A_LL.atoms.calc.mol`;
-        # `_low_level_energies` reads EmbASI's own scalars).  Both reduce to one array
-        # and three scalars, so exporting them is what lets a separate process assemble
-        # the energy from a snapshot alone -- no live EmbASI, no second SCF.
         hcore_a, enuc_a = self._a_fragment_footing()
         e_low_ab, e_low_a = self._low_level_energies()
-        # `v_emb` (and `h_emb`) are exported as arrays rather than left to be rebuilt
-        # downstream: the adapter's `v_emb` is `h_emb - hcore - P_B` and `h_emb` needs
-        # `veff_hl(gamma^A)`, i.e. a live PySCF mean field.  It also uses a *different
-        # convention* from EmbASI's exported `_v_emb_embasi` (which omits subsystem A's
-        # nuclear-electron term), so a consumer reconstructing it from the snapshot is
-        # one convention slip away from a silently wrong energy.
         state["v_emb"] = np.asarray(self.v_emb)
         state["h_emb"] = np.asarray(self.h_emb)
         state["hcore_a"] = np.asarray(hcore_a)
@@ -778,8 +747,6 @@ class ProjectionEmbeddingAdapter:
         if strict:
             self._check_fingerprint(state)
 
-        # nao is checked even when not strict: a shape mismatch is not a judgement
-        # call, it is an array that cannot be contracted with this adapter's.
         nao = int(np.asarray(self.ints.overlap()).shape[-1])
         for name, arr in arrays.items():
             if arr.shape[-2:] != (nao, nao):

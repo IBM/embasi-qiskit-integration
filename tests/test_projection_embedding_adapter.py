@@ -540,16 +540,6 @@ def test_restricted_span_reproduces_full_basis_orbitals(adapter):
         assert np.allclose(gram, np.eye(gram.shape[0]), atol=1e-8)
 
 
-# --------------------------------------------------------------------------- #
-# The cross-process state seam, against live EmbASI.
-#
-# ``tests/test_state_roundtrip.py`` pins export/restore against the partitioned-RHF
-# mock (no EmbASI).  These two go further and pin it against the real thing, because
-# the mock cannot exercise what actually makes the seam necessary: EmbASI's A_LL
-# one-electron blocks live outside this repo and are only populated by an SCF, which
-# is why ``restore_state`` must be called *after* a fresh ``run_low_level`` rather
-# than instead of one.
-# --------------------------------------------------------------------------- #
 def test_restore_state_reproduces_the_live_downfold():
     """A restored snapshot reassembles ``F_emb`` bit-identically on real EmbASI.
 

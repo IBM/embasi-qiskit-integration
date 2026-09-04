@@ -228,12 +228,6 @@ class EmbeddingSetup(Protocol):
     fields stay private to :class:`EmbeddingWorkflow`, which owns that loop.
     """
 
-    # Declared as read-only properties rather than plain attributes: a mutable
-    # Protocol attribute is *invariant*, which would reject ``EmbeddingWorkflow``
-    # itself (its ``selector`` is a narrower ``Literal[...]`` and its ``xyz`` a
-    # ``Path``).  The builders only ever read these, so read-only is both accurate
-    # and what makes the structural match work.
-
     # geometry source (build_atoms)
     @property
     def xyz(self) -> Any: ...
@@ -277,18 +271,6 @@ class EmbeddingSetup(Protocol):
     def apc_max_size(self) -> tuple[int, int] | None: ...
     @property
     def apc_fixed(self) -> Any: ...
-
-
-# --------------------------------------------------------------------------- #
-# Module-level construction seams.
-#
-# These three were private methods on the CLI ``BaseSettings``.  They are pure
-# construction -- they read settings and return an adapter/selector -- so they are
-# module-level functions taking an :class:`EmbeddingSetup`, and the
-# ``EmbeddingWorkflow`` methods are one-line delegations.  An external driver can
-# then reuse the *exact* construction (including the atom reorder, the
-# region-1-first mask and the open-shell guard) as public API, rather than
-# reaching into privates or reimplementing it and drifting.
 
 
 def build_atoms(cfg: EmbeddingSetup) -> tuple[Any, int]:
@@ -401,13 +383,8 @@ def build_selector(cfg: EmbeddingSetup, emb: ProjectionEmbeddingAdapter, *, log=
     )
 
     mol = emb.ints.mol
-    # run_low_level() (called before this) populates the overlap and F_emb; assert
-    # for the type-checker and to fail loudly if the call order is ever broken.
     assert emb._s is not None, "run_low_level() must run before _build_selector()"
     overlap = emb._s
-    # Reordered active-atom positions lead, ascending: 0..len(active_atoms)-1.
-    # Partition them into PHYSICAL fragments per ``active_fragment_sizes`` (one
-    # group by default).
     n_active = len(cfg.active_atoms)
     sizes = cfg.active_fragment_sizes or [n_active]
     if sum(sizes) != n_active:
@@ -422,11 +399,8 @@ def build_selector(cfg: EmbeddingSetup, emb: ProjectionEmbeddingAdapter, *, log=
         start += sz
 
     if cfg.selector in ("spade", "concentric-cl", "apc-concentric"):
-        # A rotation cannot be unioned per-fragment the way index selection can,
-        # so all three localisers anchor on the UNION of the fragment AOs.
         frag_union = np.unique(np.concatenate(groups)) if groups else np.empty(0, int)
         if cfg.selector == "spade":
-            # ``n_virtual`` caps the kept rotated shell.
             return (
                 None,
                 spade_virtual_selector(overlap, frag_union, max_virtual=cfg.n_virtual),
