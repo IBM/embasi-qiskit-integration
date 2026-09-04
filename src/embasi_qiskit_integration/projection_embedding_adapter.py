@@ -683,7 +683,7 @@ class ProjectionEmbeddingAdapter:
             "mf_hl_max_cycle": getattr(mf, "max_cycle", None),
         }
         try:
-            e_low_a, e_low_total = self._low_level_energies()
+            e_low_total, e_low_a = self._low_level_energies()
             diagnostics["e_low_A"] = e_low_a
             diagnostics["e_low_total"] = e_low_total
         except Exception:  # noqa: BLE001 -- diagnostics must never break a run

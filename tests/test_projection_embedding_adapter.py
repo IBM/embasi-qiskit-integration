@@ -291,6 +291,34 @@ def test_projection_energy_reads_embasi_low_level(adapter, orbitals_full):
 
 
 # --------------------------------------------------------------------------- #
+# Diagnostics -- the low-level energies must not be reported swapped.
+# --------------------------------------------------------------------------- #
+def test_low_level_diagnostics_do_not_swap_the_two_energies(adapter):
+    """``low_level_diagnostics`` must label E_low(A) and E_low(AB) the same way
+    ``export_state`` does.
+    """
+    diagnostics = adapter.low_level_diagnostics()
+    state = adapter.export_state()
+
+    # (a) The two readers of the same call must agree.
+    assert diagnostics["e_low_A"] == pytest.approx(float(state["e_low_a"]), abs=1e-12)
+    assert diagnostics["e_low_total"] == pytest.approx(float(state["e_low_total"]), abs=1e-12)
+
+    # (b) Both must match the converted EmbASI internals, by name.
+    from embasi_qiskit_integration.projection_embedding_adapter import _EV2HA
+
+    p = adapter.p
+    expected_ab = float(np.real(p.subsys_AB_lowlvl_scftotalen)) * _EV2HA
+    expected_a = float(np.real(p.subsys_A_lowlvl_totalen)) * _EV2HA
+    assert diagnostics["e_low_A"] == pytest.approx(expected_a, abs=1e-12)
+    assert diagnostics["e_low_total"] == pytest.approx(expected_ab, abs=1e-12)
+
+    # (c) Physics: the supersystem total is BELOW the fragment energy, so a swap
+    # flips this inequality even if the values above were ever both stubbed.
+    assert diagnostics["e_low_total"] < diagnostics["e_low_A"]
+
+
+# --------------------------------------------------------------------------- #
 # PbE total energy -- the physical null test.
 # --------------------------------------------------------------------------- #
 def test_pbe_in_pbe_null_case_A_terms_reduce_to_fragment_hf_minus_pbe(adapter, orbitals_full):
@@ -628,6 +656,4 @@ def test_projection_energy_from_state_reports_a_missing_key_by_name():
     state = {k: v for k, v in adapter.export_state().items() if k != "fingerprint"}
     del state["hcore_a"]
     with pytest.raises(KeyError, match="hcore_a"):
-        projection_energy_from_state(
-            state, solver_energy=-1.0, rdm1_ao=np.asarray(adapter._dm_a)
-        )
+        projection_energy_from_state(state, solver_energy=-1.0, rdm1_ao=np.asarray(adapter._dm_a))
