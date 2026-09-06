@@ -291,6 +291,34 @@ def test_projection_energy_reads_embasi_low_level(adapter, orbitals_full):
 
 
 # --------------------------------------------------------------------------- #
+# Diagnostics -- the low-level energies must not be reported swapped.
+# --------------------------------------------------------------------------- #
+def test_low_level_diagnostics_do_not_swap_the_two_energies(adapter):
+    """``low_level_diagnostics`` must label E_low(A) and E_low(AB) the same way
+    ``export_state`` does.
+    """
+    diagnostics = adapter.low_level_diagnostics()
+    state = adapter.export_state()
+
+    # (a) The two readers of the same call must agree.
+    assert diagnostics["e_low_A"] == pytest.approx(float(state["e_low_a"]), abs=1e-12)
+    assert diagnostics["e_low_total"] == pytest.approx(float(state["e_low_total"]), abs=1e-12)
+
+    # (b) Both must match the converted EmbASI internals, by name.
+    from embasi_qiskit_integration.projection_embedding_adapter import _EV2HA
+
+    p = adapter.p
+    expected_ab = float(np.real(p.subsys_AB_lowlvl_scftotalen)) * _EV2HA
+    expected_a = float(np.real(p.subsys_A_lowlvl_totalen)) * _EV2HA
+    assert diagnostics["e_low_A"] == pytest.approx(expected_a, abs=1e-12)
+    assert diagnostics["e_low_total"] == pytest.approx(expected_ab, abs=1e-12)
+
+    # (c) Physics: the supersystem total is BELOW the fragment energy, so a swap
+    # flips this inequality even if the values above were ever both stubbed.
+    assert diagnostics["e_low_total"] < diagnostics["e_low_A"]
+
+
+# --------------------------------------------------------------------------- #
 # PbE total energy -- the physical null test.
 # --------------------------------------------------------------------------- #
 def test_pbe_in_pbe_null_case_A_terms_reduce_to_fragment_hf_minus_pbe(adapter, orbitals_full):
@@ -510,3 +538,112 @@ def test_restricted_span_reproduces_full_basis_orbitals(adapter):
     for orb in (orb_restricted, orb_full):
         gram = orb.coeff.T @ adapter._s @ orb.coeff
         assert np.allclose(gram, np.eye(gram.shape[0]), atol=1e-8)
+
+
+def test_restore_state_reproduces_the_live_downfold():
+    """A restored snapshot reassembles ``F_emb`` bit-identically on real EmbASI.
+
+    Two independently built adapters stand in for two OS processes: an out-of-process
+    outer loop re-runs the supersystem SCF each round (nothing else can populate
+    A_LL), then restores the carried ``v_emb``/``P_B``/densities over it.  If this
+    drifted, every round after the first would downfold a subtly different
+    Hamiltonian and the loop's trajectory would move for plumbing reasons rather than
+    physics ones.
+
+    Measured 0.0 here (the supersystem SCF is bit-reproducible on this system), which
+    is a bonus rather than the guarantee -- the promise is agreement to SCF
+    convergence tolerance, and a larger or density-fitted case may only reach that.
+    """
+    source = _build_adapter()
+    source.run_low_level()
+    reference = np.array(source.h_emb, copy=True)
+    state = source.export_state()
+
+    fresh = _build_adapter()
+    fresh.run_low_level()  # a fresh round's own SCF, as a new process must run
+    fresh.restore_state(state)
+
+    np.testing.assert_allclose(fresh.h_emb, reference, atol=1e-12, rtol=0.0)
+    np.testing.assert_allclose(fresh._dm_a_init, state["dm_a_init"], atol=1e-12, rtol=0.0)
+
+
+def test_restore_state_refuses_a_different_functional():
+    """A snapshot must not be paired across a change in the high-level functional.
+
+    Every array keeps its shape when ``xc_hl`` changes, so the mismatch is invisible
+    to a shape check and would assemble a plausible, wrong energy -- ``veff_hl``
+    would subtract a different functional than the one folded into the carried
+    ``v_emb``.  Regression: an earlier fingerprint omitted ``xc_hl`` and this pairing
+    was accepted.
+    """
+    source = _build_adapter(xc_hl="PBE")
+    source.run_low_level()
+    state = source.export_state()
+
+    other = _build_adapter(xc_hl="PBE0")
+    other.run_low_level()
+    with pytest.raises(ValueError, match="does not match this adapter"):
+        other.restore_state(state)
+
+
+def test_projection_energy_from_state_matches_the_live_assembly():
+    """The out-of-process energy assembly must reproduce the in-process one exactly.
+
+    ``projection_energy`` reads the live ``ProjectionEmbedding`` for two things -- the
+    ghosted-subsystem-A footing and EmbASI's low-level energies -- and ``export_state``
+    carries both, so a separate process can assemble the same energy from a snapshot.
+    This pins that it *is* the same energy, term by term.
+
+    The footing shift is why this matters rather than being a convenience: it is ~3.8 Ha
+    here, it enters ``e_high_A``, and the outer loop converges on the density while
+    carrying any error in the energy -- so a reimplementation that got the ``v_emb``
+    convention wrong (EmbASI's ``_v_emb_embasi`` omits subsystem A's nuclear-electron
+    term; the adapter's ``v_emb`` does not) would produce a plausible, wrong total with
+    no other symptom.
+    """
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        projection_energy_from_state,
+    )
+    from embasi_qiskit_integration.solvers import FCISolver
+
+    adapter = _build_adapter()
+    adapter.run_low_level()
+    orbitals = adapter.build_orbitals(n_frozen_occ=0, n_virtual=None)
+    result = FCISolver().solve(adapter.embedded_hamiltonian(orbitals))
+
+    live = adapter.projection_energy(result, orbitals)
+    # Round-trip the snapshot through an .npz, which is how it actually travels (and
+    # without allow_pickle, as a consumer reading another process's file should).
+    state = {k: v for k, v in adapter.export_state().items() if k != "fingerprint"}
+    from_state = projection_energy_from_state(
+        state,
+        solver_energy=result.energy,
+        rdm1_ao=adapter.rdm1_ao(result.rdm1, orbitals),
+    )
+
+    for term in (
+        "e_low_total",
+        "e_low_A",
+        "e_high_A",
+        "correction",
+        "projector_leak",
+        "footing_shift",
+        "total",
+    ):
+        assert getattr(from_state, term) == pytest.approx(getattr(live, term), abs=1e-12), term
+    # The shift is genuinely large here, so the agreement above is a real test of it.
+    assert abs(live.footing_shift) > 1.0
+
+
+def test_projection_energy_from_state_reports_a_missing_key_by_name():
+    """A snapshot that did not come from ``export_state`` must fail clearly."""
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        projection_energy_from_state,
+    )
+
+    adapter = _build_adapter()
+    adapter.run_low_level()
+    state = {k: v for k, v in adapter.export_state().items() if k != "fingerprint"}
+    del state["hcore_a"]
+    with pytest.raises(KeyError, match="hcore_a"):
+        projection_energy_from_state(state, solver_energy=-1.0, rdm1_ao=np.asarray(adapter._dm_a))
