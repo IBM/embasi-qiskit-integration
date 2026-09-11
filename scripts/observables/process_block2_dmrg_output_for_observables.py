@@ -443,7 +443,7 @@ def build_parser():
                    metavar="DIR",
                    help="the DMRG run folder holding dmrg_scratch/ and "
                         "dmrg_rundir/ as siblings. The RDMs, FCIDUMP, dmrg.e "
-                        "and the geometry/MO/basis inputs for 030 are all "
+                        "and the geometry/MO/basis inputs for compute_observables.py are all "
                         "discovered from it. The scratch dir or the run dir "
                         "itself are also accepted. (--dmrg-dir is an alias; "
                         f"default: {DEF_DMRG_DIR})")
@@ -466,13 +466,13 @@ def build_parser():
                    help="energies in Ha, overriding the discovered energy file: comma "
                         "list, text file, or npz")
     p.add_argument("--geom", default=None,
-                   help="geometry .xyz to record for 030 (default: the single "
+                   help="geometry .xyz to record for compute_observables.py (default: the single "
                         ".xyz found in the run folder)")
     p.add_argument("--mo", default=None,
-                   help="MO-coefficient npz to record for 030 (default: the "
+                   help="MO-coefficient npz to record for compute_observables.py (default: the "
                         "*natorb*.npz found in the run folder)")
     p.add_argument("--basis", default=None,
-                   help="basis set name to record for 030 (default: inferred "
+                   help="basis set name to record for compute_observables.py (default: inferred "
                         "from the run folder name)")
     p.add_argument("--out-prefix", default=DEF_OUT_PREFIX,
                    help=f"output file prefix (default: {DEF_OUT_PREFIX})")
@@ -696,7 +696,7 @@ def main(argv=None):
         log(f"WARNING: {e_states.size} energies for {len(roots)} roots; "
             "excitation energies will be incomplete downstream")
 
-    section("Molecule inputs for 030")
+    section("Molecule inputs for compute_observables")
     search = [d for d in (top_dir, run_dir, rdm_dir) if d]
     geom = args.geom
     if geom:
@@ -711,7 +711,7 @@ def main(argv=None):
                 log(f"  NOTE: several .xyz present ({', '.join(multi)}); using "
                     "the first. Pass --geom to choose.")
         else:
-            log("Geometry     : not found -- pass --geom, or give 030 its own "
+            log("Geometry     : not found -- pass --geom, or give compute_observables its own "
                 "--geom")
 
     mo = args.mo
@@ -724,7 +724,7 @@ def main(argv=None):
         if mo:
             log(f"MO coeff     : {mo}  [found]")
         else:
-            log("MO coeff     : not found -- pass --mo, or give 030 its own --mo")
+            log("MO coeff     : not found -- pass --mo, or give compute_observables its own --mo")
 
     basis = args.basis
     if basis:
@@ -736,7 +736,7 @@ def main(argv=None):
             log("  VERIFY this matches the basis your DMRG run used -- it is a "
                 "name guess, not a value read from the output.")
         else:
-            log("Basis        : not determined -- pass --basis, or give 030 its "
+            log("Basis        : not determined -- pass --basis, or give compute_observables its "
                 "own --basis")
 
     if args.check:
@@ -814,12 +814,12 @@ def main(argv=None):
     if states_path is None:
         log("")
         log("No energy file was written, so excitation energies and wavelengths")
-        log("will be reported as zero. Add --energies to 030 to fill them in.")
+        log("will be reported as zero. Add --energies to compute_observables to fill them in.")
     if missing:
         log("")
         log(f"Could not resolve {', '.join(missing)} from the run folder -- the "
             "command above omits them,")
-        log("so 030 would fall back to its built-in example defaults. Supply "
+        log("so compute_observables would fall back to its built-in example defaults. Supply "
             "them explicitly.")
 
     manifest_path = f"{args.out_prefix}_manifest.txt"
