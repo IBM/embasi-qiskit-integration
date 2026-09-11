@@ -255,9 +255,7 @@ def read_xyz(path):
     except (IndexError, ValueError):
         raise ValueError(f"first line of {path} is not an atom count: {lines[0]!r}")
     if len(lines) < natom + 2:
-        raise ValueError(
-            f"{path}: header says {natom} atoms but file has {len(lines)} lines"
-        )
+        raise ValueError(f"{path}: header says {natom} atoms but file has {len(lines)} lines")
 
     composition, geom = {}, []
     for n in range(2, natom + 2):
@@ -284,9 +282,7 @@ def load_mo_coeff(path):
             for key in ("mo_coeff", "mo_coeffs", "mo"):
                 if key in d:
                     return np.asarray(d[key], dtype=float), key
-            raise KeyError(
-                f"{path} has no 'mo_coeff' key (found: {list(d.keys())})"
-            )
+            raise KeyError(f"{path} has no 'mo_coeff' key (found: {list(d.keys())})")
 
     with open(path, "rb") as fh:
         obj = pickle.load(fh)
@@ -309,14 +305,10 @@ def load_energies(spec, n_roots):
                         e = np.atleast_1d(np.asarray(d[key], dtype=float))
                         break
                 else:
-                    raise KeyError(
-                        f"{spec} has no 'e_states' key (found: {list(d.keys())})"
-                    )
+                    raise KeyError(f"{spec} has no 'e_states' key (found: {list(d.keys())})")
         else:
             with open(spec) as fh:
-                e = np.array(
-                    [float(ln.split()[0]) for ln in fh if ln.strip()], dtype=float
-                )
+                e = np.array([float(ln.split()[0]) for ln in fh if ln.strip()], dtype=float)
     else:
         e = np.array([float(v) for v in spec.split(",") if v.strip()], dtype=float)
 
@@ -388,8 +380,7 @@ def load_rdms_from_npz(path, n_orbs, n_roots):
         for i, dm in found.items():
             if dm.shape != (n_orbs, n_orbs):
                 raise ValueError(
-                    f"{path}['dm1_root{i}'] has shape {dm.shape}, "
-                    f"expected ({n_orbs}, {n_orbs})"
+                    f"{path}['dm1_root{i}'] has shape {dm.shape}, expected ({n_orbs}, {n_orbs})"
                 )
         return found
 
@@ -439,9 +430,7 @@ def find_rdm_dir(dmrg_dir, kind):
     """Locate the dir holding spatial_*pdm.<i>.<i>.txt (usually node0/)."""
     stem = f"spatial_{kind}"
     for cand in (os.path.join(dmrg_dir, "node0"), dmrg_dir):
-        if os.path.isdir(cand) and any(
-            f.startswith(stem) for f in os.listdir(cand)
-        ):
+        if os.path.isdir(cand) and any(f.startswith(stem) for f in os.listdir(cand)):
             return cand
     for base, dirs, files in os.walk(dmrg_dir):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
@@ -466,10 +455,9 @@ def count_npz_roots(path):
                         return int(arr.shape[0])
                     if arr.ndim == 2:
                         return 1
-            n = sum(1 for k in keys
-                    if k.startswith("dm1_root") and k[len("dm1_root"):].isdigit())
+            n = sum(1 for k in keys if k.startswith("dm1_root") and k[len("dm1_root") :].isdigit())
             return n or None
-    except Exception:
+    except (OSError, ValueError, KeyError):
         return None
 
 
@@ -488,8 +476,7 @@ def find_energies(*dirs):
     for d in dirs:
         if not d or not os.path.isdir(d):
             continue
-        for pat in ("dmrg_states*.npz", "e_states*.npz", "energies.txt",
-                    "energies.dat"):
+        for pat in ("dmrg_states*.npz", "e_states*.npz", "energies.txt", "energies.dat"):
             hits = sorted(_glob.glob(os.path.join(d, pat)))
             if hits:
                 return hits[0]
@@ -515,8 +502,8 @@ def read_fcidump_header(path):
                                     nelec = val
                 if "&END" in up or "/" == line.strip():
                     break
-    except Exception:
-        pass
+    except (OSError, ValueError) as exc:
+        log(f"  could not parse FCIDUMP header {path}: {exc}")
     return norb, nelec
 
 
@@ -526,51 +513,89 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="See the module docstring for install instructions and examples.",
     )
-    p.add_argument("--geom", default=DEF_GEOM,
-                   help=f"geometry .xyz in Angstrom (default: {DEF_GEOM})")
-    p.add_argument("--basis", default=DEF_BASIS,
-                   help=f"basis set, must match the DMRG run (default: {DEF_BASIS})")
-    p.add_argument("--mo", default=DEF_MO,
-                   help=f"MO coefficients, .npz or .pkl (default: {DEF_MO})")
-    p.add_argument("--n-elec", type=int, default=None,
-                   help=f"active electrons (default: FCIDUMP, else {DEF_N_ELEC})")
-    p.add_argument("--n-orbs", type=int, default=None,
-                   help=f"active orbitals (default: FCIDUMP, else {DEF_N_ORBS})")
-    p.add_argument("--n-roots", type=int, default=None,
-                   help="number of roots (default: from --energies, --rdm-npz, "
-                        f"or the RDM files present, else {DEF_N_ROOTS})")
-    p.add_argument("--ncore", type=int, default=None,
-                   help="frozen-core orbital count (default: nelectron//2 - n_elec//2)")
+    p.add_argument(
+        "--geom", default=DEF_GEOM, help=f"geometry .xyz in Angstrom (default: {DEF_GEOM})"
+    )
+    p.add_argument(
+        "--basis",
+        default=DEF_BASIS,
+        help=f"basis set, must match the DMRG run (default: {DEF_BASIS})",
+    )
+    p.add_argument(
+        "--mo", default=DEF_MO, help=f"MO coefficients, .npz or .pkl (default: {DEF_MO})"
+    )
+    p.add_argument(
+        "--n-elec",
+        type=int,
+        default=None,
+        help=f"active electrons (default: FCIDUMP, else {DEF_N_ELEC})",
+    )
+    p.add_argument(
+        "--n-orbs",
+        type=int,
+        default=None,
+        help=f"active orbitals (default: FCIDUMP, else {DEF_N_ORBS})",
+    )
+    p.add_argument(
+        "--n-roots",
+        type=int,
+        default=None,
+        help="number of roots (default: from --energies, --rdm-npz, "
+        f"or the RDM files present, else {DEF_N_ROOTS})",
+    )
+    p.add_argument(
+        "--ncore",
+        type=int,
+        default=None,
+        help="frozen-core orbital count (default: nelectron//2 - n_elec//2)",
+    )
 
     src = p.add_mutually_exclusive_group()
-    src.add_argument("--dmrg-dir", default=None,
-                     help="DMRG run directory; RDM files, FCIDUMP and node0/ are "
-                          f"auto-discovered inside it (default: {DEF_DMRG_DIR})")
-    src.add_argument("--rdm-dir", default=None,
-                     help="exact dir holding spatial_*pdm.<i>.<i>.txt files")
-    src.add_argument("--rdm-npz", default=None,
-                     help="npz with per-root 1-RDMs, instead of the text files")
-    p.add_argument("--rdm-kind", choices=("twopdm", "onepdm"), default=DEF_RDM_KIND,
-                   help=f"block2 RDM file type (default: {DEF_RDM_KIND})")
+    src.add_argument(
+        "--dmrg-dir",
+        default=None,
+        help="DMRG run directory; RDM files, FCIDUMP and node0/ are "
+        f"auto-discovered inside it (default: {DEF_DMRG_DIR})",
+    )
+    src.add_argument(
+        "--rdm-dir", default=None, help="exact dir holding spatial_*pdm.<i>.<i>.txt files"
+    )
+    src.add_argument(
+        "--rdm-npz", default=None, help="npz with per-root 1-RDMs, instead of the text files"
+    )
+    p.add_argument(
+        "--rdm-kind",
+        choices=("twopdm", "onepdm"),
+        default=DEF_RDM_KIND,
+        help=f"block2 RDM file type (default: {DEF_RDM_KIND})",
+    )
 
-    p.add_argument("--energies", default=None,
-                   help="total energies in Ha: comma list, text file, or .npz "
-                        "(default: any dmrg_states*.npz / energies.txt next to "
-                        "the RDMs)")
-    p.add_argument("--ct-fragments", default=None,
-                   help="'PD1:0-10,...;PD2:11-21,...' 0-based xyz atom indices "
-                        "(default: the PD1/PD2 split, applied only when the "
-                        f"geometry has {DEF_CT_NATOM} atoms)")
-    p.add_argument("--no-ct", action="store_true",
-                   help="skip the charge-transfer analysis entirely")
+    p.add_argument(
+        "--energies",
+        default=None,
+        help="total energies in Ha: comma list, text file, or .npz "
+        "(default: any dmrg_states*.npz / energies.txt next to "
+        "the RDMs)",
+    )
+    p.add_argument(
+        "--ct-fragments",
+        default=None,
+        help="'PD1:0-10,...;PD2:11-21,...' 0-based xyz atom indices "
+        "(default: the PD1/PD2 split, applied only when the "
+        f"geometry has {DEF_CT_NATOM} atoms)",
+    )
+    p.add_argument(
+        "--no-ct", action="store_true", help="skip the charge-transfer analysis entirely"
+    )
     p.add_argument("--charge", type=int, default=0, help="molecular charge (default: 0)")
-    p.add_argument("--spin", type=int, default=0,
-                   help="2S, unpaired electrons (default: 0)")
-    p.add_argument("--max-memory", type=int, default=4000,
-                   help="pyscf max_memory in MB (default: 4000)")
+    p.add_argument("--spin", type=int, default=0, help="2S, unpaired electrons (default: 0)")
+    p.add_argument(
+        "--max-memory", type=int, default=4000, help="pyscf max_memory in MB (default: 4000)"
+    )
     p.add_argument("--out-prefix", default="dmrg_obs", help="output file prefix")
-    p.add_argument("--check", action="store_true",
-                   help="validate inputs and print the setup, then stop")
+    p.add_argument(
+        "--check", action="store_true", help="validate inputs and print the setup, then stop"
+    )
     return p
 
 
@@ -662,13 +687,10 @@ def main(argv=None):
             log(f"n_roots      : {args.n_roots}   (from RDM files present)")
         else:
             args.n_roots = DEF_N_ROOTS
-            log(f"n_roots      : {args.n_roots}   (built-in default -- pass "
-                "--n-roots to override)")
+            log(f"n_roots      : {args.n_roots}   (built-in default -- pass --n-roots to override)")
     e_states = e_all[: args.n_roots] if e_all is not None else None
     if e_states is not None and len(e_states) < args.n_roots:
-        raise ValueError(
-            f"got {len(e_states)} energies but --n-roots={args.n_roots}"
-        )
+        raise ValueError(f"got {len(e_states)} energies but --n-roots={args.n_roots}")
     log(f"Active space : CAS({args.n_elec}e,{args.n_orbs}o)  n_roots={args.n_roots}")
 
     mo_coeff, mo_src = load_mo_coeff(args.mo)
@@ -684,23 +706,25 @@ def main(argv=None):
         if natom == DEF_CT_NATOM:
             ct_spec = DEF_CT_FRAGMENTS
         else:
-            log(f"CT fragments : skipped -- geometry has {natom} atoms, the "
+            log(
+                f"CT fragments : skipped -- geometry has {natom} atoms, the "
                 f"built-in PD1/PD2 split describes {DEF_CT_NATOM}. "
-                "Pass --ct-fragments to define your own.")
+                "Pass --ct-fragments to define your own."
+            )
 
     frags = parse_ct_fragments(ct_spec) if ct_spec else None
     if frags:
         src = "given" if args.ct_fragments else "PD1/PD2 default"
-        log(f"CT fragments : [{src}] "
-            + ", ".join(f"{k}({len(v)} atoms)" for k, v in frags.items()))
+        log(
+            f"CT fragments : [{src}] " + ", ".join(f"{k}({len(v)} atoms)" for k, v in frags.items())
+        )
         assigned = [i for idxs in frags.values() for i in idxs]
         if len(assigned) != len(set(assigned)):
             raise ValueError("--ct-fragments assigns an atom to two fragments")
         out_of_range = [i for i in assigned if not 0 <= i < natom]
         if out_of_range:
             raise ValueError(
-                f"--ct-fragments atom indices outside 0..{natom - 1}: "
-                f"{out_of_range[:10]}"
+                f"--ct-fragments atom indices outside 0..{natom - 1}: {out_of_range[:10]}"
             )
         n_rest = natom - len(set(assigned))
         if n_rest:
@@ -745,8 +769,7 @@ def main(argv=None):
         log("ERROR: no 1-RDMs could be loaded -- nothing to do")
         return 1
     if len(dm1_roots) < args.n_roots:
-        log(f"NOTE: {len(dm1_roots)} of {args.n_roots} roots had RDMs; "
-            "reporting only those")
+        log(f"NOTE: {len(dm1_roots)} of {args.n_roots} roots had RDMs; reporting only those")
     if e_states is None:
         log("No --energies given: excitation energies will show as 0")
         e_states = np.zeros(args.n_roots)
@@ -768,8 +791,7 @@ def main(argv=None):
     dip_cas = np.einsum("xpq,pi,qj->xij", dip_ao, mo_cas, mo_cas)
 
     mu_states = {
-        i: mu_nuc + mu_core + -np.einsum("xij,ij->x", dip_cas, dm)
-        for i, dm in dm1_roots.items()
+        i: mu_nuc + mu_core + -np.einsum("xij,ij->x", dip_cas, dm) for i, dm in dm1_roots.items()
     }
     log(f"mu_nuclear (Debye)   : {np.round(mu_nuc * AU2DEBYE, 4).tolist()}")
     log(f"mu_frozen-core (D)   : {np.round(mu_core * AU2DEBYE, 4).tolist()}")
@@ -785,11 +807,7 @@ def main(argv=None):
         de = delta_eV[iroot]
         nm = f"{NM_EV / de:8.1f}" if de > 0.01 else "       -"
         mu_D = mu_states[iroot] * AU2DEBYE
-        dmu = (
-            (mu_states[iroot] - mu_ref) * AU2DEBYE
-            if mu_ref is not None
-            else np.full(3, np.nan)
-        )
+        dmu = (mu_states[iroot] - mu_ref) * AU2DEBYE if mu_ref is not None else np.full(3, np.nan)
         emit(
             f"  S{iroot:<2}  {de:>8.4f}  {nm}"
             f"  {mu_D[0]:>9.4f}  {mu_D[1]:>9.4f}  {mu_D[2]:>9.4f}"
@@ -837,17 +855,13 @@ def main(argv=None):
 
         if 0 in q_roots:
             emit("\n  Delta-q vs S0 (positive = gained electrons):")
-            hdr2 = f"  {'St':>3}  {'dE(eV)':>8}  " + "  ".join(
-                f"d{n:>9}" for n in names
-            )
+            hdr2 = f"  {'St':>3}  {'dE(eV)':>8}  " + "  ".join(f"d{n:>9}" for n in names)
             emit(hdr2)
             emit("  " + "-" * (len(hdr2) - 2))
             for iroot in sorted(q_roots):
                 if iroot == 0:
                     continue
-                dvals = "  ".join(
-                    f"{q_roots[iroot][n] - q_roots[0][n]:>+10.4f}" for n in names
-                )
+                dvals = "  ".join(f"{q_roots[iroot][n] - q_roots[0][n]:>+10.4f}" for n in names)
                 emit(f"  S{iroot:<2}  {delta_eV[iroot]:>8.4f}  {dvals}")
         else:
             emit("\n  NOTE: root 0 absent, delta-q not computed")
@@ -858,15 +872,10 @@ def main(argv=None):
             frag_names=np.array(names),
             e_states=e_states,
             delta_eV=delta_eV,
-            **{
-                f"q_frag_root{i}": np.array([q[n] for n in names])
-                for i, q in q_roots.items()
-            },
+            **{f"q_frag_root{i}": np.array([q[n] for n in names]) for i, q in q_roots.items()},
             **(
                 {
-                    f"dq_frag_root{i}": np.array(
-                        [q[n] - q_roots[0][n] for n in names]
-                    )
+                    f"dq_frag_root{i}": np.array([q[n] - q_roots[0][n] for n in names])
                     for i, q in q_roots.items()
                 }
                 if 0 in q_roots
@@ -879,10 +888,7 @@ def main(argv=None):
     with open(summary_path, "w") as fh:
         fh.write(f"# {os.path.basename(sys.argv[0])}\n")
         fh.write(f"# geom={args.geom} basis={args.basis} mo={args.mo}\n")
-        fh.write(
-            f"# CAS({args.n_elec}e,{args.n_orbs}o) "
-            f"roots_used={len(dm1_roots)}\n"
-        )
+        fh.write(f"# CAS({args.n_elec}e,{args.n_orbs}o) roots_used={len(dm1_roots)}\n")
         fh.write("\n".join(_report) + "\n")
     log(f"Summary -> {summary_path}")
     log(f"Total wall time: {time.time() - _t0:.1f}s")

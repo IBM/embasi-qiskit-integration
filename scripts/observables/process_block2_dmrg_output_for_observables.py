@@ -90,8 +90,7 @@ def section(title):
 
 
 RUN_MARKERS = ("FCIDUMP", "dmrg.conf", "dmrg.out")
-FCIDUMP_NAMES = ("FCIDUMP", "fcidump_block2.dat", "fcidump_pyscf.dat",
-                 "FCIDUMP.dat", "fcidump.dat")
+FCIDUMP_NAMES = ("FCIDUMP", "fcidump_block2.dat", "fcidump_pyscf.dat", "FCIDUMP.dat", "fcidump.dat")
 
 
 def _is_run_dir(d):
@@ -135,17 +134,23 @@ def find_run_dir_upward(start, levels=3):
         if _is_run_dir(parent):
             return parent
         for sib in sorted(glob.glob(os.path.join(parent, "*"))):
-            if os.path.isdir(sib) and "_saved" not in os.path.basename(sib):
-                if _is_run_dir(sib):
-                    return sib
+            if os.path.isdir(sib) and "_saved" not in os.path.basename(sib) and _is_run_dir(sib):
+                return sib
         cur = parent
     return None
 
 
 BASIS_PATTERNS = (
-    "def2-tzvpp", "def2-tzvp", "def2-svp", "def2-qzvp",
-    "cc-pvtz", "cc-pvdz", "cc-pvqz",
-    "6-311g", "6-31g", "sto-3g",
+    "def2-tzvpp",
+    "def2-tzvp",
+    "def2-svp",
+    "def2-qzvp",
+    "cc-pvtz",
+    "cc-pvdz",
+    "cc-pvqz",
+    "6-311g",
+    "6-31g",
+    "sto-3g",
 )
 
 
@@ -168,14 +173,14 @@ def find_mo_file(*dirs):
         if not d or not os.path.isdir(d):
             continue
         cands = sorted(glob.glob(os.path.join(d, "*natorb*.npz")))
-        cands += [f for f in sorted(glob.glob(os.path.join(d, "*.npz")))
-                  if f not in cands]
+        cands += [f for f in sorted(glob.glob(os.path.join(d, "*.npz"))) if f not in cands]
         for f in cands:
             try:
                 with np.load(f, allow_pickle=False) as z:
                     if "mo_coeff" in z:
                         return f
-            except Exception:
+            except (OSError, ValueError):
+                # Not a readable non-pickled npz; expected while probing, so skip quietly.
                 continue
     return None
 
@@ -331,12 +336,21 @@ def find_energy_source(rdm_dir, run_dir):
         cand = os.path.join(d, "dmrg.e")
         if os.path.exists(cand):
             return cand, "dmrg.e"
-    for d in (rdm_dir, run_dir, os.path.dirname(rdm_dir or "") or None,
-              os.path.dirname(os.path.dirname(rdm_dir or "")) or None):
+    for d in (
+        rdm_dir,
+        run_dir,
+        os.path.dirname(rdm_dir or "") or None,
+        os.path.dirname(os.path.dirname(rdm_dir or "")) or None,
+    ):
         if not d or not os.path.isdir(d):
             continue
-        for pat in ("dmrg_states*.npz", "*states*.npz", "e_states*.npz",
-                    "energies.txt", "energies.dat"):
+        for pat in (
+            "dmrg_states*.npz",
+            "*states*.npz",
+            "e_states*.npz",
+            "energies.txt",
+            "energies.dat",
+        ):
             hits = sorted(glob.glob(os.path.join(d, pat)))
             if hits:
                 return hits[0], "npz/text"
@@ -381,12 +395,16 @@ def check_against_dmrg_out(path, e_states, tol=1e-6):
         return
     n = len(e_states)
     full = [b for b in blocks if len(b) == n]
-    log(f"  consistency: {os.path.basename(path)} has {len(blocks)} sweep blocks, "
-        f"{len(full)} with {n} roots")
+    log(
+        f"  consistency: {os.path.basename(path)} has {len(blocks)} sweep blocks, "
+        f"{len(full)} with {n} roots"
+    )
     if not full:
         sizes = sorted({len(b) for b in blocks})
-        log(f"    no block has {n} roots (block sizes seen: {sizes}) -- cannot "
-            "cross-check; cannot confirm the root count either")
+        log(
+            f"    no block has {n} roots (block sizes seen: {sizes}) -- cannot "
+            "cross-check; cannot confirm the root count either"
+        )
         return
     best, best_d = None, None
     for k, b in enumerate(full):
@@ -395,23 +413,28 @@ def check_against_dmrg_out(path, e_states, tol=1e-6):
         if best_d is None or d < best_d:
             best, best_d = k, d
     gs = None
-    m = re.search(r"DMRG Energy\s*=\s*(-?\d+\.\d+)",
-                  open(path, errors="replace").read())
+    with open(path, errors="replace") as fh:
+        m = re.search(r"DMRG Energy\s*=\s*(-?\d+\.\d+)", fh.read())
     if m:
         gs = float(m.group(1))
     if best_d <= tol:
         where = "the last" if best == len(full) - 1 else f"block {best + 1}/{len(full)}"
         log(f"    OK: matches {where} sweep block to {best_d:.2e} Ha")
     else:
-        log(f"    MISMATCH: closest sweep block differs by {best_d:.2e} Ha "
-            f"(block {best + 1}/{len(full)})")
-        log("    The energy file and dmrg.out disagree. Check they come from the "
-            "same run before trusting the excitation energies.")
+        log(
+            f"    MISMATCH: closest sweep block differs by {best_d:.2e} Ha "
+            f"(block {best + 1}/{len(full)})"
+        )
+        log(
+            "    The energy file and dmrg.out disagree. Check they come from the "
+            "same run before trusting the excitation energies."
+        )
     if gs is not None:
         dg = abs(gs - e_states[0])
         tag = "OK" if dg <= tol else "MISMATCH"
-        log(f"    {tag}: 'DMRG Energy' line {gs:.9f} vs root 0 {e_states[0]:.9f} "
-            f"(diff {dg:.2e} Ha)")
+        log(
+            f"    {tag}: 'DMRG Energy' line {gs:.9f} vs root 0 {e_states[0]:.9f} (diff {dg:.2e} Ha)"
+        )
 
 
 def load_energies(spec):
@@ -422,62 +445,90 @@ def load_energies(spec):
                 for key in ("e_states", "e_tot", "energies"):
                     if key in d:
                         return np.atleast_1d(np.asarray(d[key], dtype=float))
-                raise KeyError(
-                    f"{spec} has no 'e_states' key (found: {list(d.keys())})"
-                )
+                raise KeyError(f"{spec} has no 'e_states' key (found: {list(d.keys())})")
         with open(spec) as fh:
-            return np.array(
-                [float(ln.split()[0]) for ln in fh if ln.strip()], dtype=float
-            )
+            return np.array([float(ln.split()[0]) for ln in fh if ln.strip()], dtype=float)
     return np.array([float(v) for v in spec.split(",") if v.strip()], dtype=float)
 
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description="Turn a raw block2 dmrg_scratch into inputs for "
-                    "compute_observables.py",
+        description="Turn a raw block2 dmrg_scratch into inputs for compute_observables.py",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="See the module docstring for install instructions and examples.",
     )
-    p.add_argument("--run-root-folder", "--dmrg-dir", dest="dmrg_dir", default=None,
-                   metavar="DIR",
-                   help="the DMRG run folder holding dmrg_scratch/ and "
-                        "dmrg_rundir/ as siblings. The RDMs, FCIDUMP, dmrg.e "
-                        "and the geometry/MO/basis inputs for compute_observables.py are all "
-                        "discovered from it. The scratch dir or the run dir "
-                        "itself are also accepted. (--dmrg-dir is an alias; "
-                        f"default: {DEF_DMRG_DIR})")
-    p.add_argument("--rdm-dir", default=None,
-                   help="exact dir holding spatial_<kind>.<i>.<i>.txt; may be "
-                        "combined with --run-root-folder, and its parents are "
-                        "searched for a run dir when that is absent")
-    p.add_argument("--rdm-kind", choices=("twopdm", "onepdm"), default=DEF_RDM_KIND,
-                   help=f"block2 RDM file type (default: {DEF_RDM_KIND})")
-    p.add_argument("--fcidump", default=None,
-                   help="FCIDUMP file supplying norb/nelec (default: FCIDUMP in "
-                        "the run dir, when there is one)")
-    p.add_argument("--n-elec", type=int, default=None,
-                   help="active electrons (default: from FCIDUMP)")
-    p.add_argument("--n-orbs", type=int, default=None,
-                   help="active orbitals (default: from FCIDUMP)")
-    p.add_argument("--roots", default=None,
-                   help="comma list of root indices to keep (default: all found)")
-    p.add_argument("--energies", default=None,
-                   help="energies in Ha, overriding the discovered energy file: comma "
-                        "list, text file, or npz")
-    p.add_argument("--geom", default=None,
-                   help="geometry .xyz to record for compute_observables.py (default: the single "
-                        ".xyz found in the run folder)")
-    p.add_argument("--mo", default=None,
-                   help="MO-coefficient npz to record for compute_observables.py (default: the "
-                        "*natorb*.npz found in the run folder)")
-    p.add_argument("--basis", default=None,
-                   help="basis set name to record for compute_observables.py (default: inferred "
-                        "from the run folder name)")
-    p.add_argument("--out-prefix", default=DEF_OUT_PREFIX,
-                   help=f"output file prefix (default: {DEF_OUT_PREFIX})")
-    p.add_argument("--check", action="store_true",
-                   help="report what was found, then stop before writing")
+    p.add_argument(
+        "--run-root-folder",
+        "--dmrg-dir",
+        dest="dmrg_dir",
+        default=None,
+        metavar="DIR",
+        help="the DMRG run folder holding dmrg_scratch/ and "
+        "dmrg_rundir/ as siblings. The RDMs, FCIDUMP, dmrg.e "
+        "and the geometry/MO/basis inputs for compute_observables.py are all "
+        "discovered from it. The scratch dir or the run dir "
+        "itself are also accepted. (--dmrg-dir is an alias; "
+        f"default: {DEF_DMRG_DIR})",
+    )
+    p.add_argument(
+        "--rdm-dir",
+        default=None,
+        help="exact dir holding spatial_<kind>.<i>.<i>.txt; may be "
+        "combined with --run-root-folder, and its parents are "
+        "searched for a run dir when that is absent",
+    )
+    p.add_argument(
+        "--rdm-kind",
+        choices=("twopdm", "onepdm"),
+        default=DEF_RDM_KIND,
+        help=f"block2 RDM file type (default: {DEF_RDM_KIND})",
+    )
+    p.add_argument(
+        "--fcidump",
+        default=None,
+        help="FCIDUMP file supplying norb/nelec (default: FCIDUMP in "
+        "the run dir, when there is one)",
+    )
+    p.add_argument(
+        "--n-elec", type=int, default=None, help="active electrons (default: from FCIDUMP)"
+    )
+    p.add_argument(
+        "--n-orbs", type=int, default=None, help="active orbitals (default: from FCIDUMP)"
+    )
+    p.add_argument(
+        "--roots", default=None, help="comma list of root indices to keep (default: all found)"
+    )
+    p.add_argument(
+        "--energies",
+        default=None,
+        help="energies in Ha, overriding the discovered energy file: comma list, text file, or npz",
+    )
+    p.add_argument(
+        "--geom",
+        default=None,
+        help="geometry .xyz to record for compute_observables.py (default: the single "
+        ".xyz found in the run folder)",
+    )
+    p.add_argument(
+        "--mo",
+        default=None,
+        help="MO-coefficient npz to record for compute_observables.py (default: the "
+        "*natorb*.npz found in the run folder)",
+    )
+    p.add_argument(
+        "--basis",
+        default=None,
+        help="basis set name to record for compute_observables.py (default: inferred "
+        "from the run folder name)",
+    )
+    p.add_argument(
+        "--out-prefix",
+        default=DEF_OUT_PREFIX,
+        help=f"output file prefix (default: {DEF_OUT_PREFIX})",
+    )
+    p.add_argument(
+        "--check", action="store_true", help="report what was found, then stop before writing"
+    )
     return p
 
 
@@ -499,8 +550,7 @@ def main(argv=None):
     rdm_dir = None
     if args.dmrg_dir:
         if not os.path.isdir(args.dmrg_dir):
-            raise FileNotFoundError(
-                f"--run-root-folder not a directory: {args.dmrg_dir}")
+            raise FileNotFoundError(f"--run-root-folder not a directory: {args.dmrg_dir}")
         # Search below first, then beside an ancestor: when the given dir is the
         # scratch dir, FCIDUMP/dmrg.out live in a sibling run dir, not under it.
         run_dir = find_run_dir(args.dmrg_dir) or find_run_dir_upward(args.dmrg_dir)
@@ -511,8 +561,9 @@ def main(argv=None):
             run_dir = args.dmrg_dir
             log(f"Run dir      : {run_dir}   (no FCIDUMP/dmrg.out found in it)")
         if not args.rdm_dir:
-            rdm_dir = (find_rdm_dir(args.dmrg_dir, args.rdm_kind)
-                       or find_rdm_dir_upward(args.dmrg_dir, args.rdm_kind))
+            rdm_dir = find_rdm_dir(args.dmrg_dir, args.rdm_kind) or find_rdm_dir_upward(
+                args.dmrg_dir, args.rdm_kind
+            )
         if rdm_dir is None and not args.rdm_dir:
             raise FileNotFoundError(
                 f"no spatial_{args.rdm_kind}.<i>.<i>.txt found under "
@@ -589,11 +640,7 @@ def main(argv=None):
             elif args.n_elec != nelec:
                 log(f"  NOTE: --n-elec {args.n_elec} overrides FCIDUMP NELEC={nelec}")
 
-    why = (
-        f"the header of {fcidump} has no usable NORB/NELEC"
-        if fcidump
-        else "no FCIDUMP was found"
-    )
+    why = f"the header of {fcidump} has no usable NORB/NELEC" if fcidump else "no FCIDUMP was found"
     if args.n_orbs is None:
         raise ValueError(
             f"could not determine --n-orbs: {why}. Pass --n-orbs explicitly"
@@ -602,16 +649,13 @@ def main(argv=None):
     if args.n_elec is None and args.rdm_kind == "twopdm":
         raise ValueError(
             f"could not determine --n-elec: {why}. It is required to contract "
-            "the 2-RDM -- pass --n-elec explicitly"
-            + ("." if fcidump else ", or --fcidump <path>.")
+            "the 2-RDM -- pass --n-elec explicitly" + ("." if fcidump else ", or --fcidump <path>.")
         )
     log(f"Active space : CAS({args.n_elec}e,{args.n_orbs}o)")
 
     roots_found = rdm_roots_present(rdm_dir, args.rdm_kind)
     if not roots_found:
-        raise FileNotFoundError(
-            f"no spatial_{args.rdm_kind}.<i>.<i>.txt files in {rdm_dir}"
-        )
+        raise FileNotFoundError(f"no spatial_{args.rdm_kind}.<i>.<i>.txt files in {rdm_dir}")
     if args.roots:
         want = [int(v) for v in args.roots.split(",") if v.strip()]
         missing = [r for r in want if r not in roots_found]
@@ -629,7 +673,6 @@ def main(argv=None):
 
     section("Energies")
     e_states = None
-    e_src = None
 
     if args.energies and os.path.isdir(args.energies):
         found, _kind = find_energy_source(args.energies, args.energies)
@@ -653,31 +696,27 @@ def main(argv=None):
             )
         if os.path.basename(args.energies) == "dmrg.e":
             e_states = read_dmrg_e(args.energies)
-            e_src = args.energies
             log(f"Energies     : {args.energies}  ({e_states.size} values, dmrg.e)")
         else:
             e_states = load_energies(args.energies)
-            e_src = args.energies
             log(f"Energies     : {args.energies}  ({e_states.size} values, given)")
     else:
         found, kind = find_energy_source(rdm_dir, run_dir)
         if found is None:
-            log("No energy file found (looked for dmrg.e beside the RDMs, then "
-                "dmrg_states*.npz / energies.txt).")
+            log(
+                "No energy file found (looked for dmrg.e beside the RDMs, then "
+                "dmrg_states*.npz / energies.txt)."
+            )
             log("  Pass --energies to get excitation energies downstream.")
         elif kind == "dmrg.e":
             e_states = read_dmrg_e(found)
-            e_src = found
             if e_states is None:
                 log(f"{found} is empty -- pass --energies instead.")
             else:
-                log(f"Energies     : {found}  ({e_states.size} values, dmrg.e, "
-                    "auto-discovered)")
+                log(f"Energies     : {found}  ({e_states.size} values, dmrg.e, auto-discovered)")
         else:
             e_states = load_energies(found)
-            e_src = found
-            log(f"Energies     : {found}  ({e_states.size} values, "
-                "auto-discovered)")
+            log(f"Energies     : {found}  ({e_states.size} values, auto-discovered)")
 
     if e_states is not None:
         log(f"  {np.round(e_states, 6).tolist()}")
@@ -693,8 +732,10 @@ def main(argv=None):
             log("  consistency: no dmrg.out found to cross-check against")
 
     if e_states is not None and e_states.size < len(roots):
-        log(f"WARNING: {e_states.size} energies for {len(roots)} roots; "
-            "excitation energies will be incomplete downstream")
+        log(
+            f"WARNING: {e_states.size} energies for {len(roots)} roots; "
+            "excitation energies will be incomplete downstream"
+        )
 
     section("Molecule inputs for compute_observables")
     search = [d for d in (top_dir, run_dir, rdm_dir) if d]
@@ -708,11 +749,15 @@ def main(argv=None):
         if geom:
             log(f"Geometry     : {geom}  [found]")
             if multi:
-                log(f"  NOTE: several .xyz present ({', '.join(multi)}); using "
-                    "the first. Pass --geom to choose.")
+                log(
+                    f"  NOTE: several .xyz present ({', '.join(multi)}); using "
+                    "the first. Pass --geom to choose."
+                )
         else:
-            log("Geometry     : not found -- pass --geom, or give compute_observables its own "
-                "--geom")
+            log(
+                "Geometry     : not found -- pass --geom, or give compute_observables its own "
+                "--geom"
+            )
 
     mo = args.mo
     if mo:
@@ -733,11 +778,15 @@ def main(argv=None):
         basis = guess_basis(top_dir, run_dir, mo, geom)
         if basis:
             log(f"Basis        : {basis}  [inferred from the folder name]")
-            log("  VERIFY this matches the basis your DMRG run used -- it is a "
-                "name guess, not a value read from the output.")
+            log(
+                "  VERIFY this matches the basis your DMRG run used -- it is a "
+                "name guess, not a value read from the output."
+            )
         else:
-            log("Basis        : not determined -- pass --basis, or give compute_observables its "
-                "own --basis")
+            log(
+                "Basis        : not determined -- pass --basis, or give compute_observables its "
+                "own --basis"
+            )
 
     if args.check:
         section("Check only")
@@ -763,8 +812,7 @@ def main(argv=None):
         dm1_roots[iroot] = dm1
 
     if any(
-        args.n_elec is not None and abs(np.trace(d) - args.n_elec) > 0.1
-        for d in dm1_roots.values()
+        args.n_elec is not None and abs(np.trace(d) - args.n_elec) > 0.1 for d in dm1_roots.values()
     ):
         log("")
         log("Trace mismatch usually means --n-elec does not match the DMRG run,")
@@ -773,8 +821,10 @@ def main(argv=None):
     section("Write bundle")
     rdm_path = f"{args.out_prefix}_rdm1.npz"
     np.savez(rdm_path, **{f"dm1_root{i}": dm for i, dm in dm1_roots.items()})
-    log(f"1-RDMs   -> {rdm_path}  ({os.path.getsize(rdm_path) / 1e6:.2f} MB, "
-        f"{len(dm1_roots)} roots)")
+    log(
+        f"1-RDMs   -> {rdm_path}  ({os.path.getsize(rdm_path) / 1e6:.2f} MB, "
+        f"{len(dm1_roots)} roots)"
+    )
 
     states_path = None
     if e_states is not None:
@@ -799,8 +849,7 @@ def main(argv=None):
         cmd.append(f"--mo {mo}")
     cmd_str = " \\\n    ".join(cmd)
 
-    missing = [n for n, v in (("--geom", geom), ("--basis", basis), ("--mo", mo))
-               if not v]
+    missing = [n for n, v in (("--geom", geom), ("--basis", basis), ("--mo", mo)) if not v]
 
     section("Next step")
     if missing:
@@ -817,10 +866,14 @@ def main(argv=None):
         log("will be reported as zero. Add --energies to compute_observables to fill them in.")
     if missing:
         log("")
-        log(f"Could not resolve {', '.join(missing)} from the run folder -- the "
-            "command above omits them,")
-        log("so compute_observables would fall back to its built-in example defaults. Supply "
-            "them explicitly.")
+        log(
+            f"Could not resolve {', '.join(missing)} from the run folder -- the "
+            "command above omits them,"
+        )
+        log(
+            "so compute_observables would fall back to its built-in example defaults. Supply "
+            "them explicitly."
+        )
 
     manifest_path = f"{args.out_prefix}_manifest.txt"
     with open(manifest_path, "w") as fh:
