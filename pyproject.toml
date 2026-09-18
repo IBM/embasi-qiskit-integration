@@ -21,7 +21,16 @@ quantum  = ["qiskit>=1.0", "qiskit-aer", "qiskit-addon-sqd", "ffsim"]
 fermions = ["qiskit-fermions>=0.1.0"]
 relabel  = ["pyomo>=6.7", "highspy>=1.7"]
 hardware = ["qiskit-ibm-runtime", "samplomatic"]
-embed    = ["embasi @ git+https://github.com/tamm-cci/EmbASI.git@qm-code-adapter", "mpi4py"]          # EmbASI (from source); pulls ase + asi4py
+# EmbASI (from source); pulls ase + asi4py.  scalapack4py/asi4py are pinned to the
+# branches EmbASI's qm-code-adapter currently needs: resolving them implicitly picks
+# up releases whose ASI signatures no longer match, which fails at import time
+# rather than at install time.  Temporary -- drop the pins once the three are synced.
+embed    = [
+    "embasi @ git+https://github.com/tamm-cci/EmbASI.git@qm-code-adapter",
+    "mpi4py",
+    "scalapack4py @ git+https://gitlab.com/pvst/scalapack4py.git@v1.0_release",
+    "asi4py @ git+https://gitlab.com/pvst/asi.git@doc_corrections#egg=pkg&subdirectory=pyasi",
+]
 chem     = ["rdkit>=2023.9"]         # SMILES-derived charge in molecule/geometry.py (optional)
 dev      = ["pytest>=7", "pytest-cov", "ruff==0.15.20", "mypy>=2.2,<2.4", "pre-commit", "rdkit>=2023.9"]
 # Every runtime extra in one shot (excludes `dev` tooling).

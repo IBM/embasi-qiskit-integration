@@ -339,17 +339,32 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
         projection="level-shift",
         parallel=parallel,
     )
-    # PySCFIntegrals wraps the *same* mf_hl object, so veff_hl undoes exactly
-    # what EmbASI folded into F_emb, whether that is KS or HF.
+    # PySCFIntegrals wraps the *same* mf_hl/mf_ll objects handed to
+    # calc_base_hl/calc_base_ll, so veff_ll undoes exactly what EmbASI folded into
+    # F_emb (which is built from the A_LL blocks -- see the h_emb property) and
+    # veff_hl remains available as the high-level mean field.
     density_fit: bool | str = cfg.df_auxbasis or cfg.density_fit
-    integrals = PySCFIntegrals(mf_hl, density_fit=density_fit)
+    integrals = PySCFIntegrals(mf_hl, mf_ll, density_fit=density_fit)
     return ProjectionEmbeddingAdapter(
         projection, integrals, mu=cfg.mu, unrestricted=cfg.unrestricted
     )
 
 
-def build_selector(cfg: EmbeddingSetup, emb: ProjectionEmbeddingAdapter, *, log=None):
+def build_selector(
+    cfg: EmbeddingSetup,
+    emb: ProjectionEmbeddingAdapter,
+    *,
+    log=None,
+    use_relaxed: bool = False,
+):
     """Build the active-virtual shaping hook from ``cfg.selector``.
+
+    ``use_relaxed`` (mirroring
+    :meth:`ProjectionEmbeddingAdapter.build_orbitals`'s flag) selects the relaxed
+    embedded-HF Fock from :meth:`ProjectionEmbeddingAdapter.relax_active_hf`
+    instead of the one-shot low-level ``F_emb``, for every branch below that reads
+    a Fock eagerly (``concentric-cl``, ``apc-concentric``).  ``relax_hf`` gates
+    both whether ``relax_active_hf`` ran and this flag, so the two always agree.
 
     Returns a ``(selector, virtual_localizer, orbital_builder)`` triple with at
     most one non-None (all ``None`` for the fixed ``--n_virtual`` cut):
@@ -413,10 +428,19 @@ def build_selector(cfg: EmbeddingSetup, emb: ProjectionEmbeddingAdapter, *, log=
             n_shells, max_size, fixed = cfg.n_shells, cfg.apc_max_size, cfg.apc_fixed
 
             def _orbital_builder(
-                emb, frag=frag_union, n_shells=n_shells, max_size=max_size, fixed=fixed
+                emb,
+                frag=frag_union,
+                n_shells=n_shells,
+                max_size=max_size,
+                fixed=fixed,
+                use_relaxed=use_relaxed,
             ):
                 return emb.build_orbitals_apc_concentric(
-                    fragment_ao=frag, n_shells=n_shells, max_size=max_size, fixed=fixed
+                    fragment_ao=frag,
+                    n_shells=n_shells,
+                    max_size=max_size,
+                    fixed=fixed,
+                    use_relaxed=use_relaxed,
                 )
 
             return None, None, _orbital_builder
@@ -434,7 +458,7 @@ def build_selector(cfg: EmbeddingSetup, emb: ProjectionEmbeddingAdapter, *, log=
             concentric_localization_selector(
                 overlap,
                 frag_union,
-                emb._fock,
+                emb._fock_relaxed_arr if use_relaxed else emb._fock,
                 n_shells=cfg.n_shells,
                 max_virtual=cfg.n_virtual,
             ),
@@ -475,6 +499,16 @@ class EmbeddingWorkflow(BaseSettings):
     # solver never runs; the dissociation-energy driver overrides this per run.
     xc_hl: str = "HF"
     mu: float = 1.0e6  # level-shift parameter, paper Eq. 6
+    # WF-in-DFT only (never reached on the DFT-in-DFT path, which has no solver):
+    # converge subsystem A's own HF problem on A_HL, self-consistently, in the
+    # frozen v_emb/P_B potential run_low_level() built -- see
+    # ProjectionEmbeddingAdapter.relax_active_hf.  Without it build_orbitals()
+    # diagonalizes F_emb exactly once against A_LL's (xc_ll-level) density, so
+    # Brillouin's theorem does not hold for the orbitals FCI/SQD receives: an
+    # orbital-relaxation error a formally-exact active-space solve cannot recover.
+    # Defaults off -- it costs an extra embedded SCF and changes the reference the
+    # published numbers in this repo were produced against.
+    relax_hf: bool = False
 
     a_nmos: int | None = None  # Fixes the number of electrons selected by SPADE
 
@@ -615,7 +649,15 @@ class EmbeddingWorkflow(BaseSettings):
         # WF-in-DFT only.  Collective on every rank: EmbASI's supersystem SCF,
         # SPADE/Pipek-Mezey localisation, and the embedded Fock all run in here.
         emb.run_low_level(a_nmos=self.a_nmos)
-        selector, virtual_localizer, orbital_builder = self._build_selector(emb, log=log)
+        if self.relax_hf:
+            log(
+                "   relaxing the subsystem-A HF reference on A_HL "
+                "(self-consistent, frozen v_emb/P_B)..."
+            )
+            emb.relax_active_hf()
+        selector, virtual_localizer, orbital_builder = self._build_selector(
+            emb, log=log, use_relaxed=self.relax_hf
+        )
         solver = self._build_solver()
         return self._run_outer_loop(
             emb, solver, selector, virtual_localizer, orbital_builder, rank=rank, log=log
@@ -727,6 +769,7 @@ class EmbeddingWorkflow(BaseSettings):
                     n_virtual=self.n_virtual,
                     selector=selector,
                     virtual_localizer=virtual_localizer,
+                    use_relaxed=self.relax_hf,
                 )
             log(f"   {orbitals}")
             if orbital_builder is not None:
@@ -891,12 +934,14 @@ class EmbeddingWorkflow(BaseSettings):
         """Return ``(ase.Atoms, charge)`` for the requested geometry source."""
         return build_atoms(self)
 
-    def _build_selector(self, emb: ProjectionEmbeddingAdapter, *, log=None):
+    def _build_selector(
+        self, emb: ProjectionEmbeddingAdapter, *, log=None, use_relaxed: bool = False
+    ):
         """Build the active-virtual shaping hook from ``self.selector``.
 
         See :func:`build_selector`, which this delegates to.
         """
-        return build_selector(self, emb, log=log)
+        return build_selector(self, emb, log=log, use_relaxed=use_relaxed)
 
     def _build_solver(self):
         from embasi_qiskit_integration.solvers import FCISolver, SQDSolver
