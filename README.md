@@ -85,6 +85,39 @@ print(res.energy)            # within 2e-3 Ha of FCI; res.diagnostics carries pr
 For CI / offline runs, replay frozen counts with `MockSampler` instead of
 `AerSampler` — same interface, fully deterministic.
 
+**Aer is a family of simulators, not one.** `AerSampler` defaults to `statevector`
+(exact), and the method is selectable — `matrix_product_state` is the interesting
+alternative, reaching wider registers than statevector allows:
+
+```python
+AerSampler(method="matrix_product_state", mps_max_bond_dimension=64)
+```
+
+From the CLI: `--aer_method matrix_product_state --mps_max_bond_dimension 64`. The
+method is validated against the installed Aer, so a typo fails immediately instead of
+silently simulating with something else, and it is recorded in
+`res.diagnostics["sampler_method"]` so a result says which simulator produced it.
+
+Two caveats worth knowing before reaching for MPS:
+
+- **Seeds do not reproduce across methods.** Each consumes randomness differently, so
+  the same `seed` gives statistically equivalent but not identical counts.
+- **MPS is not automatically faster.** Uncapped, it converges toward the exact state and
+  can be *slower* than `statevector` on the deliberately-entangling SqDRIFT circuits;
+  the bond-dimension cap is what buys the memory saving, at the cost of an
+  approximation. Benchmark on your own circuits rather than assuming a win.
+
+Both methods agree on the physics, as they should. N2 8o10e, 5000 shots, seed 11:
+
+| method | energy (Ha) | vs FCI |
+|---|---|---|
+| `statevector` | -108.9582199205 | 2.9e-4 |
+| `matrix_product_state` | -108.9583430226 | 1.7e-4 |
+| FCI reference | -108.9585095430 | — |
+
+The 1.2e-4 Ha between them is sampling noise at this shot count, not a method error —
+and MPS landing marginally closer is luck of the draw, not evidence it is better.
+
 ### 3. SQD on real quantum hardware
 
 The sampler is the only thing that changes.

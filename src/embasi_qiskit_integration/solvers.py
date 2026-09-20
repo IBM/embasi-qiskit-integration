@@ -31,6 +31,27 @@ class ActiveSpaceSolver(ABC):
     def solve(self, ham: EmbeddedHamiltonian) -> SolverResult: ...
 
 
+def _sampler_backend_diagnostics(sampler) -> dict:
+    """Simulation-method provenance for whichever sampler ran, if it has any.
+
+    Duck-typed rather than isinstance-checked so a custom sampler exposing the same
+    attributes is reported too, and a sampler with none (``MockSampler``,
+    ``RuntimeSampler``) contributes nothing rather than ``None`` entries.
+    """
+    out: dict = {}
+    method = getattr(sampler, "method", None)
+    if method is not None:
+        out["sampler_method"] = method
+    for attr, key in (
+        ("mps_max_bond_dimension", "mps_max_bond_dimension"),
+        ("mps_truncation_threshold", "mps_truncation_threshold"),
+    ):
+        value = getattr(sampler, attr, None)
+        if value is not None:
+            out[key] = value
+    return out
+
+
 class FCISolver(ActiveSpaceSolver):
     """Exact full configuration interaction via PySCF — the numerical oracle."""
 
@@ -240,6 +261,11 @@ class SQDSolver(ActiveSpaceSolver):
             method=self.method,
             n_circuits=len(circuits),
             sampler=type(self.sampler).__name__,
+            # `AerSampler` alone does not say WHICH Aer simulator ran -- Aer is a family
+            # (statevector, matrix_product_state, ...) and the choice changes both cost
+            # and exactness.  Record it so a result answers "which solver did you use?"
+            # by itself.  Absent for samplers with no simulation method (mock, runtime).
+            **_sampler_backend_diagnostics(self.sampler),
             versions=collect_versions(),
             seed=self.seed,
             fcidump_sha=ham.meta.get("sha"),

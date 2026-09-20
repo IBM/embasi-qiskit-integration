@@ -600,6 +600,20 @@ class EmbeddingWorkflow(BaseSettings):
     solver: Literal["sqd", "fci"] = "sqd"
     handoff: Literal["in-process", "two-process"] = "in-process"
     sampler: SamplerKind = "aer"
+    # Aer is a *family* of simulators, not one: statevector (exact), density_matrix,
+    # stabilizer, matrix_product_state, ... `--sampler aer` alone does not say which,
+    # so name it here and it lands in the SQD diagnostics too.  Validated against the
+    # installed Aer, so a typo fails at construction rather than silently simulating
+    # with whatever Aer would have defaulted to.
+    #
+    # NOTE seeds do NOT reproduce across methods -- each consumes randomness
+    # differently -- so switching method changes the sampled counts for a fixed seed.
+    aer_method: str = "statevector"
+    # MPS only.  Uncapped MPS converges toward the exact state and is often *slower*
+    # than statevector on the entangling circuits SqDRIFT produces; the cap is what
+    # buys the memory saving, at the cost of an approximation.
+    mps_max_bond_dimension: int | None = None
+    mps_truncation_threshold: float | None = None
     backend: str | None = None  # runtime backend name; else least-busy
     optimization_level: int = 3  # runtime ISA-transpile level
     shots: int = 100_000
@@ -1054,6 +1068,9 @@ class EmbeddingWorkflow(BaseSettings):
             backend=self.backend,
             optimization_level=self.optimization_level,
             default_shots=self.shots,
+            aer_method=self.aer_method,
+            mps_max_bond_dimension=self.mps_max_bond_dimension,
+            mps_truncation_threshold=self.mps_truncation_threshold,
         )
         return SQDSolver(sampler, shots=self.shots, seed=self.seed)
 

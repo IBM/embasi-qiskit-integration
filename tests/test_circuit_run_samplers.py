@@ -241,3 +241,152 @@ def test_cli_sampler_options_rejects_malformed_json():
 
     with pytest.raises(SystemExit, match="must be a JSON object"):
         SolveCommand(directory="/tmp/unused", sampler_options="[1, 2]")._sampler_options()
+
+
+# --------------------------------------------------------------------------- #
+# Aer is a family: selecting the simulation method
+# --------------------------------------------------------------------------- #
+def test_available_aer_methods_reports_the_installed_set():
+    """Validation reads the method list from Aer, not a hardcoded copy.
+
+    Builds differ -- a GPU build offers more -- so a hardcoded list would reject
+    methods that actually work.
+    """
+    from embasi_qiskit_integration.circuit_run.aer import available_aer_methods
+
+    methods = available_aer_methods()
+    assert "statevector" in methods
+    assert "matrix_product_state" in methods
+
+
+def test_unknown_method_is_rejected_with_the_valid_set():
+    """A typo must fail loudly, not fall through to whatever Aer defaults to."""
+    from embasi_qiskit_integration.circuit_run.aer import AerSampler
+
+    with pytest.raises(ValueError, match="unknown Aer simulation method 'mps'"):
+        AerSampler(method="mps")
+    # The message must name the alternatives, or the user has to go digging.
+    with pytest.raises(ValueError, match="matrix_product_state"):
+        AerSampler(method="mps")
+
+
+def test_mps_knobs_are_refused_on_other_methods():
+    """A bond-dimension cap on statevector is a silent no-op; refuse it instead."""
+    from embasi_qiskit_integration.circuit_run.aer import AerSampler
+
+    with pytest.raises(ValueError, match="only meaningful for"):
+        AerSampler(method="statevector", mps_max_bond_dimension=32)
+    with pytest.raises(ValueError, match="only meaningful for"):
+        AerSampler(method="density_matrix", mps_truncation_threshold=1e-10)
+    with pytest.raises(ValueError, match="must be >= 1"):
+        AerSampler(method="matrix_product_state", mps_max_bond_dimension=0)
+
+
+def test_backend_options_carry_the_mps_knobs():
+    """The knobs must reach Aer under the names it expects."""
+    from embasi_qiskit_integration.circuit_run.aer import AerSampler
+
+    plain = AerSampler(method="statevector").backend_options
+    assert plain == {"method": "statevector"}
+
+    mps = AerSampler(
+        method="matrix_product_state",
+        mps_max_bond_dimension=16,
+        mps_truncation_threshold=1e-8,
+    ).backend_options
+    assert mps["method"] == "matrix_product_state"
+    assert mps["matrix_product_state_max_bond_dimension"] == 16
+    assert mps["matrix_product_state_truncation_threshold"] == 1e-8
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("method", ["statevector", "matrix_product_state", "density_matrix"])
+def test_every_selectable_method_samples_a_bell_state(method):
+    """Each method must actually run and agree on the physics.
+
+    A Bell state is the cheapest thing that distinguishes "the method ran" from "the
+    method silently produced garbage": only 00 and 11 may appear, in roughly equal
+    weight, whichever simulator produced them.
+    """
+    from qiskit import QuantumCircuit
+
+    from embasi_qiskit_integration.circuit_run.aer import AerSampler
+
+    qc = QuantumCircuit(2)
+    qc.h(0)
+    qc.cx(0, 1)
+    qc.measure_all()
+
+    counts = AerSampler(method=method).sample(qc, shots=4000, seed=3)
+    assert set(counts) <= {"00", "11"}
+    assert sum(counts.values()) == 4000
+    # Roughly balanced: 4000 shots puts 3-sigma well inside this band.
+    assert 0.4 < counts.get("00", 0) / 4000 < 0.6
+
+
+@pytest.mark.slow
+def test_mps_with_a_bond_cap_still_samples_correctly():
+    """A capped bond dimension is an approximation, but must stay correct here.
+
+    A Bell state needs bond dimension 2, so a cap of 2 is lossless for it -- this pins
+    that the cap is *applied* without breaking a state it can represent exactly.
+    """
+    from qiskit import QuantumCircuit
+
+    from embasi_qiskit_integration.circuit_run.aer import AerSampler
+
+    qc = QuantumCircuit(2)
+    qc.h(0)
+    qc.cx(0, 1)
+    qc.measure_all()
+
+    sampler = AerSampler(method="matrix_product_state", mps_max_bond_dimension=2)
+    counts = sampler.sample(qc, shots=2000, seed=3)
+    assert set(counts) <= {"00", "11"}
+    assert sum(counts.values()) == 2000
+
+
+def test_build_sampler_threads_the_method_through():
+    from embasi_qiskit_integration.circuit_run import build_sampler
+
+    sampler = build_sampler("aer", aer_method="matrix_product_state", mps_max_bond_dimension=8)
+    assert sampler.method == "matrix_product_state"
+    assert sampler.backend_options["matrix_product_state_max_bond_dimension"] == 8
+    # Default stays statevector: this feature must not change existing runs.
+    assert build_sampler("aer").method == "statevector"
+
+
+def test_aer_options_are_refused_on_non_aer_samplers(tmp_path):
+    """Same contract as `options`: silently ignoring a simulation knob is worse."""
+    import json
+
+    from embasi_qiskit_integration.circuit_run import build_sampler
+
+    counts_file = tmp_path / "counts.json"
+    counts_file.write_text(json.dumps({"0000": 10}))
+
+    with pytest.raises(ValueError, match="takes no Aer simulation options"):
+        build_sampler("mock", counts=str(counts_file), aer_method="matrix_product_state")
+    with pytest.raises(ValueError, match="takes no Aer simulation options"):
+        build_sampler("mock", counts=str(counts_file), mps_max_bond_dimension=4)
+
+
+def test_sampler_method_lands_in_the_diagnostics():
+    """A result must say which simulator produced it, not just "AerSampler"."""
+    from types import SimpleNamespace
+
+    from embasi_qiskit_integration.circuit_run.aer import AerSampler
+    from embasi_qiskit_integration.solvers import _sampler_backend_diagnostics
+
+    plain = _sampler_backend_diagnostics(AerSampler())
+    assert plain == {"sampler_method": "statevector"}
+
+    mps = _sampler_backend_diagnostics(
+        AerSampler(method="matrix_product_state", mps_max_bond_dimension=64)
+    )
+    assert mps["sampler_method"] == "matrix_product_state"
+    assert mps["mps_max_bond_dimension"] == 64
+
+    # A sampler with no simulation method contributes nothing, so mock/runtime
+    # diagnostics are unchanged rather than carrying None entries.
+    assert _sampler_backend_diagnostics(SimpleNamespace()) == {}

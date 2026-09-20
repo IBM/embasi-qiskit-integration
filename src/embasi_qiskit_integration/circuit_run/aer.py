@@ -1,11 +1,22 @@
 # Copyright IBM Corp. 2026
 # SPDX-License-Identifier: Apache-2.0
 
-"""Aer-backed bitstring sampler (noiseless statevector simulation)."""
+"""Aer-backed bitstring sampler (local simulation, method selectable)."""
 
 from __future__ import annotations
 
 from embasi_qiskit_integration.circuit_run.base import SamplerMixin
+
+
+def available_aer_methods() -> tuple[str, ...]:
+    """Simulation methods the installed Aer actually offers.
+
+    Read from Aer rather than hardcoded, so the validation below tracks whatever is
+    installed (the list differs with build options -- GPU builds add methods).
+    """
+    from qiskit_aer import AerSimulator
+
+    return tuple(AerSimulator().available_methods())
 
 
 class AerSampler(SamplerMixin):
@@ -17,12 +28,64 @@ class AerSampler(SamplerMixin):
     The simulation ``method`` is pinned (default ``"statevector"``) rather than
     left at Aer's ``"automatic"``: automatic picks a method from circuit structure,
     so the RNG consumption pattern -- and hence what a given ``seed`` reproduces --
-    could drift as circuits or Aer's heuristics change.
+    could drift as circuits or Aer's heuristics change.  **Seeds do not reproduce
+    across methods**: each consumes randomness differently, so the same ``seed``
+    gives statistically equivalent but not identical counts under
+    ``statevector`` and ``matrix_product_state``.
+
+    ``matrix_product_state`` trades exactness for memory and is the reason this is
+    selectable: it can reach wider registers than ``statevector``, but only while the
+    bond dimension stays small.  Cap it with ``mps_max_bond_dimension`` -- uncapped,
+    MPS grows toward the exact state and can be *slower* than ``statevector`` on the
+    deliberately-entangling circuits SqDRIFT produces.  Benchmark before assuming a
+    win; a truncated bond dimension is an approximation, and Aer reports the
+    truncation it applied rather than failing.
     """
 
-    def __init__(self, *, default_shots: int = 100_000, method: str = "statevector"):
+    def __init__(
+        self,
+        *,
+        default_shots: int = 100_000,
+        method: str = "statevector",
+        mps_max_bond_dimension: int | None = None,
+        mps_truncation_threshold: float | None = None,
+    ):
+        supported = available_aer_methods()
+        if method not in supported:
+            raise ValueError(
+                f"unknown Aer simulation method {method!r}; the installed Aer offers "
+                f"{', '.join(supported)}. (A typo would otherwise fall through to "
+                f"whatever Aer defaults to, silently simulating with the wrong method.)"
+            )
+        if mps_max_bond_dimension is not None:
+            if method != "matrix_product_state":
+                raise ValueError(
+                    f"mps_max_bond_dimension is only meaningful for "
+                    f"method='matrix_product_state', not {method!r}"
+                )
+            if mps_max_bond_dimension < 1:
+                raise ValueError(
+                    f"mps_max_bond_dimension must be >= 1; got {mps_max_bond_dimension}"
+                )
+        if mps_truncation_threshold is not None and method != "matrix_product_state":
+            raise ValueError(
+                f"mps_truncation_threshold is only meaningful for "
+                f"method='matrix_product_state', not {method!r}"
+            )
         self.default_shots = default_shots
         self.method = method
+        self.mps_max_bond_dimension = mps_max_bond_dimension
+        self.mps_truncation_threshold = mps_truncation_threshold
+
+    @property
+    def backend_options(self) -> dict:
+        """The ``backend_options`` handed to ``SamplerV2``, method knobs included."""
+        opts: dict = {"method": self.method}
+        if self.mps_max_bond_dimension is not None:
+            opts["matrix_product_state_max_bond_dimension"] = self.mps_max_bond_dimension
+        if self.mps_truncation_threshold is not None:
+            opts["matrix_product_state_truncation_threshold"] = self.mps_truncation_threshold
+        return opts
 
     def run(
         self, circuits: list, shots: int | None = None, *, seed: int | None = None
@@ -42,7 +105,7 @@ class AerSampler(SamplerMixin):
         if not circuits:
             return []
 
-        sampler = SamplerV2(seed=seed, options={"backend_options": {"method": self.method}})
+        sampler = SamplerV2(seed=seed, options={"backend_options": self.backend_options})
         result = sampler.run(list(circuits), shots=shots).result()
         # One PUB per circuit; a circuit carries no parameter bindings here, so
         # each PUB yields exactly one counts dict.
