@@ -509,6 +509,19 @@ class EmbeddingWorkflow(BaseSettings):
     # Defaults off -- it costs an extra embedded SCF and changes the reference the
     # published numbers in this repo were produced against.
     relax_hf: bool = False
+    # Open shell only.  Drive the genuinely spin-dependent path: diagonalize each spin
+    # channel in its OWN span(A) and downfold to an (h1a, h1b) + (aa, ab, bb) Hamiltonian
+    # (ProjectionEmbeddingAdapter.build_orbitals_spin / embedded_hamiltonian_spin).
+    # Requires `unrestricted=True` and an EmbASI that reports a spin axis.
+    #
+    # Why this is not automatic: a spin-RESTRICTED downfold is *ill-defined* on an open
+    # shell (EmbASI's SPADE partitions each channel independently, so a spin-summed P_B
+    # annihilates neither channel's A orbitals -- the projector leak is ~4e-02), so on an
+    # open shell this is the only correct path. It is a flag rather than a silent switch
+    # because selectors are not supported on it (an independent cut per channel could keep
+    # different orbital counts, and the downfold needs a common dimension) and only the
+    # FCI solver can consume the pair.
+    spin_downfold: bool = False
 
     a_nmos: int | None = None  # Fixes the number of electrons selected by SPADE
 
@@ -592,6 +605,7 @@ class EmbeddingWorkflow(BaseSettings):
     shots: int = 100_000
     seed: int = 24
     job_dir: Path | None = None
+    output_path: Path | None = None
 
     # ---------------- main ---------------- #
     def cli_cmd(self) -> None:
@@ -659,9 +673,16 @@ class EmbeddingWorkflow(BaseSettings):
             emb, log=log, use_relaxed=self.relax_hf
         )
         solver = self._build_solver()
-        return self._run_outer_loop(
+
+        output = self._run_outer_loop(
             emb, solver, selector, virtual_localizer, orbital_builder, rank=rank, log=log
         )
+
+        if self.output_path is not None:
+            with self.output_path.open("a") as out:
+                out.write(f"{self.xyz}; {output.total}\n")
+
+        return output
 
     def _is_dft_in_dft(self) -> bool:
         """True when the high level is a density functional (-> paper Eq. 2).
@@ -761,7 +782,41 @@ class EmbeddingWorkflow(BaseSettings):
             tag = "" if self.max_cycles == 1 else f" [cycle {cycle + 1}/{self.max_cycles}]"
 
             log(f"== Step 2: build subsystem-A orbitals and downfold =={tag}")
-            if orbital_builder is not None:
+            if self.spin_downfold:
+                # Genuinely spin-dependent path: two orbital sets, each diagonalized in
+                # its own span(A), downfolded to an (h1a, h1b) pair.  Selectors do not
+                # apply here (see the `spin_downfold` field comment).
+                # A *localiser* (spade, concentric-cl) is supported: it is applied per
+                # channel and the two virtual counts reconciled to their min (see
+                # `build_orbitals_spin`).  An index `selector` (mulliken) and the APC
+                # `orbital_builder` are not: both pick/rank columns against a single
+                # spin-summed Fock and neither has a per-channel reconciliation, so they
+                # would silently mix the channels the per-spin path exists to separate.
+                if selector is not None or orbital_builder is not None:
+                    raise ValueError(
+                        f"spin_downfold=True does not support selector={self.selector!r}: "
+                        "index selection (mulliken) and the APC builder rank columns "
+                        "against one spin-summed Fock, which mixes the channels. Use "
+                        "--selector none, spade or concentric-cl (applied per channel), "
+                        "or cap with --n_virtual."
+                    )
+                spin_orbitals = emb.build_orbitals_spin(
+                    n_frozen_occ=self.n_frozen_occ,
+                    n_virtual=self.n_virtual,
+                    virtual_localizer=virtual_localizer,
+                    use_relaxed=self.relax_hf,
+                )
+                log(f"   alpha: {spin_orbitals[0]}")
+                log(f"   beta : {spin_orbitals[1]}")
+                ham = emb.embedded_hamiltonian_spin(spin_orbitals)
+                orbitals = spin_orbitals[0]  # alpha is the representative for feedback
+                leaks = ham.meta["p_b_leak_per_spin"]
+                log(
+                    f"   norb={ham.norb} nelec={ham.nelec} e_core={ham.e_core:.6f} Ha "
+                    f"(P_B leak per spin {leaks[0]:.2e} / {leaks[1]:.2e}; "
+                    f"spin-resolved ERIs: {ham.has_spin_dependent_eri})"
+                )
+            elif orbital_builder is not None:
                 orbitals = orbital_builder(emb)
             else:
                 orbitals = emb.build_orbitals(
@@ -771,8 +826,11 @@ class EmbeddingWorkflow(BaseSettings):
                     virtual_localizer=virtual_localizer,
                     use_relaxed=self.relax_hf,
                 )
-            log(f"   {orbitals}")
-            if orbital_builder is not None:
+            if not self.spin_downfold:
+                log(f"   {orbitals}")
+            if self.spin_downfold:
+                pass  # already logged per channel above
+            elif orbital_builder is not None:
                 n_kept_virt = orbitals.n_active_orbitals - (orbitals.n_occ - orbitals.inactive.size)
                 log(
                     f"   selector=apc-concentric picked {n_kept_virt} virtuals and froze "
@@ -791,11 +849,12 @@ class EmbeddingWorkflow(BaseSettings):
                     "   note: full A virtual space -- pass --n_virtual or "
                     "--selector concentric-cl/mulliken to fit a qubit budget"
                 )
-            ham = emb.embedded_hamiltonian(orbitals)
-            log(
-                f"   norb={ham.norb} nelec={ham.nelec} e_core={ham.e_core:.6f} Ha "
-                f"(P_B leak {ham.meta['p_b_leak']:.2e})"
-            )
+            if not self.spin_downfold:
+                ham = emb.embedded_hamiltonian(orbitals)
+                log(
+                    f"   norb={ham.norb} nelec={ham.nelec} e_core={ham.e_core:.6f} Ha "
+                    f"(P_B leak {ham.meta['p_b_leak']:.2e})"
+                )
 
             log(f"== Step 3: solve with the high-level {self.solver.upper()} solver =={tag}")
             self._maybe_reseed(solver, cycle)
@@ -854,24 +913,43 @@ class EmbeddingWorkflow(BaseSettings):
 
             log(f"== Step 5: feed the correlated 1-RDM back into the embedding =={tag}")
 
-            # TODO(open-shell, needs EmbASI): `fed_a + fed_b` discards the spin
-            # resolution one line after computing it, so the outer loop is still a
-            # spin-summed fixed point.  Closing it needs a per-spin density ingest --
-            # see `projection_embedding_adapter`'s docstring, blocker (2).  Until that
-            # is validated upstream the sum is the conservative choice: it reproduces
-            # the restricted result exactly rather than feeding a half-wired
-            # unrestricted density into the SCF.
+            # An unrestricted result keeps its spin resolution: `fed` stays the
+            # spin-summed total (DIIS, the linear mixing and the max|Δγ| diagnostic below
+            # all operate on one matrix, and the *total* is the right convergence
+            # vector), while `fed_split` carries the alpha/beta pair that is actually fed
+            # back.  Summing the pair here -- as this did -- discarded the polarisation
+            # one line after computing it, making the loop a spin-summed fixed point even
+            # when the solver had resolved the channels.
+            fed_split: tuple[np.ndarray, np.ndarray] | None = None
             if getattr(emb, "unrestricted", False) and result.is_spin_resolved:
                 fed_a, fed_b = emb.rdm1_ao_spin(result.rdm1a, result.rdm1b, orbitals)
                 fed = fed_a + fed_b
+                fed_split = (fed_a, fed_b)
             else:
                 fed = emb.rdm1_ao(result.rdm1, orbitals)
+            # When the feedback is spin-resolved, DIIS and the linear mixing act on the
+            # STACKED pair `(alpha, beta)` rather than on the spin-summed total.  One
+            # coefficient set still applies to both channels -- they share a single fixed
+            # point, so extrapolating them with different coefficients would be
+            # inconsistent -- but the residual now measures each channel's own error, so a
+            # channel that is converging badly is damped on its own terms instead of
+            # having its error masked by cancellation in the sum.  (Measured on an OH
+            # radical: the per-channel corrections are +0.62 / -0.63 while their sum is
+            # -0.014, so the total genuinely hides the per-channel behaviour.)
+            spin_mixed = fed_split is not None
+            vec_now = np.stack(emb._dm_a_spin) if (spin_mixed and emb._dm_a_spin) else dm_a_now
+            vec_fed = np.stack(fed_split) if spin_mixed else fed
+            if spin_mixed and np.asarray(vec_now).shape != np.asarray(vec_fed).shape:
+                # No per-spin input to form a residual against (first cycle after a
+                # restricted start): fall back to the spin-summed vector this round.
+                vec_now, vec_fed, spin_mixed = dm_a_now, fed, False
+
             mixing_desc = f"mix_alpha={self.mix_alpha}"
             extrapolated = None
             if self.diis:
-                diis_inputs.append(dm_a_now)
-                diis_outputs.append(fed)
-                diis_residuals.append(fed - dm_a_now)
+                diis_inputs.append(vec_now)
+                diis_outputs.append(vec_fed)
+                diis_residuals.append(vec_fed - vec_now)
                 if len(diis_residuals) > self.diis_size:
                     diis_inputs.pop(0)
                     diis_outputs.pop(0)
@@ -879,22 +957,39 @@ class EmbeddingWorkflow(BaseSettings):
                 if len(diis_residuals) >= 2:
                     extrapolated = self._diis_extrapolate(diis_residuals, diis_outputs)
                 if extrapolated is not None:
-                    fed = extrapolated
-                    mixing_desc = f"diis(n={len(diis_residuals)})"
+                    vec_fed = extrapolated
+                    per = " per-spin" if spin_mixed else ""
+                    mixing_desc = f"diis(n={len(diis_residuals)}){per}"
                 else:
                     mixing_desc = f"mix_alpha={self.mix_alpha} (DIIS bootstrap/fallback)"
             if extrapolated is None and prev_fed is not None and self.mix_alpha != 1.0:
                 # Linear mixing: DIIS's bootstrap cycle (< 2 vectors) and its
                 # fallback when the subspace matrix is singular (as well as the
-                # historical --diis=False default).
-                fed = self.mix_alpha * fed + (1.0 - self.mix_alpha) * prev_fed
-            prev_fed = fed
+                # historical --diis=False default).  `prev_fed` carries whichever vector
+                # shape the previous cycle used, so only mix when they agree.
+                if np.asarray(prev_fed).shape == np.asarray(vec_fed).shape:
+                    vec_fed = self.mix_alpha * vec_fed + (1.0 - self.mix_alpha) * prev_fed
+            prev_fed = vec_fed
+            # Unstack: `fed` stays the spin-summed total (the |Δ| diagnostic and the
+            # restricted path read it), `fed_split` the mixed channels.
+            if spin_mixed:
+                arr = np.asarray(vec_fed)
+                fed_split = (arr[0], arr[1])
+                fed = arr[0] + arr[1]
+            else:
+                fed = np.asarray(vec_fed)
+            # No rescaling needed: the pair itself went through DIIS/mixing above, so
+            # `fed_split` and `fed` are consistent by construction (`fed` is their sum).
+            fed_in: np.ndarray | tuple[np.ndarray, np.ndarray] = (
+                fed_split if fed_split is not None else fed
+            )
             # Currently commented out the old outer loop behaviour where the
             # low level potential is re-constructed and subtracted from the
             # supersystem embedding potential.
-            # emb.run_low_level(dma_in=fed, dmb_in=emb._dm_b)
-            emb.run_low_level_a_only(dma_in=fed, dmb_in=emb._dm_b)
-            log(f"   embedded Fock rebuilt at γ̃^A + γ^B ({mixing_desc}).")
+            # emb.run_low_level(dma_in=fed_in, dmb_in=emb._dm_b)
+            emb.run_low_level_a_only(dma_in=fed_in, dmb_in=emb._dm_b)
+            spin_note = "" if fed_split is None else " [per-spin pair]"
+            log(f"   embedded Fock rebuilt at γ̃^A + γ^B ({mixing_desc}){spin_note}.")
 
         return energy
 

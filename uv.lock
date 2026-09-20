@@ -49,14 +49,10 @@ wheels = [
 [[package]]
 name = "asi4py"
 version = "1.4.5"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://gitlab.com/pvst/asi.git?subdirectory=pyasi&rev=doc_corrections#57be26ec24e39b5be2cb79188c489851a0da7274" }
 dependencies = [
     { name = "ase" },
     { name = "scalapack4py" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/00/ef/4ac4708d5a4a1aceaf139ef0141aea9edefdc92660bd7f5d22d6e33cce03/asi4py-1.4.5.tar.gz", hash = "sha256:5e6a288de46626920fb89bece116cd4a031bfec0300bf4b5015dae400f41df2b", size = 19687, upload-time = "2025-10-13T17:38:54.214Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/95/6d/39320dcde520799bc6c14e977b51e0b0b1d898634450c581306ccdba82de/asi4py-1.4.5-py3-none-any.whl", hash = "sha256:dd98e0865000ec9fe9ddac767e8adcbfaa1df954dff298cc4730b59a5c81f8ed", size = 19357, upload-time = "2025-10-13T17:38:52.791Z" },
 ]
 
 [[package]]
@@ -715,7 +711,7 @@ wheels = [
 [[package]]
 name = "embasi"
 version = "0.5.0"
-source = { git = "https://github.com/tamm-cci/EmbASI.git?rev=qm-code-adapter#a671067aeba7ebe93a9c6e30ffd8f60717185bf1" }
+source = { git = "https://github.com/tamm-cci/EmbASI.git?rev=qm-code-adapter#29731694151074a921d0832994af9ad2ed7e378d" }
 dependencies = [
     { name = "ase" },
     { name = "asi4py" },
@@ -790,6 +786,7 @@ relabel = [
 
 [package.metadata]
 requires-dist = [
+    { name = "asi4py", marker = "extra == 'embed'", git = "https://gitlab.com/pvst/asi.git?subdirectory=pyasi&rev=doc_corrections" },
     { name = "embasi", marker = "extra == 'embed'", git = "https://github.com/tamm-cci/EmbASI.git?rev=qm-code-adapter" },
     { name = "embasi-qiskit-integration", extras = ["quantum", "fermions", "relabel", "hardware", "embed"], marker = "extra == 'all'" },
     { name = "ffsim", marker = "extra == 'quantum'" },
@@ -813,6 +810,7 @@ requires-dist = [
     { name = "rdkit", marker = "extra == 'dev'", specifier = ">=2023.9" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.20" },
     { name = "samplomatic", marker = "extra == 'hardware'" },
+    { name = "scalapack4py", marker = "extra == 'embed'", git = "https://gitlab.com/pvst/scalapack4py.git?rev=v1.0_release" },
     { name = "scipy", specifier = ">=1.10" },
 ]
 provides-extras = ["quantum", "fermions", "relabel", "hardware", "embed", "chem", "dev", "all"]
@@ -3120,17 +3118,13 @@ wheels = [
 
 [[package]]
 name = "scalapack4py"
-version = "0.2.0"
-source = { registry = "https://pypi.org/simple" }
+version = "1.0.0"
+source = { git = "https://gitlab.com/pvst/scalapack4py.git?rev=v1.0_release#5c386b3edb4e8b4bc1f0e0996dc2019f0ddf1f63" }
 dependencies = [
     { name = "mpi4py" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/93/a8/00871a7638523329ba4333a17a60e2f10dc006c54c8dda5a09542cf50f3c/scalapack4py-0.2.0.tar.gz", hash = "sha256:aa1af82ed206759e75f2fb61b9ebbf25fec694b33e4bcda5a85c020d3b825816", size = 18961, upload-time = "2025-10-13T10:31:29.643Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/03/2d/8c124b68e3303f933cf2db6ed965e3f467183a983631d47e92f77fe268b1/scalapack4py-0.2.0-py3-none-any.whl", hash = "sha256:f365bdccaaeea2c6cb2be0343ed3ed8c1347467b8460ca081ced05f5a89f7f59", size = 22289, upload-time = "2025-10-13T10:31:28.171Z" },
 ]
 
 [[package]]

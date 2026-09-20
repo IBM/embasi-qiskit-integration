@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import warnings
 
+from typing import Any
+
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -26,7 +28,23 @@ class EmbeddedHamiltonian(BaseModel):
 
     Attributes:
         h1: One-body integrals, shape ``(norb, norb)``. Hermitian. The embedding
-            potential is already folded in.
+            potential is already folded in. On an open shell this is the
+            **spin-averaged** operator, kept required so every existing consumer
+            (SQD, FCIDUMP) keeps working unchanged.
+        h1a: Optional alpha one-body integrals, shape ``(norb, norb)``, Hermitian.
+            Given with ``h1b`` for a genuine spin-dependent downfold, where the two
+            spin channels see different mean fields. Only a solver that can consume
+            the pair uses it (``FCISolver`` -> ``pyscf.fci.direct_uhf``); the others
+            fall back to ``h1`` and say so. ``None`` means spin-restricted.
+        h1b: Optional beta one-body integrals. Must accompany ``h1a``.
+        h2_spin: Optional ``(h2_aa, h2_ab, h2_bb)`` two-body triple, each
+            ``(norb,)*4`` in chemists' notation, for a downfold whose two spin channels
+            use *different* orbital sets. ``h2`` stays required and remains the
+            alpha-only tensor every other consumer reads. Only ``h2_aa`` and ``h2_bb``
+            carry full 8-fold permutational symmetry; the mixed ``h2_ab`` block is built
+            from two different orbital sets, so it is symmetric only under
+            ``(pq|rs) == (qp|rs) == (pq|sr)`` and is *not* checked for the 8-fold
+            property. Requires ``h1a``/``h1b``.
         h2: Two-body integrals, shape ``(norb, norb, norb, norb)`` in *chemists'*
             notation ``(pq|rs)``.
         e_core: Scalar offset (nuclear repulsion + environment/frozen-core).
@@ -40,12 +58,42 @@ class EmbeddedHamiltonian(BaseModel):
     h2: np.ndarray
     e_core: float
     nelec: tuple[int, int]
+    h1a: np.ndarray | None = None
+    h1b: np.ndarray | None = None
+    h2_spin: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
     meta: dict = Field(default_factory=dict)
 
     @field_validator("h1", "h2", mode="before")
     @classmethod
     def _as_float_array(cls, value: object) -> np.ndarray:
         return np.asarray(value, dtype=float)
+
+    @field_validator("h1a", "h1b", mode="before")
+    @classmethod
+    def _as_optional_float_array(cls, value: object) -> np.ndarray | None:
+        return None if value is None else np.asarray(value, dtype=float)
+
+    @field_validator("h2_spin", mode="before")
+    @classmethod
+    def _as_optional_eri_triple(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        arrays = tuple(np.asarray(v, dtype=float) for v in value)
+        if len(arrays) != 3:
+            raise ValueError(
+                f"h2_spin must be a (h2_aa, h2_ab, h2_bb) triple; got {len(arrays)} arrays"
+            )
+        return arrays
+
+    @property
+    def is_spin_dependent(self) -> bool:
+        """True when a genuine ``(h1a, h1b)`` pair is available."""
+        return self.h1a is not None
+
+    @property
+    def has_spin_dependent_eri(self) -> bool:
+        """True when a genuine ``(aa, ab, bb)`` two-body triple is available."""
+        return self.h2_spin is not None
 
     @model_validator(mode="after")
     def _validate_shapes(self) -> EmbeddedHamiltonian:
@@ -72,6 +120,51 @@ class EmbeddedHamiltonian(BaseModel):
                 "h2 does not satisfy 8-fold permutational symmetry to atol=1e-6",
                 stacklevel=2,
             )
+
+        # The spin-dependent pair is all-or-nothing, same rule as SolverResult's
+        # rdm1a/rdm1b: half a pair is a plumbing slip, and a solver picking the
+        # present half would silently use one spin's operator for both channels.
+        if (self.h1a is None) != (self.h1b is None):
+            raise ValueError("h1a and h1b must be given together, or neither")
+        h1a, h1b = self.h1a, self.h1b
+        if h1a is not None and h1b is not None:
+            # Bound to locals so the None-narrowing survives into the loop (a tuple of
+            # the attributes would widen the element type back to `ndarray | None`).
+            for name, arr in (("h1a", h1a), ("h1b", h1b)):
+                if arr.shape != (norb, norb):
+                    raise ValueError(
+                        f"{name} must have shape {(norb, norb)} to match h1; got {arr.shape}"
+                    )
+                if not np.allclose(arr, arr.conj().T, atol=1e-8):
+                    raise ValueError(f"{name} is not Hermitian to atol=1e-8")
+
+        h2_spin = self.h2_spin
+        if h2_spin is not None:
+            if h1a is None:
+                raise ValueError(
+                    "h2_spin needs h1a/h1b: a spin-dependent two-body tensor with a "
+                    "spin-averaged one-body operator is not a coherent Hamiltonian"
+                )
+            for name, arr in zip(("h2_aa", "h2_ab", "h2_bb"), h2_spin, strict=True):
+                if arr.shape != (norb,) * 4:
+                    raise ValueError(f"{name} must have shape {(norb,) * 4}; got {arr.shape}")
+            # Only the same-spin blocks have the 8-fold property; h2_ab is built from
+            # two different orbital sets, so (pq|rs) != (rs|pq) there by construction.
+            for name, arr in (("h2_aa", h2_spin[0]), ("h2_bb", h2_spin[2])):
+                if not _has_eightfold_symmetry(arr, atol=1e-6):
+                    warnings.warn(
+                        f"{name} does not satisfy 8-fold permutational symmetry to atol=1e-6",
+                        stacklevel=2,
+                    )
+            ab = h2_spin[1]
+            if not np.allclose(ab, ab.transpose(1, 0, 2, 3), atol=1e-6) or not np.allclose(
+                ab, ab.transpose(0, 1, 3, 2), atol=1e-6
+            ):
+                warnings.warn(
+                    "h2_ab is not symmetric under (pq|rs) == (qp|rs) == (pq|sr) to "
+                    "atol=1e-6; the mixed-spin block looks malformed",
+                    stacklevel=2,
+                )
         return self
 
     @property

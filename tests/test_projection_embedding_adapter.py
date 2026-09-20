@@ -388,10 +388,13 @@ def test_pbe_in_pbe_null_case_A_terms_reduce_to_fragment_hf_minus_pbe(adapter, o
     )
     # Correction must vanish (γ̃ == γ), isolating the A-term difference.
     assert abs(energy.correction) < 1e-8
-    # The footing rebasing must have fired (the frames genuinely differ here).
-    assert energy.footing_shift > 1.0  # ~3.8 Ha for this fragment
+    # Since EmbASI's 9c21cac (ghosts=0) A_LL shares e_core's frame, so the rebase is an
+    # identity here.  Pinned tight: a NON-zero shift now means the frames have diverged
+    # again, which is what the ~4 Ha bug looked like.
+    assert energy.footing_shift == pytest.approx(0.0, abs=1e-9)
 
-    # Independent reference: fragment HF - PBE at γ^A on EmbASI's ghosted A mol.
+    # Independent reference: fragment HF - PBE at γ^A on EmbASI's A_LL mol (no longer
+    # ghosted since 9c21cac -- it is the supersystem mol with an adjusted charge).
     dm_a = adapter._dm_a
     mol_a = adapter.p.A_LL.atoms.calc.mol
     hcore_a = np.asarray(mol_a.intor("int1e_kin") + mol_a.intor("int1e_nuc"))
@@ -631,8 +634,11 @@ def test_projection_energy_from_state_matches_the_live_assembly():
         "total",
     ):
         assert getattr(from_state, term) == pytest.approx(getattr(live, term), abs=1e-12), term
-    # The shift is genuinely large here, so the agreement above is a real test of it.
-    assert abs(live.footing_shift) > 1.0
+    # The shift is an identity since EmbASI's 9c21cac (ghosts=0) -- see
+    # test_pbe_in_pbe_null_case_A_terms_reduce_to_fragment_hf_minus_pbe.  The
+    # term-by-term agreement above is still the real test: it covers e_high_A, the
+    # Eq. 8 correction and the projector leak, none of which are trivial.
+    assert live.footing_shift == pytest.approx(0.0, abs=1e-9)
 
 
 def test_projection_energy_from_state_reports_a_missing_key_by_name():

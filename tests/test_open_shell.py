@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import textwrap
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -202,14 +204,50 @@ def test_somo_pattern_rejects_counts_that_do_not_fit():
 # --------------------------------------------------------------------------- #
 # the embedding path is deliberately NOT yet open shell
 # --------------------------------------------------------------------------- #
-def test_unrestricted_downfold_refuses_restricted_orbitals():
-    """``unrestricted=True`` must not silently produce the ``na == nb`` split.
+def _restricted_orbitals():
+    return EmbeddedOrbitals(
+        coeff=np.eye(4),
+        energy=np.arange(4.0),
+        n_occ=2,
+        inactive=np.array([], dtype=int),
+        active=np.array([0, 1, 2]),
+    )
 
-    Nothing populates ``n_occ_b`` from EmbASI yet -- ``build_orbitals`` infers a single
-    ``n_occ`` from ``mo_a_ll.shape[1]`` -- so an unrestricted adapter handed restricted
-    orbitals would downfold to a closed shell while reporting success. That is the exact
-    failure the ``// 2`` removal was meant to end, so it raises instead. Pinning it here
-    keeps the gap visible rather than latent.
+
+def test_unrestricted_downfold_refuses_when_the_spin_is_unknown():
+    """``unrestricted=True`` with no evidence of the sector must not guess.
+
+    When EmbASI exposes no ``A_spin``, ``build_orbitals`` has nothing to populate
+    ``n_occ_b`` from, so an unrestricted adapter handed restricted orbitals would
+    downfold to a closed shell while reporting success. That is the exact failure the
+    ``// 2`` removal was meant to end, so it raises instead.
+
+    Note the refusal keys on the *reported spin*, not on ``unrestricted`` alone -- see
+    :func:`test_unrestricted_singlet_downfolds` for the case that must now be allowed.
+    """
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        ProjectionEmbeddingAdapter,
+    )
+
+    adapter = ProjectionEmbeddingAdapter.__new__(ProjectionEmbeddingAdapter)
+    adapter.unrestricted = True  # no `p`, so A_spin is unavailable
+    restricted = _restricted_orbitals()
+    assert not restricted.is_open_shell
+    with pytest.raises(NotImplementedError, match="no A_spin"):
+        adapter.embedded_hamiltonian(restricted)
+
+
+def test_unrestricted_singlet_downfolds():
+    """An unrestricted run whose partition reports ``2S == 0`` is well-posed.
+
+    ``n_alpha == n_beta`` is represented exactly by the restricted downfold, so
+    refusing it would reject a valid run. The blanket
+    ``unrestricted and not is_open_shell`` refusal did exactly that; the guard now
+    keys on whether the spin is *known*.
+
+    Reaching the real downfold needs live integrals, so this asserts only that the
+    spin guard no longer fires -- the failure that follows is from the missing
+    ``h_emb``, which is the point: execution got past the refusal.
     """
     from embasi_qiskit_integration.projection_embedding_adapter import (
         ProjectionEmbeddingAdapter,
@@ -217,16 +255,14 @@ def test_unrestricted_downfold_refuses_restricted_orbitals():
 
     adapter = ProjectionEmbeddingAdapter.__new__(ProjectionEmbeddingAdapter)
     adapter.unrestricted = True
-    restricted = EmbeddedOrbitals(
-        coeff=np.eye(4),
-        energy=np.arange(4.0),
-        n_occ=2,
-        inactive=np.array([], dtype=int),
-        active=np.array([0, 1, 2]),
+    adapter.p = SimpleNamespace(A_spin=0)  # a reported singlet
+
+    with pytest.raises(Exception) as excinfo:  # noqa: PT011 -- any non-refusal failure
+        adapter.embedded_hamiltonian(_restricted_orbitals())
+    assert not isinstance(excinfo.value, NotImplementedError), (
+        "the spin guard fired on a reported singlet; an unrestricted 2S == 0 run "
+        "must be allowed through the restricted downfold"
     )
-    assert not restricted.is_open_shell
-    with pytest.raises(NotImplementedError, match="n_occ_b is None"):
-        adapter.embedded_hamiltonian(restricted)
 
 
 def test_apc_selection_forwards_the_beta_count():
@@ -245,12 +281,29 @@ def test_apc_selection_forwards_the_beta_count():
     """
     import ast
     import inspect
+    import linecache
 
     from embasi_qiskit_integration.projection_embedding_adapter import (
         ProjectionEmbeddingAdapter,
     )
 
+    # `inspect.getsource` slices the file on disk at the function's *cached*
+    # `co_firstlineno`. If the module was edited after import -- which happens when a
+    # long suite runs while the source is being changed -- those line numbers are stale
+    # and getsource silently returns a neighbouring function, failing this test for a
+    # reason that has nothing to do with the code. Drop linecache's view so the slice is
+    # taken against the file as it is now, and skip rather than fail if it still does not
+    # line up (a stale interpreter, not a regression).
+    linecache.checkcache()
+
     src = inspect.getsource(ProjectionEmbeddingAdapter.build_orbitals_apc_concentric)
+    if not src.lstrip().startswith("def build_orbitals_apc_concentric"):
+        pytest.skip(
+            "inspect.getsource returned a stale slice (module edited after import); "
+            "the behavioural equivalent is "
+            "test_open_shell_embedding_live.py::"
+            "test_apc_selection_forwards_the_beta_count_for_real"
+        )
     tree = ast.parse(textwrap.dedent(src))
     constructions = [
         node

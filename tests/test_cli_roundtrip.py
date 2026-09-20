@@ -121,3 +121,63 @@ def test_hyphenated_flag_spelling_is_rejected(tmp_path):
 
     with pytest.raises(SystemExit):
         main(["solve", str(tmp_path), "--optimization-level", "3"])
+
+
+def test_spin_resolved_rdms_survive_the_job_directory(tmp_path):
+    """``rdm1a``/``rdm1b`` must cross the process boundary, not be silently dropped.
+
+    ``write_result`` used to serialise only ``energy``/``rdm1``/``rdm2``/``diagnostics``,
+    so an unrestricted solve lost its spin resolution on the way out: nothing raised,
+    ``is_spin_resolved`` came back ``False``, and the unrestricted outer-loop branch
+    fell back to the spin-summed density.  That is invisible in the energy until the
+    open-shell physics is wrong, so pin the round-trip.
+    """
+    from embasi_qiskit_integration.contract import SolverResult
+
+    rdm1a = np.diag([1.0, 1.0, 0.0])
+    rdm1b = np.diag([1.0, 0.0, 0.0])
+    res = SolverResult(energy=-1.5, rdm1=rdm1a + rdm1b, rdm1a=rdm1a, rdm1b=rdm1b, diagnostics={})
+    ipc.write_result(res, tmp_path)
+    back = ipc.read_result(tmp_path)
+
+    assert back.is_spin_resolved
+    np.testing.assert_allclose(back.rdm1a, rdm1a)
+    np.testing.assert_allclose(back.rdm1b, rdm1b)
+    # The sector survives too -- (2, 1) is a doublet, which a spin-summed rdm1 alone
+    # cannot distinguish from any other split of three electrons.
+    assert back.check_spin_sector((2, 1)) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_restricted_result_stays_spin_summed(tmp_path):
+    """A result with no spin pair must round-trip unchanged (no empty arrays written)."""
+    from embasi_qiskit_integration.contract import SolverResult
+
+    res = SolverResult(energy=-1.0, rdm1=np.eye(3), diagnostics={})
+    ipc.write_result(res, tmp_path)
+    back = ipc.read_result(tmp_path)
+
+    assert not back.is_spin_resolved
+    assert back.rdm1a is None and back.rdm1b is None
+
+
+def test_half_a_spin_pair_on_disk_is_rejected(tmp_path):
+    """A truncated file must fail loudly rather than degrade to spin-summed.
+
+    The pair is written together, so half of it means a corrupted or hand-edited
+    ``result.npz``.  ``SolverResult``'s own validator rejects half a pair; this pins
+    that ``read_result`` routes through it instead of quietly dropping the orphan.
+    """
+    from embasi_qiskit_integration.contract import SolverResult
+
+    rdm1a = np.diag([1.0, 1.0, 0.0])
+    rdm1b = np.diag([1.0, 0.0, 0.0])
+    res = SolverResult(energy=-1.5, rdm1=rdm1a + rdm1b, rdm1a=rdm1a, rdm1b=rdm1b, diagnostics={})
+    ipc.write_result(res, tmp_path)
+
+    path = tmp_path / "result.npz"
+    with np.load(path) as npz:
+        kept = {k: npz[k] for k in npz.files if k != "rdm1b"}
+    np.savez(path, **kept)
+
+    with pytest.raises(ValueError, match="together"):
+        ipc.read_result(tmp_path)

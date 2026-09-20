@@ -14,6 +14,8 @@ collected via the addon's ``callback`` hook and stored in ``diagnostics``.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 from embasi_qiskit_integration.circuit_run.spin_layout import (
@@ -122,6 +124,20 @@ def run_sqd(
     if include_configurations is not None:
         extra["include_configurations"] = include_configurations
 
+    if ham.is_spin_dependent:
+        # qiskit-addon-sqd takes a single `one_body_tensor`, so there is nowhere to put
+        # the second channel.  Fall back to the spin-averaged `h1` rather than picking
+        # one channel arbitrarily, and say so: the result is then ROHF-like on an
+        # open shell, not UHF-quality, and comparing it against an unrestricted
+        # reference without knowing that would be misleading.
+        warnings.warn(
+            "this Hamiltonian carries a spin-dependent (h1a, h1b) pair, but SQD's "
+            "diagonalize_fermionic_hamiltonian accepts only one one-body tensor; "
+            "using the spin-averaged h1. The result is spin-restricted (ROHF-like) "
+            "even though the downfold was not. Use the FCI solver for a genuine "
+            "unrestricted solve.",
+            stacklevel=2,
+        )
     result = diagonalize_fermionic_hamiltonian(
         ham.h1,
         ham.h2,

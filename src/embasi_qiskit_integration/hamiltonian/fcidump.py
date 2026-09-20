@@ -55,6 +55,18 @@ def write(ham: EmbeddedHamiltonian, path: str | Path, *, signed_ms2: bool = True
     path = Path(path)
     norb = ham.norb
     na, nb = ham.nelec
+    if ham.is_spin_dependent:
+        # The FCIDUMP format has one &FCI integral block: there is no standard way to
+        # carry a second one-body matrix.  Write the spin-averaged `h1` and warn, so a
+        # reader does not mistake the file for a faithful record of a spin-dependent
+        # downfold.  `nelec`/`ms2` still carry the sector exactly.
+        warnings.warn(
+            "this Hamiltonian carries a spin-dependent (h1a, h1b) pair, which the "
+            "FCIDUMP format cannot represent; writing the spin-averaged h1. The "
+            "(n_alpha, n_beta) sector is preserved, but a reader gets a "
+            "spin-restricted one-body operator.",
+            stacklevel=2,
+        )
     pyscf_fcidump.from_integrals(
         str(path),
         ham.h1,
