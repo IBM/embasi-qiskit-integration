@@ -34,7 +34,15 @@ coverage.xml
 .vscode/
 *.swp
 .DS_Store
+# Emacs backups / autosaves.  Upstream EmbASI has committed these before
+# (`ks_array.py~`, `#qmcode_adapters.py#` ship inside the installed package), so
+# guard our own tree against the same slip.
+*~
+\#*\#
+.\#*
 
 # Local scratch notes and generated docs, deliberately untracked.
 /EMBEDDING_WORKFLOW_NOTES.md
 /docs/
+/port.md
+/TODO.md
