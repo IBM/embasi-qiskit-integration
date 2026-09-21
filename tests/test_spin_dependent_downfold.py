@@ -626,14 +626,29 @@ def test_frozen_core_on_the_spin_path_sums_both_channels():
     assert not np.allclose(per_channel_a, veff_true)
     assert not np.allclose(ham.h1a, _h1(alpha.c_active, fock_a, per_channel_a))
 
-    e_core_true = np.einsum(
-        "ij,ji->", dm_true, (fock_a - ad.ints.veff_ll(ad._dm_a)) + 0.5 * veff_true
+    # `e_core`'s one-body part is PER CHANNEL: each core density against its own
+    # `h_emb_s`.  The two-body part rides the total core density (veff is a functional
+    # of it) and is counted once.
+    h_emb_a = fock_a - ad.ints.veff_ll(ad._dm_a)
+    h_emb_b = ad._fock_spin[1] - ad.ints.veff_ll(ad._dm_a)
+    e_core_true = (
+        np.einsum("ij,ji->", c_in_a @ c_in_a.T, h_emb_a)
+        + np.einsum("ij,ji->", c_in_b @ c_in_b.T, h_emb_b)
+        + 0.5 * np.einsum("ij,ji->", dm_true, veff_true)
     )
     assert ham.e_core == pytest.approx(float(e_core_true), abs=1e-10)
-    e_core_wrong = np.einsum(
-        "ij,ji->", dm_wrong, (fock_a - ad.ints.veff_ll(ad._dm_a)) + 0.5 * veff_wrong
-    )
+    # ...and not the doubled single-channel core.
+    e_core_wrong = np.einsum("ij,ji->", dm_wrong, h_emb_a + 0.5 * veff_wrong)
     assert abs(ham.e_core - float(e_core_wrong)) > 1e-8
+    # ...nor the summed core charged entirely to ALPHA's operator, which has the right
+    # density but the wrong potential for beta's half.  The discrepancy is exactly
+    # `tr[d_b (h_emb_a - h_emb_b)]`, and it survives every electron-count and spin-sector
+    # check, so only a direct comparison catches it.
+    e_core_alpha_only = np.einsum("ij,ji->", dm_true, h_emb_a + 0.5 * veff_true)
+    assert abs(ham.e_core - float(e_core_alpha_only)) > 1e-8
+    assert float(e_core_alpha_only) - float(e_core_true) == pytest.approx(
+        float(np.einsum("ij,ji->", c_in_b @ c_in_b.T, h_emb_a - h_emb_b)), abs=1e-10
+    )
 
 
 def test_frozen_core_is_inert_at_zero_frozen_occupied():

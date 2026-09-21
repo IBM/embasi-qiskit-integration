@@ -2201,6 +2201,11 @@ class ProjectionEmbeddingAdapter:
         inactive densities, not twice either one: each channel freezes its own orbitals,
         so both the folded ``veff`` and ``e_core`` are built from
         ``c_in_a c_in_a^T + c_in_b c_in_b^T``.
+
+        ``e_core``'s *one-body* part is nonetheless per channel -- each core density
+        against its own ``h_emb_s`` -- because the two channels see different embedded
+        Focks.  Its two-body part stays on the total core density, which is what
+        ``veff`` is a functional of.  All of this is inert at ``n_frozen_occ=0``.
         """
         alpha, beta = orbitals
         if alpha.n_active_orbitals != beta.n_active_orbitals:
@@ -2221,12 +2226,17 @@ class ProjectionEmbeddingAdapter:
         # ~0.4 kcal/mol on OH) and large once a frozen orbital is valence-like
         # (<a|S|b> ~ 0.96, ~40 kcal/mol on triplet CH2).  It also cancels identically at
         # `n_frozen_occ=0`, where both forms are zero.
-        dm_in = alpha.c_inactive @ alpha.c_inactive.T + beta.c_inactive @ beta.c_inactive.T
+        # Kept as separate halves as well as the sum: the one-body part of `e_core` below
+        # contracts each channel's core against its own operator, which the summed
+        # density alone cannot express.
+        dm_core_a = alpha.c_inactive @ alpha.c_inactive.T
+        dm_core_b = beta.c_inactive @ beta.c_inactive.T
+        dm_in = dm_core_a + dm_core_b
         # Both channels see the SAME frozen-core mean field: veff is a functional of the
         # total core density, not of one spin's half of it.
         veff_in = self.ints.veff_hf(dm_in)
 
-        h1_pair, leaks = [], []
+        h1_pair, leaks, h_emb_pair = [], [], []
         for ispin, orb in ((0, alpha), (1, beta)):
             c_act = orb.c_active
             # Each channel's own projector must be invisible in its own active space.
@@ -2235,6 +2245,9 @@ class ProjectionEmbeddingAdapter:
             # h_emb per channel: strip the low-level mean field, exactly as `h_emb` does
             # for the spin-summed Fock (see that property for why it is veff_ll).
             h_emb_s = fock - self.ints.veff_ll(self._dm_a_arr)
+            # Kept for `e_core` below, which must charge each channel's frozen core to
+            # its OWN one-body operator -- the same one its h1 is built from.
+            h_emb_pair.append(h_emb_s)
             h1_s = c_act.T @ (h_emb_s + veff_in) @ c_act
             asym = float(np.abs(h1_s - h1_s.T).max())
             if asym > 1e-6:
@@ -2270,11 +2283,20 @@ class ProjectionEmbeddingAdapter:
             # A backend without the mixed transform (e.g. a stub): fall back to the
             # spin-free tensor rather than fabricating a triple, and record it.
             h2_spin = None
-        e_core = self.ints.energy_nuc() + np.einsum(
-            "ij,ji->",
-            dm_in,
-            (self._fock_spin[0] - self.ints.veff_ll(self._dm_a_arr))  # type: ignore[index]
-            + 0.5 * veff_in,
+        # Frozen-core energy, per channel.  Each channel's core density is charged to
+        # ITS OWN embedded one-body operator (the very `h_emb_s` its h1 is built from),
+        # not to alpha's for both: the two channels see different Focks, so contracting
+        # beta's core against `h_emb_a` charges it at the wrong potential.  The error is
+        # exactly `tr[d_b (h_emb_a - h_emb_b)]` -- 0.0162 Ha (10.2 kcal/mol) on the OH
+        # radical at n_frozen_occ=1, with the right electron count and spin sector, so
+        # nothing else flags it.  The two-body term stays on the TOTAL core density
+        # (`veff_in` is a functional of it) and is counted once, hence the single 0.5.
+        # Vanishes identically at n_frozen_occ=0, where both cores are empty.
+        e_core = float(
+            self.ints.energy_nuc()
+            + np.einsum("ij,ji->", dm_core_a, h_emb_pair[0])
+            + np.einsum("ij,ji->", dm_core_b, h_emb_pair[1])
+            + 0.5 * np.einsum("ij,ji->", dm_in, veff_in)
         )
         n_alpha = alpha.n_occ - alpha.inactive.size
         n_beta = beta.n_occ - beta.inactive.size

@@ -257,6 +257,118 @@ def test_spin_free_eri_is_a_real_approximation(open_shell):
     assert abs(res_free.energy - result.energy) > 1.0
 
 
+@pytest.fixture(scope="module")
+def open_shell_frozen():
+    """The same embedding, but with one frozen occupied per channel.
+
+    Every other test here runs at ``n_frozen_occ=0``, where the whole frozen-core term
+    vanishes identically -- so the core fold and its ``e_core`` contribution had no
+    live numerical coverage at all. This fixture is that coverage.
+    """
+    adapter = _build_open_shell_adapter()
+    adapter.run_low_level()
+    alpha, beta = adapter.build_orbitals_spin(n_frozen_occ=1)
+    ham = adapter.embedded_hamiltonian_spin((alpha, beta))
+    return adapter, alpha, beta, ham
+
+
+def test_frozen_core_e_core_charges_each_channel_to_its_own_fock(open_shell_frozen):
+    """``e_core``'s one-body part is per channel, rebuilt independently here.
+
+    The two channels see *different* embedded Focks, so beta's frozen core must be
+    charged to ``h_emb_b``, not to alpha's. Contracting the summed core density against
+    ``h_emb_a`` alone -- which this did -- overcharges by exactly
+    ``tr[d_b (h_emb_a - h_emb_b)]``: **0.0162 Ha (10.2 kcal/mol)** here, with the
+    electron count, the spin sector and the projector leak all still exact, which is why
+    nothing else caught it.
+
+    Rebuilt from the adapter's raw per-spin Fock and integral backend, so a bookkeeping
+    slip shows up as a disagreement rather than as a plausible number.
+    """
+    adapter, alpha, beta, ham = open_shell_frozen
+
+    c_in_a, c_in_b = alpha.c_inactive, beta.c_inactive
+    # The frozen blocks are actually populated, or there is nothing under test.
+    assert c_in_a.shape[1] == 1 and c_in_b.shape[1] == 1
+
+    dm_core_a, dm_core_b = c_in_a @ c_in_a.T, c_in_b @ c_in_b.T
+    dm_core = dm_core_a + dm_core_b
+    veff_in = adapter.ints.veff_hf(dm_core)
+    veff_ll = adapter.ints.veff_ll(adapter._dm_a_arr)
+    h_emb_a = adapter._fock_spin[0] - veff_ll
+    h_emb_b = adapter._fock_spin[1] - veff_ll
+
+    e_core_expected = (
+        adapter.ints.energy_nuc()
+        + np.einsum("ij,ji->", dm_core_a, h_emb_a)
+        + np.einsum("ij,ji->", dm_core_b, h_emb_b)
+        + 0.5 * np.einsum("ij,ji->", dm_core, veff_in)
+    )
+    assert ham.e_core == pytest.approx(float(e_core_expected), abs=1e-9)
+
+    # The regression: both cores charged to alpha's operator. Assert the gap is real and
+    # that it is precisely the cross term, so this fails loudly if the fix is reverted.
+    e_core_alpha_only = (
+        adapter.ints.energy_nuc()
+        + np.einsum("ij,ji->", dm_core, h_emb_a)
+        + 0.5 * np.einsum("ij,ji->", dm_core, veff_in)
+    )
+    cross = float(np.einsum("ij,ji->", dm_core_b, h_emb_a - h_emb_b))
+    assert float(e_core_alpha_only) - float(e_core_expected) == pytest.approx(cross, abs=1e-9)
+    # Physically significant on this system: ~10 kcal/mol, not round-off.
+    assert abs(cross) > 1e-3
+
+
+def test_frozen_core_downfold_matches_an_independent_rebuild(open_shell_frozen):
+    """End-to-end at ``n_frozen_occ=1``: the full solve, rebuilt outside the adapter.
+
+    The companion to :func:`test_downfold_matches_an_independently_rebuilt_hamiltonian`
+    with the frozen-core path actually live, so an error in the core fold cannot hide in
+    ``e_core`` while the electronic part stays right (or vice versa). Checks the *total*,
+    which is what a caller reads.
+    """
+    from pyscf import fci
+
+    from embasi_qiskit_integration.solvers import FCISolver
+
+    adapter, alpha, beta, ham = open_shell_frozen
+    result = FCISolver().solve(ham)
+
+    c_a, c_b = alpha.c_active, beta.c_active
+    c_in_a, c_in_b = alpha.c_inactive, beta.c_inactive
+    dm_core_a, dm_core_b = c_in_a @ c_in_a.T, c_in_b @ c_in_b.T
+    dm_core = dm_core_a + dm_core_b
+    veff_in = adapter.ints.veff_hf(dm_core)
+    veff_ll = adapter.ints.veff_ll(adapter._dm_a_arr)
+    h_emb_a = adapter._fock_spin[0] - veff_ll
+    h_emb_b = adapter._fock_spin[1] - veff_ll
+
+    def _h1(c, h_emb):
+        h = c.T @ (h_emb + veff_in) @ c
+        return 0.5 * (h + h.T)
+
+    eri = (
+        adapter.ints.eri_mo(c_a),
+        adapter.ints.eri_mo_mixed(c_a, c_b),
+        adapter.ints.eri_mo(c_b),
+    )
+    e_elec, _ = fci.direct_uhf.kernel(
+        (_h1(c_a, h_emb_a), _h1(c_b, h_emb_b)), eri, ham.norb, ham.nelec
+    )
+    e_core_indep = (
+        adapter.ints.energy_nuc()
+        + np.einsum("ij,ji->", dm_core_a, h_emb_a)
+        + np.einsum("ij,ji->", dm_core_b, h_emb_b)
+        + 0.5 * np.einsum("ij,ji->", dm_core, veff_in)
+    )
+    assert float(e_elec + e_core_indep) == pytest.approx(result.energy, abs=1e-9)
+
+    # Freezing an occupied really did shrink the active space, so this is a different
+    # downfold from the n_frozen_occ=0 fixture rather than an accidental repeat.
+    assert ham.norb < REF_NORB
+    assert ham.nelec == (REF_NELEC[0] - 1, REF_NELEC[1] - 1)
+
+
 def test_workflow_drives_the_open_shell_path(tmp_path):
     """``spin_downfold=True`` must reach the per-spin path from a config alone.
 
