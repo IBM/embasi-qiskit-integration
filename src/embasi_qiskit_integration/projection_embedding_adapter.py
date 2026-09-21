@@ -115,6 +115,13 @@ already exposed by the spin-polarised PySCF support on ``qm-code-adapter``.
   :meth:`embedded_hamiltonian_spin` emits the ``(h1a, h1b)`` pair
   :class:`~embasi_qiskit_integration.contract.EmbeddedHamiltonian` accepts.
   ``FCISolver`` consumes it via ``pyscf.fci.direct_uhf``.
+* **Per-spin lift-back.**  Because the two channels are diagonalized in *different*
+  spans, everything that lifts an active-space quantity to AO has to be told which
+  channel it is lifting: :meth:`rdm1_ao_spin` and :meth:`projection_energy` both take
+  beta's own orbital set.  Getting this wrong is silent -- the electron counts, the spin
+  sector, the density symmetry and the footing shift all stay exact while the beta AO
+  density is simply the wrong matrix (measured 0.998 off, and 0.0779 Ha / 48.9 kcal/mol
+  on the reported total).
 
 **Why the downfold must be per spin, not spin-summed.**  EmbASI's SPADE partitions the
 two channels independently, so the A/B separation holds *per channel only*: measured
@@ -2292,7 +2299,10 @@ class ProjectionEmbeddingAdapter:
 
     # ---------------- energy assembly ---------------- #
     def projection_energy(
-        self, result: SolverResult, orbitals: EmbeddedOrbitals
+        self,
+        result: SolverResult,
+        orbitals: EmbeddedOrbitals,
+        orbitals_b: EmbeddedOrbitals | None = None,
     ) -> ProjectionEnergy:
         """Paper Eq. 8, undoing the embedding potential the solver already saw.
 
@@ -2319,9 +2329,35 @@ class ProjectionEmbeddingAdapter:
         subtract it from ``e_high_A`` to land it on ``E_low(A)``'s footing.  What
         remains after the shift is the genuine high-vs-low functional difference on
         the fragment (WF-in-DFT), not the nuclear-frame artefact.
+
+        **Per-spin downfold.**  ``orbitals_b`` is the beta channel's own orbital set
+        (:meth:`build_orbitals_spin`'s second return value).  Pass it whenever the
+        Hamiltonian was built by :meth:`embedded_hamiltonian_spin`: the two channels live
+        in *different* spans, so the spin-summed ``rdm1`` cannot be lifted through one
+        set.  Every term here is a contraction of ``dm_hl`` against a spin-summed
+        operator, so getting ``dm_hl`` wrong moves the reported total -- measured
+        **0.0779 Ha (48.9 kcal/mol)** on the OH-radical doublet, with the electron count,
+        the spin sector and the footing shift all still exact, which is why no existing
+        check caught it.  Omit it on a restricted run (bit-identical to before).
         """
         v_emb, p_b = self.v_emb, self.p_b
-        dm_hl = self.rdm1_ao(result.rdm1, orbitals)
+        # Bound to locals so the None-narrowing below reaches `rdm1_ao_spin` (reading the
+        # attributes back off `result` widens them to `ndarray | None` again).  Together
+        # these are `result.is_spin_resolved`, which the contract validates as
+        # all-or-nothing.
+        rdm1a_in, rdm1b_in = result.rdm1a, result.rdm1b
+        dm_a_hl: np.ndarray | None = None
+        dm_b_hl: np.ndarray | None = None
+        if rdm1a_in is not None and rdm1b_in is not None:
+            # Lift each channel through its OWN active space.  Equivalent to
+            # `rdm1_ao(result.rdm1, orbitals)` when both sets coincide (the restricted
+            # case, where `orbitals_b is None`), but on a per-spin downfold the beta half
+            # belongs in beta's span, not alpha's.
+            dm_a_hl, dm_b_hl = self.rdm1_ao_spin(rdm1a_in, rdm1b_in, orbitals, orbitals_b)
+        if orbitals_b is not None and dm_a_hl is not None and dm_b_hl is not None:
+            dm_hl = dm_a_hl + dm_b_hl
+        else:
+            dm_hl = self.rdm1_ao(result.rdm1, orbitals)
 
         leak = float(np.einsum("ij,ji->", dm_hl, p_b))
         e_high_a = float(result.energy) - np.einsum("ij,ji->", dm_hl, v_emb) - leak
@@ -2342,12 +2378,11 @@ class ProjectionEmbeddingAdapter:
         # has no per-spin decomposition without a per-spin energy from the solver.
         correction_spin: tuple[float, float] | None = None
         leak_spin: tuple[float, float] | None = None
-        rdm1a, rdm1b = result.rdm1a, result.rdm1b
-        if rdm1a is not None and rdm1b is not None:
-            # Bound to locals so the None-narrowing reaches rdm1_ao_spin (reading the
-            # attributes there widens them back to `ndarray | None`).  Equivalent to
-            # `result.is_spin_resolved`, which the contract validates as all-or-nothing.
-            dm_a_hl, dm_b_hl = self.rdm1_ao_spin(rdm1a, rdm1b, orbitals)
+        if dm_a_hl is not None and dm_b_hl is not None:
+            # The very halves `dm_hl` was built from above, so the split decomposes *the
+            # density the totals were computed from* rather than a second, differently
+            # lifted one.  That identity is what makes `sum(correction_spin) ==
+            # correction` exact.
             # The reference density splits the same way the core does in rdm1_ao_spin:
             # one electron per channel, i.e. half the 2-occupancy total.
             init_half = 0.5 * self._dm_a_arr_init
@@ -2567,6 +2602,7 @@ class ProjectionEmbeddingAdapter:
         rdm1_active_a: np.ndarray,
         rdm1_active_b: np.ndarray,
         orbitals: EmbeddedOrbitals,
+        orbitals_b: EmbeddedOrbitals | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Back-transform a spin-resolved active 1-RDM pair to AO alpha/beta densities.
 
@@ -2578,13 +2614,33 @@ class ProjectionEmbeddingAdapter:
         not ``2.0 *``), so that the two channels sum back to the same total
         :meth:`rdm1_ao` produces.
 
+        ``orbitals_b`` is the **beta** channel's own orbital set, as returned second by
+        :meth:`build_orbitals_spin`.  It is mandatory on a per-spin downfold and must be
+        omitted on a restricted one:
+
+        * On the per-spin path the two channels are diagonalized in *different* spans
+          (each in its own span(A) -- see :meth:`_eigh_subsystem_a_spin`), so
+          ``rdm1_active_b`` is expressed in **beta's** active orbitals.  Lifting it with
+          alpha's ``c_active`` reads a beta-basis matrix as though it were alpha-basis:
+          the result still has the right trace and the right electron count, so no
+          sector or population check fires, but it is the wrong matrix.  Measured on the
+          OH-radical doublet: ``max|dm_beta|`` wrong by **0.998** (a whole electron's
+          worth of AO density) while ``N_beta`` stayed 4.0 to 1e-15 and the spin
+          polarisation stayed exactly 1.
+        * On the restricted path there is only one set, and passing ``None`` reuses it
+          for both channels -- bit-identical to the previous behaviour.
+
         Returns:
             ``(dm_alpha, dm_beta)`` in the AO basis.
         """
-        c_in, c_act = orbitals.c_inactive, orbitals.c_active
-        core = c_in @ c_in.T  # one electron per channel
-        dm_a = core + c_act @ np.asarray(rdm1_active_a) @ c_act.T
-        dm_b = core + c_act @ np.asarray(rdm1_active_b) @ c_act.T
+        orb_b = orbitals if orbitals_b is None else orbitals_b
+        # One electron per channel, each from its OWN span: `core` is not shared, because
+        # the two channels freeze different orbitals (SPADE partitions the spins
+        # independently).  At `n_frozen_occ=0` both blocks are empty and this is zero.
+        c_in_a, c_act_a = orbitals.c_inactive, orbitals.c_active
+        c_in_b, c_act_b = orb_b.c_inactive, orb_b.c_active
+        dm_a = c_in_a @ c_in_a.T + c_act_a @ np.asarray(rdm1_active_a) @ c_act_a.T
+        dm_b = c_in_b @ c_in_b.T + c_act_b @ np.asarray(rdm1_active_b) @ c_act_b.T
         return dm_a, dm_b
 
     def feedback(self, rdm1_active: np.ndarray, orbitals: EmbeddedOrbitals) -> None:

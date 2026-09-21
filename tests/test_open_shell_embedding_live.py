@@ -34,9 +34,15 @@ REF_NELEC = (5, 4)
 REF_NORB = 8
 REF_E_CORE = 25.2020184581
 REF_E_SOLVER = -53.5224926352
-REF_TOTAL = -110.5897439424
-REF_CORRECTION = -0.0142385801
-REF_CORRECTION_SPIN = (0.6160922018, -0.6303307820)
+# Re-measured 2026-09-21, after the per-channel AO lift fix.  `e_core` and `E_solver`
+# are unchanged (they come from the downfold and the solver, neither of which was
+# affected); `total`, `correction` and the beta half of the split all moved, because all
+# three are contractions of the AO density that was previously lifted through alpha's
+# active space for both channels.  Previous values, for the record:
+# TOTAL -110.5897439424, CORRECTION -0.0142385801, CORRECTION_SPIN[1] -0.6303307820.
+REF_TOTAL = -110.5118889208
+REF_CORRECTION = 0.0232577815
+REF_CORRECTION_SPIN = (0.6160922018, -0.5928344203)
 
 
 def _build_open_shell_adapter():
@@ -194,8 +200,8 @@ def test_energy_split_is_an_exact_decomposition(open_shell):
     ``v_emb`` -- ``h_emb`` subtracts ``h_core``/``veff_ll`` once, so two channels
     subtract them twice) gave parts that disagreed with the whole.
     """
-    adapter, alpha, _, _, result = open_shell
-    energy = adapter.projection_energy(result, alpha)
+    adapter, alpha, beta, _, result = open_shell
+    energy = adapter.projection_energy(result, alpha, beta)
 
     assert energy.is_spin_resolved
     assert sum(energy.correction_spin) == pytest.approx(energy.correction, abs=1e-10)
@@ -216,8 +222,8 @@ def test_open_shell_energies_are_pinned(open_shell):
     an exact FCI, with no sampling anywhere, so drift means something changed -- either
     here or in EmbASI. Widen only with a reason, and record it.
     """
-    adapter, alpha, _, ham, result = open_shell
-    energy = adapter.projection_energy(result, alpha)
+    adapter, alpha, beta, ham, result = open_shell
+    energy = adapter.projection_energy(result, alpha, beta)
 
     assert float(ham.e_core) == pytest.approx(REF_E_CORE, abs=1e-6)
     assert float(result.energy) == pytest.approx(REF_E_SOLVER, abs=1e-6)
@@ -255,9 +261,62 @@ def test_workflow_drives_the_open_shell_path(tmp_path):
     """``spin_downfold=True`` must reach the per-spin path from a config alone.
 
     The adapter-level tests above bypass ``EmbeddingWorkflow``; this pins that the CLI
-    surface actually wires it, including the multi-cycle feedback (cycle >= 2 goes
-    through ``run_low_level_a_only``, which must rebuild the per-spin Fock rather than
-    drop it -- that regression made cycle 2 raise).
+    surface wires it and lands on the *same number*.  The multi-cycle feedback is
+    exercised separately by :func:`test_workflow_open_shell_survives_a_second_cycle`.
+    """
+    from ase import Atoms
+    from ase.io import write
+
+    from embasi_qiskit_integration.embedding import EmbeddingWorkflow
+
+    atoms = Atoms(
+        "OHOHH",
+        positions=[
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.97],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 0.96],
+            [4.9, 0.0, -0.3],
+        ],
+    )
+    xyz = tmp_path / "oh_water.xyz"
+    write(str(xyz), atoms)
+
+    workflow = EmbeddingWorkflow(
+        _cli_parse_args=False,
+        xyz=str(xyz),
+        n_atoms=None,
+        active_atoms=[0, 1],
+        basis="sto-3g",
+        xc_ll="PBE",
+        xc_hl="HF",
+        spin=1,
+        unrestricted=True,
+        spin_downfold=True,
+        selector="none",
+        solver="fci",
+        max_cycles=1,
+        diis=True,
+    )
+    energy = workflow.run(log=lambda *_a, **_k: None)
+    assert energy.is_spin_resolved
+    # At one cycle the workflow must reproduce the adapter-level pinned total exactly.
+    # The previous loose bracket (-120 < total < -100) passed while the workflow lifted
+    # BOTH spin channels through alpha's active space -- a 0.0779 Ha error that sat well
+    # inside a 20 Ha window.  Pin it, so the CLI surface is held to the same number the
+    # adapter tests are.
+    assert float(energy.total) == pytest.approx(REF_TOTAL, abs=1e-6)
+    assert energy.correction_spin[1] == pytest.approx(REF_CORRECTION_SPIN[1], abs=1e-6)
+
+
+def test_workflow_open_shell_survives_a_second_cycle(tmp_path):
+    """Cycle >= 2 goes through ``run_low_level_a_only``, which must rebuild the per-spin
+    Fock rather than drop it -- a regression that made cycle 2 raise.
+
+    Kept separate from the single-cycle pin above because the two assert different
+    things: that one pins a number, this one pins that the loop *advances*.  The fed-back
+    density is the per-channel pair, so a channel lifted through the wrong active space
+    would move this total too.
     """
     from ase import Atoms
     from ase.io import write
@@ -294,10 +353,13 @@ def test_workflow_drives_the_open_shell_path(tmp_path):
         diis=True,
     )
     energy = workflow.run(log=lambda *_a, **_k: None)
-    # Cycle 1 reproduces the pinned single-shot total; cycle 2 moves off it, so only
-    # assert the loop ran and landed somewhere physical.
     assert energy.is_spin_resolved
-    assert -120.0 < energy.total < -100.0
+    # It moved off the single-shot value (the feedback did something) but stayed close
+    # (it is a correction, not a different calculation).
+    assert float(energy.total) != pytest.approx(REF_TOTAL, abs=1e-9)
+    assert float(energy.total) == pytest.approx(REF_TOTAL, abs=0.5)
+    # The split stays exact through the loop.
+    assert sum(energy.correction_spin) == pytest.approx(energy.correction, abs=1e-10)
 
 
 def test_workflow_refuses_an_index_selector_on_the_spin_path(tmp_path):

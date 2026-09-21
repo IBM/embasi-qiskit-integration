@@ -691,3 +691,121 @@ def test_spin_downfold_refuses_active_orbitals_that_leak_into_b():
 
     with pytest.raises(ValueError, match="leak into subsystem B per spin"):
         ad.embedded_hamiltonian_spin((leaky, beta))
+
+
+# --------------------------------------------------------------------------- #
+# the AO lift-back must use each channel's OWN active space
+# --------------------------------------------------------------------------- #
+def test_rdm1_ao_spin_lifts_each_channel_through_its_own_orbitals():
+    """``rdm1_active_b`` lives in BETA's active space, not alpha's.
+
+    ``build_orbitals_spin`` diagonalizes each channel in its own span(A), so the two
+    ``c_active`` blocks are different rotations.  Lifting the beta active RDM with
+    alpha's columns therefore reads a beta-basis matrix as though it were alpha-basis.
+
+    The failure is invisible to every scalar check, which is why it survived: on the live
+    OH-radical doublet the electron counts stayed ``(5, 4)`` to 1e-15, the spin
+    polarisation stayed exactly 1, and the density stayed symmetric -- while
+    ``max|dm_beta|`` was wrong by **0.998**, a whole electron's worth of AO density.
+    """
+    ad = _frozen_core_stub()
+    alpha, beta = ad.build_orbitals_spin(n_frozen_occ=1)
+    # The premise: the channels really are different rotations.
+    assert not np.allclose(alpha.c_active, beta.c_active)
+
+    nact = alpha.c_active.shape[1]
+    rng = np.random.default_rng(11)
+    ra = np.eye(nact) * 0.9
+    rb = np.diag(rng.uniform(0.1, 0.8, nact))
+
+    dm_a, dm_b = ad.rdm1_ao_spin(ra, rb, alpha, beta)
+
+    ca, cb = alpha.c_active, beta.c_active
+    ia, ib = alpha.c_inactive, beta.c_inactive
+    assert np.allclose(dm_a, ia @ ia.T + ca @ ra @ ca.T)
+    assert np.allclose(dm_b, ib @ ib.T + cb @ rb @ cb.T)
+    # ...and NOT what alpha's columns would have produced for the beta channel.
+    assert not np.allclose(dm_b, ia @ ia.T + ca @ rb @ ca.T)
+
+
+def test_rdm1_ao_spin_without_a_beta_set_is_the_restricted_lift():
+    """Omitting ``orbitals_b`` reuses the one set, bit-identical to the old behaviour.
+
+    The restricted path has a single orbital set by construction, so this is the
+    behaviour every existing caller relies on and it must not shift.
+    """
+    ad = _frozen_core_stub()
+    alpha, _ = ad.build_orbitals_spin(n_frozen_occ=1)
+    nact = alpha.c_active.shape[1]
+    ra, rb = np.eye(nact) * 0.7, np.eye(nact) * 0.3
+
+    one = ad.rdm1_ao_spin(ra, rb, alpha)
+    both = ad.rdm1_ao_spin(ra, rb, alpha, alpha)
+    assert np.allclose(one[0], both[0]) and np.allclose(one[1], both[1])
+    # Still the documented one-electron-per-channel core, summing to `rdm1_ao`'s total.
+    total = ad.rdm1_ao(ra + rb, alpha)
+    assert np.allclose(one[0] + one[1], total)
+
+
+def test_projection_energy_lifts_the_spin_pair_through_both_sets():
+    """``projection_energy(result, alpha, beta)`` must contract the per-channel density.
+
+    Every term in the assembly (``e_high_A``, ``correction``, ``projector_leak``, the
+    footing shift) is a contraction of one spin-summed AO density, so lifting that
+    density through alpha alone moves the reported total -- measured **0.0779 Ha
+    (48.9 kcal/mol)** on the OH-radical doublet, with the electron count, the spin sector
+    and the footing shift all still exact.
+
+    The additive split must stay exact at the same time: ``correction_spin`` has to
+    decompose the density the totals were computed *from*, not a second one.
+    """
+    from embasi_qiskit_integration.contract import SolverResult
+
+    ad = _frozen_core_stub()
+    alpha, beta = ad.build_orbitals_spin(n_frozen_occ=1)
+    nact = alpha.c_active.shape[1]
+    rng = np.random.default_rng(3)
+    ra = np.diag(rng.uniform(0.2, 0.9, nact))
+    rb = np.diag(rng.uniform(0.2, 0.9, nact))
+    result = SolverResult(energy=-3.0, rdm1=ra + rb, rdm1a=ra, rdm1b=rb)
+
+    nao = ad._dm_a.shape[0]
+    ad._dm_a_init = np.eye(nao) * 0.25
+    ad._low_level_energies = lambda: (-10.0, -4.0)
+    # `v_emb`/`p_b` are read-only properties derived from the spin-summed state, which
+    # `_frozen_core_stub` does not set (it only builds the per-spin Fock).  Drive them:
+    # v_emb = (fock - veff_ll) - hcore - p_b, with the stub's hcore/veff_ll both zero.
+    p_b = rng.standard_normal((nao, nao))
+    p_b = p_b + p_b.T
+    v_emb = rng.standard_normal((nao, nao))
+    v_emb = v_emb + v_emb.T
+    ad._p_b = p_b
+    ad._fock = v_emb + p_b
+    ad._s = np.eye(nao)
+    ad.mu = 1.0e6
+    ad._a_fragment_footing = lambda: (np.zeros((nao, nao)), 0.0)
+
+    class _IntsFull(type(ad.ints)):
+        def hcore(self):
+            return np.zeros((nao, nao))
+
+    ad.ints = _IntsFull()
+
+    with_beta = ad.projection_energy(result, alpha, beta)
+    alpha_only = ad.projection_energy(result, alpha)
+
+    # The two disagree, or the beta set is being ignored and the fix is not wired up.
+    assert not np.isclose(with_beta.total, alpha_only.total)
+
+    # The assembly used the summed per-channel density...
+    dm_a, dm_b = ad.rdm1_ao_spin(ra, rb, alpha, beta)
+    v_emb, p_b = ad.v_emb, ad.p_b
+    assert with_beta.projector_leak == pytest.approx(
+        float(np.einsum("ij,ji->", dm_a + dm_b, p_b)), abs=1e-12
+    )
+    # ...and the split still decomposes exactly that density.
+    assert sum(with_beta.correction_spin) == pytest.approx(with_beta.correction, abs=1e-12)
+    assert sum(with_beta.projector_leak_spin) == pytest.approx(with_beta.projector_leak, abs=1e-12)
+    assert with_beta.correction_spin[0] == pytest.approx(
+        float(np.einsum("ij,ji->", dm_a - 0.5 * ad._dm_a_arr_init, v_emb)), abs=1e-12
+    )

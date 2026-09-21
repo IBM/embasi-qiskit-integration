@@ -796,6 +796,9 @@ class EmbeddingWorkflow(BaseSettings):
             tag = "" if self.max_cycles == 1 else f" [cycle {cycle + 1}/{self.max_cycles}]"
 
             log(f"== Step 2: build subsystem-A orbitals and downfold =={tag}")
+            # Beta's own orbital set, set only on the per-spin path; `None` everywhere
+            # else keeps the restricted lift bit-identical.
+            orbitals_b = None
             if self.spin_downfold:
                 # Genuinely spin-dependent path: two orbital sets, each diagonalized in
                 # its own span(A), downfolded to an (h1a, h1b) pair.  Selectors do not
@@ -823,7 +826,14 @@ class EmbeddingWorkflow(BaseSettings):
                 log(f"   alpha: {spin_orbitals[0]}")
                 log(f"   beta : {spin_orbitals[1]}")
                 ham = emb.embedded_hamiltonian_spin(spin_orbitals)
-                orbitals = spin_orbitals[0]  # alpha is the representative for feedback
+                # Alpha is the representative wherever a single set is enough (logging,
+                # the restricted `rdm1_ao` fallback).  `orbitals_b` carries beta's own
+                # set, which the energy assembly and the spin-resolved feedback both
+                # need: the two channels are diagonalized in DIFFERENT spans, so lifting
+                # beta's active RDM through alpha's columns silently reads a beta-basis
+                # matrix as alpha-basis (right trace and sector, wrong matrix -- 0.0779 Ha
+                # on the OH radical's total).
+                orbitals, orbitals_b = spin_orbitals
                 leaks = ham.meta["p_b_leak_per_spin"]
                 log(
                     f"   norb={ham.norb} nelec={ham.nelec} e_core={ham.e_core:.6f} Ha "
@@ -887,7 +897,7 @@ class EmbeddingWorkflow(BaseSettings):
             )
 
             log(f"== Step 4: assemble the projection-based-embedding energy =={tag}")
-            energy = emb.projection_energy(result, orbitals)
+            energy = emb.projection_energy(result, orbitals, orbitals_b)
             log("   E = E_low(total) - E_low(A) + E_high(A) + corr")
             log(
                 f"     = {energy.e_low_total:.6f} - {energy.e_low_A:.6f} "
@@ -936,7 +946,7 @@ class EmbeddingWorkflow(BaseSettings):
             # when the solver had resolved the channels.
             fed_split: tuple[np.ndarray, np.ndarray] | None = None
             if getattr(emb, "unrestricted", False) and result.is_spin_resolved:
-                fed_a, fed_b = emb.rdm1_ao_spin(result.rdm1a, result.rdm1b, orbitals)
+                fed_a, fed_b = emb.rdm1_ao_spin(result.rdm1a, result.rdm1b, orbitals, orbitals_b)
                 fed = fed_a + fed_b
                 fed_split = (fed_a, fed_b)
             else:
