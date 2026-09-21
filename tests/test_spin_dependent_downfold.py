@@ -824,3 +824,231 @@ def test_projection_energy_lifts_the_spin_pair_through_both_sets():
     assert with_beta.correction_spin[0] == pytest.approx(
         float(np.einsum("ij,ji->", dm_a - 0.5 * ad._dm_a_arr_init, v_emb)), abs=1e-12
     )
+
+
+def test_veff_uhf_matches_an_eri_only_ground_truth():
+    """``veff_uhf`` must equal ``J[d_a+d_b] - K[d_sigma]`` built straight from ``int2e``.
+
+    Deliberately does NOT call ``veff_hf`` (or any other adapter helper) to form the
+    reference: the bug this pins was that the per-spin frozen core used the *restricted*
+    ``J - K/2``, and the pre-existing "independent rebuild" test could not see it because
+    it reused ``adapter.ints.veff_hf`` -- restating the formula under test instead of the
+    physics.  Contracting the raw AO ERIs is the only reference that is independent.
+
+    Coulomb is a functional of the total core density; exchange couples like spins only.
+    So the two channels genuinely differ, and the restricted form is wrong for any pair of
+    distinct cores.
+    """
+    from pyscf import ao2mo, gto, scf
+
+    from embasi_qiskit_integration.projection_embedding_adapter import PySCFIntegrals
+
+    mol = gto.M(atom="O 0 0 0; H 0 0 0.97", basis="sto-3g", spin=1, verbose=0)
+    nao = mol.nao
+    eri = ao2mo.restore(1, mol.intor("int2e"), nao)
+    s = mol.intor("int1e_ovlp")
+
+    # Two genuinely different, valence-like cores (a deep-1s pair would hide the bug).
+    w, v = np.linalg.eigh(s)
+    x = v @ np.diag(1.0 / np.sqrt(w)) @ v.T
+    rng = np.random.default_rng(5)
+    c = x @ np.linalg.qr(rng.standard_normal((nao, nao)))[0]
+    g = np.linalg.qr(rng.standard_normal((4, 4)))[0]
+    c_in_a, c_in_b = c[:, :2], c[:, :4] @ g[:, :2]
+    dm_a, dm_b = c_in_a @ c_in_a.T, c_in_b @ c_in_b.T
+    dm_tot = dm_a + dm_b
+
+    def _j(d):
+        return np.einsum("pqrs,rs->pq", eri, d)
+
+    def _k(d):
+        return np.einsum("prqs,rs->pq", eri, d)
+
+    ints = PySCFIntegrals(scf.UHF(mol))
+    v_a, v_b, e_two = ints.veff_uhf(dm_a, dm_b)
+
+    assert np.allclose(v_a, _j(dm_tot) - _k(dm_a), atol=1e-10)
+    assert np.allclose(v_b, _j(dm_tot) - _k(dm_b), atol=1e-10)
+    e_two_gt = 0.5 * np.einsum("ij,ji->", dm_tot, _j(dm_tot)) - 0.5 * (
+        np.einsum("ij,ji->", dm_a, _k(dm_a)) + np.einsum("ij,ji->", dm_b, _k(dm_b))
+    )
+    assert e_two == pytest.approx(float(e_two_gt), abs=1e-10)
+
+    # The two channels really do differ here, and the restricted fold really is wrong --
+    # otherwise this test would pass against the buggy implementation too.
+    assert not np.allclose(v_a, v_b)
+    assert not np.allclose(v_a, ints.veff_hf(dm_tot), atol=1e-3)
+    assert abs(e_two - 0.5 * np.einsum("ij,ji->", dm_tot, ints.veff_hf(dm_tot))) > 1e-3
+
+
+def test_veff_uhf_reduces_to_the_restricted_fold_on_a_closed_shell():
+    """Equal channels must reproduce ``veff_hf`` exactly, so restricted runs are unmoved.
+
+    ``J[2d] - K[d] == J[2d] - K[2d]/2`` when both channels carry the same ``d``, which is
+    why this change cannot shift any closed-shell number.
+    """
+    from pyscf import gto, scf
+
+    from embasi_qiskit_integration.projection_embedding_adapter import PySCFIntegrals
+
+    mol = gto.M(atom="O 0 0 0; H 0 0 0.97; H 0 0.92 -0.28", basis="sto-3g", verbose=0)
+    nao = mol.nao
+    rng = np.random.default_rng(7)
+    c = rng.standard_normal((nao, 2))
+    d = c @ c.T
+
+    ints = PySCFIntegrals(scf.RHF(mol))
+    v_a, v_b, e_two = ints.veff_uhf(d, d)
+    assert np.allclose(v_a, v_b, atol=1e-12)
+    assert np.allclose(v_a, ints.veff_hf(2.0 * d), atol=1e-10)
+    assert e_two == pytest.approx(
+        0.5 * float(np.einsum("ij,ji->", 2.0 * d, ints.veff_hf(2.0 * d))), abs=1e-10
+    )
+
+
+def test_frozen_core_falls_back_and_records_a_spin_free_veff():
+    """A backend without ``veff_uhf`` keeps the restricted fold and says so in ``meta``.
+
+    The stub integral classes in this file have no ``veff_uhf``, so the fallback must stay
+    working -- and must be *visible*, rather than a silent spin-averaged core.
+    """
+    ad = _frozen_core_stub()
+    alpha, beta = ad.build_orbitals_spin(n_frozen_occ=1)
+    ham = ad.embedded_hamiltonian_spin((alpha, beta))
+    assert ham.meta["veff_core_spin_free"] is True
+
+    # ...and a backend that HAS it reports the spin-resolved fold instead.
+    dm_scale = np.diag(1.0 + np.arange(float(ad._s.shape[0])))
+
+    class _IntsUhf(type(ad.ints)):
+        def veff_uhf(self, dm_a, dm_b):
+            d = np.asarray(dm_a) + np.asarray(dm_b)
+            v = dm_scale @ d @ dm_scale
+            return v, v, 0.5 * float(np.einsum("ij,ji->", d, v))
+
+    ad.ints = _IntsUhf()
+    ham2 = ad.embedded_hamiltonian_spin((alpha, beta))
+    assert ham2.meta["veff_core_spin_free"] is False
+
+
+def test_per_spin_correction_uses_the_polarised_reference_not_a_half():
+    """``correction_spin`` must reference the round-0 ``(alpha, beta)`` pair, not 0.5*total.
+
+    ``gamma^A_init`` is genuinely polarised on an open shell, so halving the spin-summed
+    reference mis-attributes density between the channels.  The *sum* stays exact either
+    way -- which is all the companion sum-invariance test can see -- so this pins the
+    split itself.
+    """
+    from embasi_qiskit_integration.contract import SolverResult
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        EmbeddedOrbitals,
+        ProjectionEmbeddingAdapter,
+    )
+
+    nao, nact = 4, 2
+    rng = np.random.default_rng(23)
+    q = np.linalg.qr(rng.standard_normal((nao, nao)))[0]
+    v_emb = rng.standard_normal((nao, nao))
+    v_emb = v_emb + v_emb.T
+    p_b = rng.standard_normal((nao, nao))
+    p_b = p_b + p_b.T
+
+    ad = ProjectionEmbeddingAdapter.__new__(ProjectionEmbeddingAdapter)
+    ad.unrestricted = True
+    ad.mu = 1.0e6
+    ad._s = np.eye(nao)
+    ad._dm_a = np.eye(nao) * 0.5
+    ad._v_emb_spin = None
+    ad._p_b_spin = None
+    ad._fock_spin = None
+    ad._p_b = p_b
+    ad._fock = v_emb + p_b
+    ad._a_fragment_footing = lambda: (np.zeros((nao, nao)), 0.0)
+    ad._low_level_energies = lambda: (-10.0, -4.0)
+
+    # A deliberately POLARISED reference: 3 alpha / 1 beta, so halving it (2/2) is a
+    # visibly different matrix from the truth.
+    init_a = np.diag([1.0, 1.0, 1.0, 0.0])
+    init_b = np.diag([1.0, 0.0, 0.0, 0.0])
+    ad._dm_a_init = init_a + init_b
+    ad._dm_a_spin_init = (init_a, init_b)
+
+    class _Ints:
+        def hcore(self):
+            return np.zeros((nao, nao))
+
+        def veff_ll(self, dm):
+            return np.zeros((nao, nao))
+
+        def energy_nuc(self):
+            return 0.0
+
+    ad.ints = _Ints()
+    orbitals = EmbeddedOrbitals(
+        coeff=q,
+        energy=np.arange(float(nao)),
+        n_occ=2,
+        inactive=np.array([], dtype=int),
+        active=np.arange(nact),
+    )
+    ra, rb = np.diag([1.0, 0.0]), np.diag([0.6, 0.1])
+    result = SolverResult(energy=-3.0, rdm1=ra + rb, rdm1a=ra, rdm1b=rb)
+
+    energy = ad.projection_energy(result, orbitals)
+    dm_a_hl, dm_b_hl = ad.rdm1_ao_spin(ra, rb, orbitals, None)
+    expected = (
+        float(np.einsum("ij,ji->", dm_a_hl - init_a, ad.v_emb)),
+        float(np.einsum("ij,ji->", dm_b_hl - init_b, ad.v_emb)),
+    )
+    assert energy.correction_spin[0] == pytest.approx(expected[0], abs=1e-12)
+    assert energy.correction_spin[1] == pytest.approx(expected[1], abs=1e-12)
+    # Still an exact decomposition of the total.
+    assert sum(energy.correction_spin) == pytest.approx(energy.correction, abs=1e-12)
+
+    # The halved reference would have given materially different per-channel numbers,
+    # so this assertion is what distinguishes the fix from the bug.
+    half = 0.5 * ad._dm_a_init
+    halved = (
+        float(np.einsum("ij,ji->", dm_a_hl - half, ad.v_emb)),
+        float(np.einsum("ij,ji->", dm_b_hl - half, ad.v_emb)),
+    )
+    assert abs(halved[0] - expected[0]) > 1e-3
+
+
+def test_feedback_calls_run_low_level_with_the_split_densities():
+    """``feedback`` must pass ``dma_in``/``dmb_in``, not a pre-summed ``dm_ab_in``.
+
+    It called ``run_low_level(dm_ab_in=...)``, a parameter that does not exist, so every
+    invocation raised ``TypeError``.  Nothing in-repo calls it (the workflow drives
+    ``run_low_level_a_only`` directly), which is why a broken public method went
+    unnoticed.
+    """
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        EmbeddedOrbitals,
+        ProjectionEmbeddingAdapter,
+    )
+
+    nao = 4
+    ad = ProjectionEmbeddingAdapter.__new__(ProjectionEmbeddingAdapter)
+    ad._s = np.eye(nao)
+    ad._dm_b = np.eye(nao) * 0.25
+    seen = {}
+
+    def _capture(dma_in=None, dmb_in=None, a_nmos=None):
+        seen["dma_in"] = dma_in
+        seen["dmb_in"] = dmb_in
+
+    ad.run_low_level = _capture
+    orbitals = EmbeddedOrbitals(
+        coeff=np.eye(nao),
+        energy=np.zeros(nao),
+        n_occ=2,
+        inactive=np.array([0], dtype=int),
+        active=np.array([1, 2], dtype=int),
+    )
+    ad.feedback(np.eye(2), orbitals)
+
+    assert set(seen) == {"dma_in", "dmb_in"}
+    # A is the correlated density alone; B stays separate rather than being folded in.
+    assert np.allclose(seen["dma_in"], ad.rdm1_ao(np.eye(2), orbitals))
+    assert np.allclose(seen["dmb_in"], ad._dm_b)

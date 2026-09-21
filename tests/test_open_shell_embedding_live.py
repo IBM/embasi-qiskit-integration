@@ -40,9 +40,18 @@ REF_E_SOLVER = -53.5224926352
 # three are contractions of the AO density that was previously lifted through alpha's
 # active space for both channels.  Previous values, for the record:
 # TOTAL -110.5897439424, CORRECTION -0.0142385801, CORRECTION_SPIN[1] -0.6303307820.
+# (The CORRECTION_SPIN figure there is superseded twice over -- see the note on
+# REF_CORRECTION_SPIN below, which was re-measured again after the reference-density fix.)
 REF_TOTAL = -110.5118889208
 REF_CORRECTION = 0.0232577815
-REF_CORRECTION_SPIN = (0.6160922018, -0.5928344203)
+# Re-measured 2026-09-21, after the per-spin reference-density fix.  `total` and
+# `correction` are UNCHANGED: the split is a decomposition of the spin-summed correction,
+# so mis-splitting it moved neither.  The split itself moved a lot -- it was referencing
+# `0.5 * gamma^A_init` for both channels, but `gamma^A_init` is genuinely polarised here
+# (5 alpha / 4 beta), so halving it mis-attributed half an electron of reference density
+# between the channels.  Previous (wrong) values, for the record:
+# (0.6160922018, -0.5928344203) -- off by -/+0.60 Ha, and the wrong sign on beta.
+REF_CORRECTION_SPIN = (0.0117289574, 0.0115288241)
 
 
 def _build_open_shell_adapter():
@@ -206,13 +215,31 @@ def test_energy_split_is_an_exact_decomposition(open_shell):
     assert energy.is_spin_resolved
     assert sum(energy.correction_spin) == pytest.approx(energy.correction, abs=1e-10)
     assert sum(energy.projector_leak_spin) == pytest.approx(energy.projector_leak, abs=1e-10)
-    # The split is informative, not cosmetic: two large nearly-cancelling channel
-    # contributions that the spin-summed value hides.  Measured ~43x here (+0.616 and
-    # -0.630 against a summed -0.014); assert an order of magnitude so the point is
-    # pinned without over-fitting the ratio.
-    assert abs(energy.correction_spin[0]) > 10 * abs(energy.correction)
-    # ...and they really do have opposite signs, which is what makes the sum small.
-    assert energy.correction_spin[0] * energy.correction_spin[1] < 0
+
+    # Each channel is referenced to ITS OWN round-0 density, not to half the spin-summed
+    # one.  This previously asserted the opposite -- two large, opposite-signed,
+    # nearly-cancelling channel contributions (+0.616 / -0.593 against a summed +0.023) --
+    # and cited that as the split being "informative".  It was an artefact: `gamma^A_init`
+    # is polarised (5 alpha / 4 beta), so halving it charged half an electron of reference
+    # density to the wrong channel, which is what produced the large cancelling pair.  The
+    # true split is two small, same-signed terms, so those assertions are inverted here.
+    ref_a, ref_b = adapter._dm_a_spin_init
+    dm_a_hl, dm_b_hl = adapter.rdm1_ao_spin(result.rdm1a, result.rdm1b, alpha, beta)
+    v_emb = adapter.v_emb
+    assert energy.correction_spin[0] == pytest.approx(
+        float(np.einsum("ij,ji->", dm_a_hl - ref_a, v_emb)), abs=1e-10
+    )
+    assert energy.correction_spin[1] == pytest.approx(
+        float(np.einsum("ij,ji->", dm_b_hl - ref_b, v_emb)), abs=1e-10
+    )
+    # Neither channel is an order of magnitude above the total any more, and the halved
+    # reference really would have produced something different -- so this pins the fix
+    # rather than merely the sum, which is invariant either way.
+    half = 0.5 * adapter._dm_a_arr_init
+    assert abs(energy.correction_spin[0]) < 10 * abs(energy.correction)
+    assert (
+        abs(float(np.einsum("ij,ji->", dm_a_hl - half, v_emb)) - energy.correction_spin[0]) > 1e-3
+    )
 
 
 def test_open_shell_energies_are_pinned(open_shell):
@@ -293,25 +320,36 @@ def test_frozen_core_e_core_charges_each_channel_to_its_own_fock(open_shell_froz
 
     dm_core_a, dm_core_b = c_in_a @ c_in_a.T, c_in_b @ c_in_b.T
     dm_core = dm_core_a + dm_core_b
-    veff_in = adapter.ints.veff_hf(dm_core)
     veff_ll = adapter.ints.veff_ll(adapter._dm_a_arr)
     h_emb_a = adapter._fock_spin[0] - veff_ll
     h_emb_b = adapter._fock_spin[1] - veff_ll
+
+    # Two-body core term from the raw AO ERIs, independent of the adapter's own fold (see
+    # the note in `test_frozen_core_downfold_matches_an_independent_rebuild`): the
+    # unrestricted core energy is `0.5 tr[d J[d]] - 0.5 sum_sigma tr[d_sigma K[d_sigma]]`,
+    # which is NOT `0.5 tr[d veff_hf(d)]`.
+    from pyscf import ao2mo
+
+    eri_ao = ao2mo.restore(1, adapter.ints.mol.intor("int2e"), adapter.ints.mol.nao)
+    j_core = np.einsum("pqrs,rs->pq", eri_ao, dm_core)
+    k_a = np.einsum("prqs,rs->pq", eri_ao, dm_core_a)
+    k_b = np.einsum("prqs,rs->pq", eri_ao, dm_core_b)
+    e_core_two_body = 0.5 * np.einsum("ij,ji->", dm_core, j_core) - 0.5 * (
+        np.einsum("ij,ji->", dm_core_a, k_a) + np.einsum("ij,ji->", dm_core_b, k_b)
+    )
 
     e_core_expected = (
         adapter.ints.energy_nuc()
         + np.einsum("ij,ji->", dm_core_a, h_emb_a)
         + np.einsum("ij,ji->", dm_core_b, h_emb_b)
-        + 0.5 * np.einsum("ij,ji->", dm_core, veff_in)
+        + e_core_two_body
     )
     assert ham.e_core == pytest.approx(float(e_core_expected), abs=1e-9)
 
     # The regression: both cores charged to alpha's operator. Assert the gap is real and
     # that it is precisely the cross term, so this fails loudly if the fix is reverted.
     e_core_alpha_only = (
-        adapter.ints.energy_nuc()
-        + np.einsum("ij,ji->", dm_core, h_emb_a)
-        + 0.5 * np.einsum("ij,ji->", dm_core, veff_in)
+        adapter.ints.energy_nuc() + np.einsum("ij,ji->", dm_core, h_emb_a) + e_core_two_body
     )
     cross = float(np.einsum("ij,ji->", dm_core_b, h_emb_a - h_emb_b))
     assert float(e_core_alpha_only) - float(e_core_expected) == pytest.approx(cross, abs=1e-9)
@@ -327,7 +365,7 @@ def test_frozen_core_downfold_matches_an_independent_rebuild(open_shell_frozen):
     ``e_core`` while the electronic part stays right (or vice versa). Checks the *total*,
     which is what a caller reads.
     """
-    from pyscf import fci
+    from pyscf import ao2mo, fci
 
     from embasi_qiskit_integration.solvers import FCISolver
 
@@ -338,12 +376,32 @@ def test_frozen_core_downfold_matches_an_independent_rebuild(open_shell_frozen):
     c_in_a, c_in_b = alpha.c_inactive, beta.c_inactive
     dm_core_a, dm_core_b = c_in_a @ c_in_a.T, c_in_b @ c_in_b.T
     dm_core = dm_core_a + dm_core_b
-    veff_in = adapter.ints.veff_hf(dm_core)
+
+    # Build the frozen-core mean field from the raw AO ERIs, NOT from
+    # `adapter.ints.veff_uhf` (nor `veff_hf`).  Calling the adapter's own helper here
+    # would restate the formula under test: an earlier version of this test used
+    # `veff_hf`, and so could not see that the per-spin core was being folded with the
+    # *restricted* `J - K/2` instead of the unrestricted `J[d] - K[d_sigma]`.  Only an
+    # independent contraction distinguishes the two.
+    eri_ao = ao2mo.restore(1, adapter.ints.mol.intor("int2e"), adapter.ints.mol.nao)
+
+    def _j(d):
+        return np.einsum("pqrs,rs->pq", eri_ao, d)
+
+    def _k(d):
+        return np.einsum("prqs,rs->pq", eri_ao, d)
+
+    veff_in_a = _j(dm_core) - _k(dm_core_a)
+    veff_in_b = _j(dm_core) - _k(dm_core_b)
+    e_core_two_body = 0.5 * np.einsum("ij,ji->", dm_core, _j(dm_core)) - 0.5 * (
+        np.einsum("ij,ji->", dm_core_a, _k(dm_core_a))
+        + np.einsum("ij,ji->", dm_core_b, _k(dm_core_b))
+    )
     veff_ll = adapter.ints.veff_ll(adapter._dm_a_arr)
     h_emb_a = adapter._fock_spin[0] - veff_ll
     h_emb_b = adapter._fock_spin[1] - veff_ll
 
-    def _h1(c, h_emb):
+    def _h1(c, h_emb, veff_in):
         h = c.T @ (h_emb + veff_in) @ c
         return 0.5 * (h + h.T)
 
@@ -353,15 +411,39 @@ def test_frozen_core_downfold_matches_an_independent_rebuild(open_shell_frozen):
         adapter.ints.eri_mo(c_b),
     )
     e_elec, _ = fci.direct_uhf.kernel(
-        (_h1(c_a, h_emb_a), _h1(c_b, h_emb_b)), eri, ham.norb, ham.nelec
+        (_h1(c_a, h_emb_a, veff_in_a), _h1(c_b, h_emb_b, veff_in_b)),
+        eri,
+        ham.norb,
+        ham.nelec,
     )
     e_core_indep = (
         adapter.ints.energy_nuc()
         + np.einsum("ij,ji->", dm_core_a, h_emb_a)
         + np.einsum("ij,ji->", dm_core_b, h_emb_b)
-        + 0.5 * np.einsum("ij,ji->", dm_core, veff_in)
+        + e_core_two_body
     )
     assert float(e_elec + e_core_indep) == pytest.approx(result.energy, abs=1e-9)
+
+    # The spin-averaged fold really is a different answer, so the agreement above is
+    # evidence about the unrestricted core and not a tolerance that would absorb either.
+    # On this doublet the frozen orbital is a deep 1s (the two channels' cores overlap to
+    # ~1e-7), so the gap is small here -- it reaches ~1.9 kcal/mol at n_frozen_occ=2 and
+    # ~0.8 Ha once a frozen orbital is genuinely valence-like.
+    veff_avg = adapter.ints.veff_hf(dm_core)
+    e_core_avg = (
+        adapter.ints.energy_nuc()
+        + np.einsum("ij,ji->", dm_core_a, h_emb_a)
+        + np.einsum("ij,ji->", dm_core_b, h_emb_b)
+        + 0.5 * np.einsum("ij,ji->", dm_core, veff_avg)
+    )
+    e_elec_avg, _ = fci.direct_uhf.kernel(
+        (_h1(c_a, h_emb_a, veff_avg), _h1(c_b, h_emb_b, veff_avg)),
+        eri,
+        ham.norb,
+        ham.nelec,
+    )
+    assert abs(float(e_elec_avg + e_core_avg) - result.energy) > 1e-9
+    assert ham.meta["veff_core_spin_free"] is False
 
     # Freezing an occupied really did shrink the active space, so this is a different
     # downfold from the n_frozen_occ=0 fixture rather than an accidental repeat.

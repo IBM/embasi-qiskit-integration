@@ -157,9 +157,18 @@ per-spin leak ~2e-10, ``E_solver = -53.522493`` Ha.
   ``port.md``.
 * **The energy decomposition is spin-resolved, the totals are not re-derived.**
   :attr:`ProjectionEnergy.correction_spin` / ``projector_leak_spin`` split the two
-  density-linear terms exactly (each pair sums to its total).  ``e_high_A`` has no
+  density-linear terms exactly (each pair sums to its total), each channel referenced to
+  its own round-0 density (``_dm_a_spin_init``) rather than to half the spin-summed one --
+  ``gamma^A`` is polarised, so halving it mis-attributes reference density between the
+  channels while leaving the sum (and hence ``total``) untouched.  ``e_high_A`` has no
   per-spin form -- it carries the solver's total energy, which the solver does not
-  decompose -- and :meth:`export_state` still exports the spin-summed arrays.
+  decompose -- and :meth:`export_state` exports the spin-summed arrays alongside the
+  per-spin ones.
+* **The frozen core is folded unrestricted.**  At ``n_frozen_occ > 0`` each channel sees
+  ``J[d_a + d_b] - K[d_sigma]`` (:meth:`AOIntegrals.veff_uhf`), not the restricted
+  ``J - K/2``: Coulomb is a functional of the total core density but exchange couples
+  like spins only, and SPADE freezes different orbitals per channel.  Inert at
+  ``n_frozen_occ=0``.
 * **The outer loop damps the channels, converges on the total.**  When the feedback is
   spin-resolved, DIIS and the linear mixing act on the stacked ``(alpha, beta)`` pair, so
   each channel's own residual is damped; a single coefficient set is shared, since the
@@ -249,6 +258,30 @@ class AOIntegrals(Protocol):
         7. eq. 18: ``(ia|ia) ~ 0.5 K_aa``).
         """
 
+    def veff_uhf(self, dm_a: np.ndarray, dm_b: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+        """Unrestricted HF mean field of a spin-resolved 1-occupancy density pair.
+
+        Returns ``(v_alpha, v_beta, e_two_body)`` where
+        ``v_sigma = J[dm_a + dm_b] - K[dm_sigma]`` and
+        ``e_two_body = 0.5 tr[d J[d]] - 0.5 (tr[dm_a K[dm_a]] + tr[dm_b K[dm_b]])``
+        with ``d = dm_a + dm_b``.
+
+        This is the frozen-core fold the *per-spin* downfold needs, and it is **not**
+        obtainable from :meth:`veff_hf`.  ``veff_hf`` is the restricted ``J - K/2``:
+        correct only when the two channels share an orbital set, because Coulomb is a
+        functional of the total density but **exchange couples like spins only**.
+        Using the spin-averaged form for two genuinely different cores understates the
+        channel splitting -- measured (ERI-only ground truth, 6-31g, valence-like cores
+        overlapping by 0.34) ``max|v_avg - v_alpha| = 1.09 Ha`` and **+0.78 Ha
+        (+492 kcal/mol)** on the CAS total.  It vanishes only as the two cores coincide,
+        which is why a deep-1s frozen core (overlap 0.9999998) hides it at 0.02
+        kcal/mol.
+
+        The energy is returned alongside the potentials rather than left to the caller
+        because the exchange self-interaction does not factor out of
+        ``0.5 tr[d v]``: that expression is only valid for the restricted ``J - K/2``.
+        """
+
     def eri_mo(self, mo_coeff: np.ndarray) -> np.ndarray:
         """Chemist-notation (pq|rs), shape (nmo,)*4, for the given MO block."""
 
@@ -335,6 +368,37 @@ class PySCFIntegrals:
 
     def get_k(self, dm) -> np.ndarray:
         return self._spin_average(self._hf.get_k(self.mol, np.asarray(dm)))
+
+    def veff_uhf(self, dm_a, dm_b) -> tuple[np.ndarray, np.ndarray, float]:
+        """``(v_alpha, v_beta, e_two_body)`` for a spin-resolved core; see the protocol.
+
+        ``self._hf`` is the restricted *integral engine* (never kernel()'d), and
+        ``get_j``/``get_k`` on it are plain contractions of the AO ERIs with whatever
+        density they are handed -- verified against a direct ``int2e`` contraction.  No
+        spin averaging happens anywhere here; that is what :meth:`veff_hf` does, and what
+        this method exists to avoid.
+
+        Each channel's exchange is fetched in its own call rather than as one stacked
+        ``(2, nao, nao)`` density: the stacked form gives identical numbers (checked) but
+        makes PySCF log ``Incompatible dm dimension. Treat dm as RHF density matrix.`` on
+        every evaluation, which is noise on a per-cycle code path.
+
+        Like :meth:`veff_hf` and :meth:`get_k`, this uses the exact AO ERIs even when
+        the backend was built with ``density_fit``; the DF approximation is applied only
+        in :meth:`eri_mo`/:meth:`eri_mo_mixed`, matching the pre-existing behaviour of
+        the restricted fold rather than introducing a second convention.
+        """
+        d_a = np.asarray(dm_a)
+        d_b = np.asarray(dm_b)
+        d_tot = d_a + d_b
+        j_tot = np.asarray(self._hf.get_j(self.mol, d_tot))
+        k_a = np.asarray(self._hf.get_k(self.mol, d_a))
+        k_b = np.asarray(self._hf.get_k(self.mol, d_b))
+        e_two_body = float(
+            0.5 * np.einsum("ij,ji->", d_tot, j_tot)
+            - 0.5 * (np.einsum("ij,ji->", d_a, k_a) + np.einsum("ij,ji->", d_b, k_b))
+        )
+        return j_tot - k_a, j_tot - k_b, e_two_body
 
     def eri_mo(self, mo_coeff) -> np.ndarray:
         """Chemist-notation ``(pq|rs)`` over the given MO block, shape (nmo,)*4.
@@ -643,6 +707,12 @@ class ProjectionEmbeddingAdapter:
         self._p_b_spin: tuple[np.ndarray, np.ndarray] | None = None
         self._v_emb_spin: tuple[np.ndarray, np.ndarray] | None = None
         self._dm_a_spin: tuple[np.ndarray, np.ndarray] | None = None
+        # The (alpha, beta) halves of `_dm_a_init`, captured on the FIRST run_low_level
+        # only (like `_dm_a_init` itself) and never refreshed -- `_dm_a_spin` tracks the
+        # *current* cycle, so it cannot serve as the Eq. 8 reference.  Without this pair
+        # the per-spin correction has to halve the spin-summed reference, which is wrong
+        # whenever gamma^A is polarised: see `projection_energy`.
+        self._dm_a_spin_init: tuple[np.ndarray, np.ndarray] | None = None
         self._dm_b_spin: tuple[np.ndarray, np.ndarray] | None = None
         self._fock_spin: tuple[np.ndarray, np.ndarray] | None = None
         # EmbASI's v_emb (= H^AB - H^A); on EmbASI's footing, i.e. it does NOT
@@ -847,6 +917,12 @@ class ProjectionEmbeddingAdapter:
         self._v_emb_spin = self._as_ao_pair(v_emb_embasi)
         self._dm_a_spin = self._as_ao_pair(dm_a)
         self._dm_b_spin = self._as_ao_pair(dm_b)
+        # Captured once, on the first run_low_level ever -- the per-spin counterpart of
+        # `_dm_a_init` above, and set under the same condition so the two always describe
+        # the same cycle.  `_dm_a_spin` is refreshed every cycle and must not be used as
+        # the reference (see `projection_energy`'s per-spin split).
+        if self._dm_a_spin_init is None and self._dm_a_spin is not None:
+            self._dm_a_spin_init = (self._dm_a_spin[0].copy(), self._dm_a_spin[1].copy())
 
         # `_assemble_fock_a_only` also rebuilds the per-spin pair (see its comment).
         self._assemble_fock_a_only()
@@ -929,7 +1005,17 @@ class ProjectionEmbeddingAdapter:
     # Per-spin counterparts, exported as a SEPARATE optional set: they are `None` on any
     # restricted run, so requiring them (as `_STATE_ARRAYS` does) would break every
     # closed-shell export.  Each is stored flattened to `(2, nao, nao)`.
-    _STATE_SPIN_ARRAYS = ("_p_b_spin", "_v_emb_spin", "_dm_a_spin", "_dm_b_spin", "_fock_spin")
+    _STATE_SPIN_ARRAYS = (
+        "_p_b_spin",
+        "_v_emb_spin",
+        "_dm_a_spin",
+        "_dm_b_spin",
+        "_fock_spin",
+        # Carried for the same reason `_dm_a_init` is (see `export_state`): a fresh
+        # process re-runs the SCF, and without the round-0 pair the per-spin correction
+        # silently falls back to halving a polarised reference.
+        "_dm_a_spin_init",
+    )
 
     def state_fingerprint(self) -> dict[str, Any]:
         """Identify the adapter a snapshot may be restored into.
@@ -2202,10 +2288,18 @@ class ProjectionEmbeddingAdapter:
         so both the folded ``veff`` and ``e_core`` are built from
         ``c_in_a c_in_a^T + c_in_b c_in_b^T``.
 
-        ``e_core``'s *one-body* part is nonetheless per channel -- each core density
-        against its own ``h_emb_s`` -- because the two channels see different embedded
-        Focks.  Its two-body part stays on the total core density, which is what
-        ``veff`` is a functional of.  All of this is inert at ``n_frozen_occ=0``.
+        The frozen-core mean field is **unrestricted**: each channel sees
+        ``J[d_a + d_b] - K[d_sigma]`` (:meth:`AOIntegrals.veff_uhf`).  Coulomb is a
+        functional of the total core density, but exchange couples like spins only, so
+        the restricted ``J - K/2`` is correct only when both channels freeze the same
+        orbitals -- which SPADE's per-spin partition does not guarantee.  ``e_core``'s
+        one-body part is likewise per channel (each core density against its own
+        ``h_emb_s``, since the two channels see different embedded Focks), and its
+        two-body part carries the matching UHF exchange self-interaction rather than
+        ``0.5 tr[d veff]``, an identity that holds only for the restricted form.  A
+        backend without ``veff_uhf`` falls back to the restricted fold and records
+        ``veff_core_spin_free`` in ``meta``.  All of this is inert at
+        ``n_frozen_occ=0``, where both cores are empty.
         """
         alpha, beta = orbitals
         if alpha.n_active_orbitals != beta.n_active_orbitals:
@@ -2232,9 +2326,34 @@ class ProjectionEmbeddingAdapter:
         dm_core_a = alpha.c_inactive @ alpha.c_inactive.T
         dm_core_b = beta.c_inactive @ beta.c_inactive.T
         dm_in = dm_core_a + dm_core_b
-        # Both channels see the SAME frozen-core mean field: veff is a functional of the
-        # total core density, not of one spin's half of it.
-        veff_in = self.ints.veff_hf(dm_in)
+        # The frozen-core mean field is UNRESTRICTED: `J` is a functional of the total
+        # core density, but exchange couples like spins only, so each channel sees
+        # `J[d_a + d_b] - K[d_sigma]` and the two differ.  The restricted `J - K/2`
+        # (`veff_hf`) is correct only when both channels freeze the SAME orbitals; here
+        # they do not, because SPADE partitions the spins separately.  Measured against an
+        # ERI-only UHF ground truth with valence-like cores (overlap 0.34): the averaged
+        # form is 1.09 Ha off per channel and +0.78 Ha (+492 kcal/mol) on the CAS total.
+        # It is invisible for a deep 1s core (overlap 0.9999998, 0.02 kcal/mol), which is
+        # why the pinned OH numbers barely move -- and why this had to be checked against
+        # a rebuild that does not itself call `veff_hf`.
+        #
+        # `e_two_body` comes back from the same call rather than being recomputed as
+        # `0.5 tr[d veff]`: that identity holds for the restricted `J - K/2` only, since
+        # the exchange self-interaction does not factor out once the two channels have
+        # different K.
+        if hasattr(self.ints, "veff_uhf"):
+            veff_in_a, veff_in_b, e_core_two_body = self.ints.veff_uhf(dm_core_a, dm_core_b)
+            veff_spin_free = False
+        else:
+            # A backend without the unrestricted fold (the stub integral classes in the
+            # tests): keep the restricted form rather than fabricating one, and record it
+            # in `meta` so a consumer can tell the fold was spin-averaged.  Identical to
+            # the previous behaviour, and inert at `n_frozen_occ=0` where both cores are
+            # empty and every form below is zero.
+            veff_in_a = veff_in_b = self.ints.veff_hf(dm_in)
+            e_core_two_body = 0.5 * float(np.einsum("ij,ji->", dm_in, veff_in_a))
+            veff_spin_free = True
+        veff_in_pair = (veff_in_a, veff_in_b)
 
         h1_pair, leaks, h_emb_pair = [], [], []
         for ispin, orb in ((0, alpha), (1, beta)):
@@ -2248,7 +2367,8 @@ class ProjectionEmbeddingAdapter:
             # Kept for `e_core` below, which must charge each channel's frozen core to
             # its OWN one-body operator -- the same one its h1 is built from.
             h_emb_pair.append(h_emb_s)
-            h1_s = c_act.T @ (h_emb_s + veff_in) @ c_act
+            # ...and each channel's own frozen-core potential (see `veff_in_pair` above).
+            h1_s = c_act.T @ (h_emb_s + veff_in_pair[ispin]) @ c_act
             asym = float(np.abs(h1_s - h1_s.T).max())
             if asym > 1e-6:
                 raise ValueError(
@@ -2296,7 +2416,7 @@ class ProjectionEmbeddingAdapter:
             self.ints.energy_nuc()
             + np.einsum("ij,ji->", dm_core_a, h_emb_pair[0])
             + np.einsum("ij,ji->", dm_core_b, h_emb_pair[1])
-            + 0.5 * np.einsum("ij,ji->", dm_in, veff_in)
+            + e_core_two_body
         )
         n_alpha = alpha.n_occ - alpha.inactive.size
         n_beta = beta.n_occ - beta.inactive.size
@@ -2316,6 +2436,9 @@ class ProjectionEmbeddingAdapter:
                 "spin_dependent": True,
                 # Honest record of what is and is not spin-resolved here.
                 "h2_spin_free": h2_spin is None,
+                # True when the backend had no `veff_uhf` and the frozen core fell back
+                # to the restricted `J - K/2` fold.  Always inert at `n_frozen_occ=0`.
+                "veff_core_spin_free": veff_spin_free,
             },
         )
 
@@ -2405,9 +2528,26 @@ class ProjectionEmbeddingAdapter:
             # density the totals were computed from* rather than a second, differently
             # lifted one.  That identity is what makes `sum(correction_spin) ==
             # correction` exact.
-            # The reference density splits the same way the core does in rdm1_ao_spin:
-            # one electron per channel, i.e. half the 2-occupancy total.
-            init_half = 0.5 * self._dm_a_arr_init
+            # The reference density must be split the way EmbASI actually polarised it,
+            # NOT halved.  `gamma^A_init` is genuinely spin-polarised on an open shell
+            # (measured 5 alpha / 4 beta on the OH doublet), so `0.5 * total` assigns 4.5
+            # electrons to each channel and mis-attributes a whole half-electron of
+            # reference density between them.  The spin-summed `correction` is unaffected
+            # (the two halves still sum to the total, which is all a sum check can see),
+            # but the reported per-channel split was wrong by -/+0.60 Ha and inverted the
+            # sign of the beta term: measured (+0.616, -0.593) against the true
+            # (+0.0117, +0.0115).
+            #
+            # `_dm_a_spin_init` is the round-0 pair; fall back to halving only when there
+            # is none (a restricted adapter, or a snapshot predating it), where the two
+            # channels are equal anyway and halving is exact.  Read through `getattr`
+            # because the stub adapters in the tests are built via `object.__new__` and
+            # never run `__init__`, so the attribute may not exist at all.
+            spin_init = getattr(self, "_dm_a_spin_init", None)
+            if spin_init is not None:
+                init_a, init_b = spin_init
+            else:
+                init_a = init_b = 0.5 * self._dm_a_arr_init
             # Split the DENSITY against the same spin-summed operators the totals used.
             # Both terms are linear in the density, so this is an exact decomposition by
             # construction: the two halves sum to the reported total (pinned by a test).
@@ -2417,8 +2557,8 @@ class ProjectionEmbeddingAdapter:
             # (~33 Ha apart) and contracting each channel against its own would produce a
             # "decomposition" whose parts do not add up to the whole it decomposes.
             correction_spin = (
-                float(np.einsum("ij,ji->", dm_a_hl - init_half, v_emb)),
-                float(np.einsum("ij,ji->", dm_b_hl - init_half, v_emb)),
+                float(np.einsum("ij,ji->", dm_a_hl - init_a, v_emb)),
+                float(np.einsum("ij,ji->", dm_b_hl - init_b, v_emb)),
             )
             leak_spin = (
                 float(np.einsum("ij,ji->", dm_a_hl, p_b)),
@@ -2677,12 +2817,16 @@ class ProjectionEmbeddingAdapter:
         :meth:`run_low_level` with a pre-mixed density directly, so this method
         is the bare (undamped) step callers can use when they do their own mixing.
 
-        The fed-back total density (γ̃^A from the correlated solve, plus the
-        frozen environment γ^B) is wrapped into EmbASI's ``SpinKpointArray`` by
-        :meth:`run_low_level` before it reaches ``construct_embedded_fock``.
+        The fed-back subsystem-A density (γ̃^A from the correlated solve) and the
+        frozen environment γ^B go in as the *separate* arguments
+        :meth:`run_low_level` takes, each wrapped into EmbASI's ``SpinKpointArray``
+        there.  They are deliberately not pre-summed: ``run_low_level`` hands
+        ``dma_in`` and ``dmb_in`` to ``construct_embedding_potential`` as the two
+        subsystems it re-partitions against, so collapsing them into one total
+        would feed the A layer the environment density as well.
         """
         dm_hl = self.rdm1_ao(rdm1_active, orbitals)
-        self.run_low_level(dm_ab_in=dm_hl + self._dm_b_arr)
+        self.run_low_level(dma_in=dm_hl, dmb_in=self._dm_b_arr)
 
     # ---------------- checks ---------------- #
     def _validate_densities(self) -> None:
