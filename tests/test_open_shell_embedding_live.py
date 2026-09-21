@@ -34,24 +34,37 @@ REF_NELEC = (5, 4)
 REF_NORB = 8
 REF_E_CORE = 25.2020184581
 REF_E_SOLVER = -53.5224926352
-# Re-measured 2026-09-21, after the per-channel AO lift fix.  `e_core` and `E_solver`
-# are unchanged (they come from the downfold and the solver, neither of which was
-# affected); `total`, `correction` and the beta half of the split all moved, because all
-# three are contractions of the AO density that was previously lifted through alpha's
-# active space for both channels.  Previous values, for the record:
-# TOTAL -110.5897439424, CORRECTION -0.0142385801, CORRECTION_SPIN[1] -0.6303307820.
-# (The CORRECTION_SPIN figure there is superseded twice over -- see the note on
-# REF_CORRECTION_SPIN below, which was re-measured again after the reference-density fix.)
-REF_TOTAL = -110.5118889208
-REF_CORRECTION = 0.0232577815
-# Re-measured 2026-09-21, after the per-spin reference-density fix.  `total` and
-# `correction` are UNCHANGED: the split is a decomposition of the spin-summed correction,
-# so mis-splitting it moved neither.  The split itself moved a lot -- it was referencing
-# `0.5 * gamma^A_init` for both channels, but `gamma^A_init` is genuinely polarised here
-# (5 alpha / 4 beta), so halving it mis-attributed half an electron of reference density
-# between the channels.  Previous (wrong) values, for the record:
-# (0.6160922018, -0.5928344203) -- off by -/+0.60 Ha, and the wrong sign on beta.
-REF_CORRECTION_SPIN = (0.0117289574, 0.0115288241)
+# Re-measured 2026-09-21, after the PER-CHANNEL CONTRACTION fix, and this time checked
+# against physics rather than only re-pinned.  Every previous `REF_TOTAL` in this file was
+# wrong by ~39 Ha: the assembly contracted the spin-summed density against the spin-summed
+# `v_emb`/`P_B`, which on a per-spin downfold picks up cross-channel terms (SPADE makes
+# `span(A_alpha)` S-orthogonal to `span(B_alpha)`, NOT to `span(B_beta)`) and removes a
+# `v_emb` term the solver never added.
+#
+# Why -149.61 is right and -110.51 was not.  This system is an OH radical 4 A from a
+# water molecule, so at that separation the supersystem is very nearly non-interacting:
+#
+#     E(OH, UHF/sto-3g)        = -74.362669
+#     E(H2O, RHF/sto-3g)       = -74.960573   ->  sum = -149.323242
+#     E(supersystem, UHF)      = -149.322412
+#     E(supersystem, UPBE)     = -149.793506
+#
+# The run is HF-in-PBE, so the total must land between the UHF and UPBE supersystem
+# numbers, near PBE (only fragment A is HF).  NEW = -149.6094 sits 0.18 Ha from UPBE and
+# 0.29 Ha from UHF -- in the bracket.  OLD = -110.5119 was 39.3 Ha outside it, i.e. not a
+# physically possible total for this system at all.  The projector leak tells the same
+# story: -3.6e-16 now, against +7.99e-02 before, for a quantity that is a numerical zero
+# by construction.
+#
+# Superseded values, for the record (all wrong, each for a different reason):
+#   -110.5897439424  before the per-channel AO lift fix
+#   -110.5118889208  after it, still spin-summed in the energy assembly
+REF_TOTAL = -149.6093681127
+REF_CORRECTION = -0.0022215722
+# Each channel referenced to its own round-0 density AND contracted against its own
+# `v_emb_spin`.  Superseded values: (0.6160922018, -0.5928344203) with a halved reference,
+# then (0.0117289574, 0.0115288241) with the polarised reference but spin-summed operators.
+REF_CORRECTION_SPIN = (0.0002066411, -0.0024282133)
 
 
 def _build_open_shell_adapter():
@@ -204,10 +217,12 @@ def test_downfold_matches_an_independently_rebuilt_hamiltonian(open_shell):
 def test_energy_split_is_an_exact_decomposition(open_shell):
     """The per-spin breakdown must sum to the totals it decomposes.
 
-    Both split terms are linear in the density, so this is exact. It caught a real bug:
-    contracting each channel against its own ``v_emb_spin`` (which does NOT sum to
-    ``v_emb`` -- ``h_emb`` subtracts ``h_core``/``veff_ll`` once, so two channels
-    subtract them twice) gave parts that disagreed with the whole.
+    Now exact *by construction*: the spin-summed ``correction`` / ``projector_leak`` are
+    derived as the channel sums, rather than each being an independent contraction that
+    happens to agree.  Earlier versions of this test bought the identity by contracting
+    both channels against the spin-summed ``v_emb``/``P_B``, which is what hid a ~39 Ha
+    error in ``total`` (see the note on ``REF_TOTAL``): the sum check is invariant under
+    mis-attributing between the channels, so it cannot see that class of bug at all.
     """
     adapter, alpha, beta, _, result = open_shell
     energy = adapter.projection_energy(result, alpha, beta)
@@ -216,30 +231,37 @@ def test_energy_split_is_an_exact_decomposition(open_shell):
     assert sum(energy.correction_spin) == pytest.approx(energy.correction, abs=1e-10)
     assert sum(energy.projector_leak_spin) == pytest.approx(energy.projector_leak, abs=1e-10)
 
-    # Each channel is referenced to ITS OWN round-0 density, not to half the spin-summed
-    # one.  This previously asserted the opposite -- two large, opposite-signed,
-    # nearly-cancelling channel contributions (+0.616 / -0.593 against a summed +0.023) --
-    # and cited that as the split being "informative".  It was an artefact: `gamma^A_init`
-    # is polarised (5 alpha / 4 beta), so halving it charged half an electron of reference
-    # density to the wrong channel, which is what produced the large cancelling pair.  The
-    # true split is two small, same-signed terms, so those assertions are inverted here.
+    # Each channel against ITS OWN operators, and referenced to its OWN round-0 density.
     ref_a, ref_b = adapter._dm_a_spin_init
     dm_a_hl, dm_b_hl = adapter.rdm1_ao_spin(result.rdm1a, result.rdm1b, alpha, beta)
-    v_emb = adapter.v_emb
+    v_a, v_b = adapter.v_emb_spin(0), adapter.v_emb_spin(1)
+    p_a, p_b = adapter._p_b_spin
     assert energy.correction_spin[0] == pytest.approx(
-        float(np.einsum("ij,ji->", dm_a_hl - ref_a, v_emb)), abs=1e-10
+        float(np.einsum("ij,ji->", dm_a_hl - ref_a, v_a)), abs=1e-10
     )
     assert energy.correction_spin[1] == pytest.approx(
-        float(np.einsum("ij,ji->", dm_b_hl - ref_b, v_emb)), abs=1e-10
+        float(np.einsum("ij,ji->", dm_b_hl - ref_b, v_b)), abs=1e-10
     )
-    # Neither channel is an order of magnitude above the total any more, and the halved
-    # reference really would have produced something different -- so this pins the fix
-    # rather than merely the sum, which is invariant either way.
+    assert energy.projector_leak_spin[0] == pytest.approx(
+        float(np.einsum("ij,ji->", dm_a_hl, p_a)), abs=1e-12
+    )
+    assert energy.projector_leak_spin[1] == pytest.approx(
+        float(np.einsum("ij,ji->", dm_b_hl, p_b)), abs=1e-12
+    )
+
+    # The projector leak is a numerical zero ONLY per channel.  The spin-summed
+    # contraction is 0.08 Ha here -- small enough to read as noise on this system, which is
+    # exactly why it went unnoticed, and +2.4e4 on a stretched C-N bond.  Assert both, so
+    # the distinction is pinned rather than the magnitude of one system.
+    assert abs(energy.projector_leak) < 1e-10
+    leak_summed = float(np.einsum("ij,ji->", dm_a_hl + dm_b_hl, adapter.p_b))
+    assert abs(leak_summed) > 1e-3
+    assert abs(leak_summed - energy.projector_leak) > 1e-3
+
+    # ...and the halved reference would still give a different split, so the polarised
+    # reference is pinned too.
     half = 0.5 * adapter._dm_a_arr_init
-    assert abs(energy.correction_spin[0]) < 10 * abs(energy.correction)
-    assert (
-        abs(float(np.einsum("ij,ji->", dm_a_hl - half, v_emb)) - energy.correction_spin[0]) > 1e-3
-    )
+    assert abs(float(np.einsum("ij,ji->", dm_a_hl - half, v_a)) - energy.correction_spin[0]) > 1e-3
 
 
 def test_open_shell_energies_are_pinned(open_shell):
@@ -738,3 +760,172 @@ def test_apc_selection_forwards_the_beta_count_for_real(open_shell):
     assert orbitals.is_open_shell
     n_alpha, n_beta = orbitals.n_active_electrons_spin
     assert n_alpha > n_beta, f"expected a doublet-like split, got {(n_alpha, n_beta)}"
+
+
+# --------------------------------------------------------------------------- #
+# A geometry where the two spin channels' spans genuinely differ.
+#
+# Everything above runs on the OH-radical fixture, whose channels overlap enough that a
+# cross-channel error reads as noise: the spin-summed projector leak there is 0.08 Ha
+# against a per-channel ~1e-16, which is why contracting across channels went unnoticed
+# through several rounds of review.  This block uses the stretched end of the C-N
+# dissociation scan (2.20 A, the `data/22.inp` geometry), where the same error is +2.4e4
+# and a wrong assembly cannot hide.
+# --------------------------------------------------------------------------- #
+
+# Stretched butyronitrile, C-N at 2.20 A: `data/22.inp`, inlined so the test does not
+# depend on an untracked data directory.
+_STRETCHED_CN = [
+    ("N", (3.20473, -0.47458, -0.00000)),
+    ("C", (1.14199, 0.29032, -0.00000)),
+    ("C", (-0.28626, 0.80954, -0.00000)),
+    ("H", (-0.43038, 1.45243, -0.90096)),
+    ("H", (-0.43037, 1.45244, 0.90095)),
+    ("C", (-1.33813, -0.36286, 0.00001)),
+    ("H", (-1.17391, -1.00037, -0.89892)),
+    ("H", (-1.17391, -1.00036, 0.89895)),
+    ("C", (-2.80434, 0.18582, 0.00001)),
+    ("H", (-3.53027, -0.65561, 0.00001)),
+    ("H", (-2.99050, 0.80923, 0.90131)),
+    ("H", (-2.99050, 0.80921, -0.90131)),
+]
+
+
+def _build_stretched_adapter(*, spin: int, unrestricted: bool):
+    """A live adapter on the stretched C-N geometry, HF-in-HF, active atoms [0, 1]."""
+    import pyscf
+    from ase import Atoms
+    from embasi.embedding import ProjectionEmbedding
+    from pyscf.pbc.tools.pyscf_ase import PySCF, ase_atoms_to_pyscf
+
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        ProjectionEmbeddingAdapter,
+        PySCFIntegrals,
+    )
+
+    atoms = Atoms("".join(s for s, _ in _STRETCHED_CN), positions=[p for _, p in _STRETCHED_CN])
+    kwargs = {"atom": ase_atoms_to_pyscf(atoms), "basis": "sto-3g"}
+    if spin:
+        kwargs["spin"] = spin
+    mol = pyscf.M(**kwargs)
+    make = mol.UKS if unrestricted else mol.RKS
+    mf_ll, mf_hl = make(xc="HF"), make(xc="HF")
+    projection = ProjectionEmbedding(
+        atoms,
+        embed_mask=[1, 1] + [2] * (len(_STRETCHED_CN) - 2),
+        calc_base_ll=PySCF(method=mf_ll),
+        calc_base_hl=PySCF(method=mf_hl),
+        projection="level-shift",
+        mu_val=1.0e6,
+        parallel=False,
+    )
+    adapter = ProjectionEmbeddingAdapter(
+        projection, PySCFIntegrals(mf_hl, mf_ll), mu=1.0e6, unrestricted=unrestricted
+    )
+    adapter.run_low_level()
+    return adapter
+
+
+def test_stretched_spans_are_not_cross_orthogonal():
+    """The premise of the per-channel contraction, measured where it is unmissable.
+
+    Each channel's density is annihilated by *its own* projector but not by the other's,
+    because SPADE partitions the spins separately. On the OH fixture the cross terms are
+    0.08 / 9e-04; here they are ~2.4e4 / ~5e2. Pinning both magnitudes is the point: a
+    tolerance that passes on OH says nothing about this regime.
+    """
+    adapter = _build_stretched_adapter(spin=2, unrestricted=True)
+    d_a, d_b = adapter._dm_a_spin
+    p_a, p_b = adapter._p_b_spin
+
+    def tr(x, y):
+        return float(np.einsum("ij,ji->", x, y))
+
+    assert abs(tr(d_a, p_a)) < 1e-8
+    assert abs(tr(d_b, p_b)) < 1e-8
+    # ...and the cross terms are enormous, which is what makes a spin-summed contraction
+    # of these operators wrong rather than merely imprecise.
+    assert abs(tr(d_a, p_b)) > 1e3
+    assert tr(d_a + d_b, adapter._p_b) == pytest.approx(
+        tr(d_a, p_a) + tr(d_b, p_b) + tr(d_a, p_b) + tr(d_b, p_a), abs=1e-6
+    )
+
+
+def test_stretched_open_shell_total_matches_a_closed_shell_control():
+    """The assembled per-spin total must be physical, cross-checked two ways.
+
+    This is the test the OH fixture cannot provide. It pins the fix that matters most:
+    contracting the spin-summed density against the spin-summed operators gave
+    ``total = -24288 Ha`` on this geometry -- for a system whose low-level supersystem
+    energy is ``-206.99 Ha`` -- with ``projector_leak = +2.41e4`` for a field that is a
+    numerical zero by construction.
+
+    Two independent references, because a single one could be wrong the same way:
+
+    1. **A closed-shell control on the identical geometry**, through the restricted path
+       (untouched by this change). The triplet must land near it, not 24 kHa away.
+    2. **The projector leak**, which must be a numerical zero per channel.
+    """
+    from embasi_qiskit_integration.solvers import FCISolver
+
+    adapter = _build_stretched_adapter(spin=2, unrestricted=True)
+    alpha, beta = adapter.build_orbitals_spin(n_frozen_occ=4)
+    ham = adapter.embedded_hamiltonian_spin((alpha, beta))
+    result = FCISolver().solve(ham)
+    energy = adapter.projection_energy(result, alpha, orbitals_b=beta)
+
+    # The leak is a numerical zero -- the regression this guards was +2.41e+04.
+    assert abs(energy.projector_leak) < 1e-8, energy.projector_leak
+    assert energy.is_spin_resolved
+    assert sum(energy.projector_leak_spin) == pytest.approx(energy.projector_leak, abs=1e-12)
+    assert sum(energy.correction_spin) == pytest.approx(energy.correction, abs=1e-10)
+
+    # Reference 1: the restricted path on the same nuclei.
+    control = _build_stretched_adapter(spin=0, unrestricted=False)
+    orbitals = control.build_orbitals(n_frozen_occ=4)
+    control_result = FCISolver().solve(control.embedded_hamiltonian(orbitals))
+    control_energy = control.projection_energy(control_result, orbitals)
+
+    # `e_high_A` is the term the bug corrupted (-24090 against -9.11), and it is the one
+    # that should agree closely: both are HF on the same fragment, differing only in spin
+    # state.  Measured 0.022 Ha apart; 0.5 Ha is loose enough not to be brittle and tight
+    # enough that the 24 kHa regression cannot pass.
+    assert energy.e_high_A == pytest.approx(control_energy.e_high_A, abs=0.5)
+    assert float(energy.total) == pytest.approx(float(control_energy.total), abs=1.0)
+    # An absolute sanity bracket, in case BOTH paths ever regress together.
+    assert -215.0 < float(energy.total) < -200.0
+
+
+def test_stretched_state_roundtrip_reproduces_the_per_spin_energy():
+    """``projection_energy_from_state`` must reproduce the live per-spin assembly exactly.
+
+    The snapshot path is a second implementation of the same algebra, so it is where a
+    per-channel fix silently fails to propagate. It must also *refuse* an open-shell
+    snapshot handed only a spin-summed density, rather than assembling the wrong number.
+    """
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        projection_energy_from_state,
+    )
+    from embasi_qiskit_integration.solvers import FCISolver
+
+    adapter = _build_stretched_adapter(spin=2, unrestricted=True)
+    alpha, beta = adapter.build_orbitals_spin(n_frozen_occ=4)
+    ham = adapter.embedded_hamiltonian_spin((alpha, beta))
+    result = FCISolver().solve(ham)
+    live = adapter.projection_energy(result, alpha, orbitals_b=beta)
+
+    dm_a, dm_b = adapter.rdm1_ao_spin(result.rdm1a, result.rdm1b, alpha, beta)
+    state = {k: v for k, v in adapter.export_state().items() if k != "fingerprint"}
+    from_state = projection_energy_from_state(
+        state,
+        solver_energy=result.energy,
+        rdm1_ao=dm_a + dm_b,
+        rdm1_ao_spin=(dm_a, dm_b),
+    )
+    for term in ("e_high_A", "correction", "projector_leak", "footing_shift", "total"):
+        assert getattr(from_state, term) == pytest.approx(getattr(live, term), abs=1e-10), term
+    assert from_state.correction_spin == pytest.approx(live.correction_spin, abs=1e-10)
+
+    # Withholding the pair must raise, not silently assemble the spin-summed (wrong) form.
+    with pytest.raises(ValueError, match="open-shell"):
+        projection_energy_from_state(state, solver_energy=result.energy, rdm1_ao=dm_a + dm_b)

@@ -155,15 +155,24 @@ per-spin leak ~2e-10, ``E_solver = -53.522493`` Ha.
   ``qiskit-addon-sqd`` limitation (no UHF entry point, and its ``sci_solver`` hook
   receives the tensor already substituted), not something fixable here -- see
   ``port.md``.
-* **The energy decomposition is spin-resolved, the totals are not re-derived.**
-  :attr:`ProjectionEnergy.correction_spin` / ``projector_leak_spin`` split the two
-  density-linear terms exactly (each pair sums to its total), each channel referenced to
-  its own round-0 density (``_dm_a_spin_init``) rather than to half the spin-summed one --
-  ``gamma^A`` is polarised, so halving it mis-attributes reference density between the
-  channels while leaving the sum (and hence ``total``) untouched.  ``e_high_A`` has no
-  per-spin form -- it carries the solver's total energy, which the solver does not
-  decompose -- and :meth:`export_state` exports the spin-summed arrays alongside the
-  per-spin ones.
+* **The energy terms are contracted per channel, and the totals derived from them.**
+  Every density-linear term in :meth:`projection_energy` contracts each channel against
+  *its own* ``v_emb``/``P_B`` (:meth:`v_emb_spin`, ``_p_b_spin``) and sums, because that
+  is what :meth:`embedded_hamiltonian_spin` folded into ``h1_s``.  The spin-summed
+  ``correction`` / ``projector_leak`` are then **derived** from the pair, so
+  ``sum(correction_spin) == correction`` still holds exactly -- by construction now,
+  rather than by sharing one operator.  Contracting the spin-summed density against the
+  spin-summed operators instead is wrong twice over, since SPADE partitions the spins
+  separately and ``span(A_alpha)`` is not S-orthogonal to ``span(B_beta)``: the projector
+  picks up cross terms scaled by ``mu`` (``+2.4e4`` on ``data/22.inp``, a field documented
+  as a numerical zero, dragging ``total`` to -24288 Ha on a ~-207 Ha system) and the
+  ``v_emb`` term removes something the solver never added (+54.0 Ha).  Each channel is
+  referenced to its own round-0 density (``_dm_a_spin_init``), not half the spin-summed
+  one -- ``gamma^A`` is polarised, so halving mis-attributes reference density.
+  ``e_high_A`` still has no per-spin form: it carries the solver's total energy, which the
+  solver does not decompose.  :meth:`export_state` exports the spin-summed arrays, the
+  per-spin ones, and the adapter's own per-channel ``v_emb`` pair
+  (``v_emb_spin_adapter``) that :func:`projection_energy_from_state` needs.
 * **The frozen core is folded unrestricted.**  At ``n_frozen_occ > 0`` each channel sees
   ``J[d_a + d_b] - K[d_sigma]`` (:meth:`AOIntegrals.veff_uhf`), not the restricted
   ``J - K/2``: Coulomb is a functional of the total core density but exchange couples
@@ -548,6 +557,7 @@ def projection_energy_from_state(
     *,
     solver_energy: float,
     rdm1_ao: np.ndarray,
+    rdm1_ao_spin: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> "ProjectionEnergy":
     """Assemble paper Eq. 8 from an :meth:`ProjectionEmbeddingAdapter.export_state`
     snapshot, with no live EmbASI.
@@ -566,9 +576,23 @@ def projection_energy_from_state(
         solver_energy: the correlated solver's total energy for the embedded fragment.
         rdm1_ao: the solver 1-RDM lifted to the AO basis (see
             :meth:`ProjectionEmbeddingAdapter.rdm1_ao`).
+        rdm1_ao_spin: on an **open-shell** snapshot, the ``(alpha, beta)`` AO densities
+            from :meth:`ProjectionEmbeddingAdapter.rdm1_ao_spin` -- each channel lifted
+            through its *own* active space.  Required to reproduce the in-process energy
+            there: each channel must be contracted against its own ``v_emb``/``P_B``,
+            because SPADE partitions the spins separately, so the spin-summed operators
+            carry cross-channel terms the solver never saw (see
+            :meth:`ProjectionEmbeddingAdapter.projection_energy`).  ``None`` on a
+            restricted snapshot, where the spin-summed form is exact.
 
     Returns:
         The same :class:`ProjectionEnergy` breakdown the in-process path returns.
+
+    Raises:
+        ValueError: the snapshot carries per-spin arrays (so it is open-shell) but
+            ``rdm1_ao_spin`` was not passed.  Assembling it spin-summed would silently
+            report a wrong energy -- on a stretched C-N bond, -24288 Ha against a ~-207 Ha
+            system -- so this refuses rather than guessing.
     """
 
     def _array(key: str) -> np.ndarray:
@@ -586,9 +610,68 @@ def projection_energy_from_state(
     # subsystem A's nuclear-electron term).  Mixing the two is a silent energy error.
     v_emb = _array("v_emb")
 
-    leak = float(np.einsum("ij,ji->", dm_hl, p_b))
-    e_high_a = float(solver_energy) - np.einsum("ij,ji->", dm_hl, v_emb) - leak
-    correction = float(np.einsum("ij,ji->", dm_hl - _array("dm_a_init"), v_emb))
+    # An open-shell snapshot is identifiable by the per-spin arrays `export_state` adds
+    # only when they exist.  Without the matching per-spin density there is nothing to
+    # contract per channel, and the spin-summed fallback is not merely approximate here --
+    # it is off by `mu` times the cross-channel overlap.  Refuse instead.
+    is_open_shell = "p_b_spin" in state and "v_emb_spin" in state
+    if is_open_shell and rdm1_ao_spin is None:
+        raise ValueError(
+            "this snapshot is open-shell (it carries per-spin P_B / v_emb), so "
+            "projection_energy_from_state needs rdm1_ao_spin=(dm_alpha, dm_beta) with "
+            "each channel lifted through its own active space. Assembling it from the "
+            "spin-summed density would contract across channels whose spans are not "
+            "S-orthogonal and report a plausible but badly wrong energy."
+        )
+
+    leak_spin: tuple[float, float] | None = None
+    correction_spin: tuple[float, float] | None = None
+    if rdm1_ao_spin is not None:
+        # Mirrors the two conditions in `ProjectionEmbeddingAdapter.projection_energy`, so
+        # the two implementations agree bit-for-bit rather than only to within the
+        # summation-order difference between `tr[d_a P] + tr[d_b P]` and `tr[(d_a+d_b) P]`
+        # (which `mu` amplifies to ~1e-10 in the projector, on a quantity that is a
+        # numerical zero either way).
+        #
+        # Open shell -> each channel against its OWN operators, the rule the in-process
+        # path documents.  `v_emb_spin_adapter` is the ADAPTER's per-channel `v_emb` pair
+        # (`h_emb_s - hcore - P_B_s`); EmbASI's `v_emb_spin` in the same snapshot follows
+        # the other convention and is NOT interchangeable with it.
+        #
+        # Restricted snapshot with a spin-resolved density -> the channels share one span,
+        # so the spin-summed operators are exact and are what the live path uses too.
+        dm_a_hl = np.asarray(rdm1_ao_spin[0], dtype=float)
+        dm_b_hl = np.asarray(rdm1_ao_spin[1], dtype=float)
+        if is_open_shell:
+            p_b_pair = _array("p_b_spin")
+            v_emb_pair = _array("v_emb_spin_adapter")
+            init_a, init_b = _array("dm_a_spin_init")
+            p_b_a, p_b_b = p_b_pair[0], p_b_pair[1]
+            v_emb_a, v_emb_b = v_emb_pair[0], v_emb_pair[1]
+        else:
+            p_b_a = p_b_b = p_b
+            v_emb_a = v_emb_b = v_emb
+            if "dm_a_spin_init" in state:
+                init_a, init_b = _array("dm_a_spin_init")
+            else:
+                init_a = init_b = 0.5 * _array("dm_a_init")
+        leak_a = float(np.einsum("ij,ji->", dm_a_hl, p_b_a))
+        leak_b = float(np.einsum("ij,ji->", dm_b_hl, p_b_b))
+        corr_a = float(np.einsum("ij,ji->", dm_a_hl - init_a, v_emb_a))
+        corr_b = float(np.einsum("ij,ji->", dm_b_hl - init_b, v_emb_b))
+        leak_spin = (leak_a, leak_b)
+        correction_spin = (corr_a, corr_b)
+        leak = leak_a + leak_b
+        correction = corr_a + corr_b
+        v_emb_term = float(
+            np.einsum("ij,ji->", dm_a_hl, v_emb_a) + np.einsum("ij,ji->", dm_b_hl, v_emb_b)
+        )
+    else:
+        leak = float(np.einsum("ij,ji->", dm_hl, p_b))
+        correction = float(np.einsum("ij,ji->", dm_hl - _array("dm_a_init"), v_emb))
+        v_emb_term = float(np.einsum("ij,ji->", dm_hl, v_emb))
+
+    e_high_a = float(solver_energy) - v_emb_term - leak
 
     footing_shift = float(
         (float(_array("enuc_full")) - float(_array("enuc_a")))
@@ -603,6 +686,8 @@ def projection_energy_from_state(
         correction=correction,
         projector_leak=leak,
         footing_shift=footing_shift,
+        correction_spin=correction_spin,
+        projector_leak_spin=leak_spin,
     )
 
 
@@ -614,7 +699,11 @@ class ProjectionEnergy:
     e_low_A: float  # E_L[γ^A]
     e_high_A: float  # E_H[Ψ̃^A], embedding pot. removed, rebased to E_low(A)'s footing
     correction: float  # tr[(γ̃^A - γ^A) v_emb]
-    projector_leak: float  # tr[γ̃^A P_B], a numerical zero when clean
+    # tr[γ̃^A P_B], a numerical zero when clean.  On a per-spin downfold this is the sum
+    # of the per-channel traces (each density against its OWN projector), not a
+    # contraction of the spin-summed density against the spin-summed projector -- the
+    # latter includes cross-channel terms scaled by mu and is *not* a numerical zero.
+    projector_leak: float
     footing_shift: float = 0.0  # nuclei/hcore rebasing applied to e_high_A (see below)
     # Per-spin split of the two density-linear terms, when the solver returned a
     # spin-resolved RDM and the adapter has a per-spin v_emb/P_B.  ``None`` on any
@@ -1139,6 +1228,15 @@ class ProjectionEmbeddingAdapter:
             pair = getattr(self, name, None)
             if pair is not None:
                 state[name.lstrip("_")] = np.asarray(np.stack(pair))
+        # The ADAPTER's per-channel `v_emb` pair (`h_emb_s - hcore - P_B_s`), which
+        # `projection_energy` contracts each channel against.  Exported under its own key
+        # because `v_emb_spin` above is EmbASI's pair, on the other convention (it omits
+        # subsystem A's nuclear-electron term); the two are not interchangeable, and
+        # `projection_energy_from_state` needs this one to reproduce the live energy.
+        if self._fock_spin is not None and self._p_b_spin is not None:
+            state["v_emb_spin_adapter"] = np.asarray(
+                np.stack((self.v_emb_spin(0), self.v_emb_spin(1)))
+            )
         state["fingerprint"] = self.state_fingerprint()
         return state
 
@@ -1738,12 +1836,21 @@ class ProjectionEmbeddingAdapter:
         **Not an additive decomposition of :attr:`v_emb`.**  ``h_emb`` subtracts
         ``h_core`` and ``veff_ll`` *once* to build the spin-summed operator, so summing
         two channels subtracts them twice: measured
-        ``|v_emb - (v_a + v_b)| ~ 33 Ha`` on an OH radical.  Each channel is the right
-        operator to contract against *that channel's* density (which is what a per-spin
-        Fock/downfold does); it is the wrong thing to use for splitting a spin-summed
-        trace.  For that, contract the density split against EmbASI's own additive
-        ``_v_emb_spin`` pair, whose channels do sum to ``_v_emb_embasi`` exactly
-        (verified 0.0).
+        ``|v_emb - (v_a + v_b)| ~ 33 Ha`` on an OH radical (24.2 Ha on the stretched
+        butyronitrile in ``data/22.inp``).
+
+        That is a property of ``v_emb``, **not** a reason to avoid this pair.  Each
+        channel is the right operator to contract against *that channel's* density, which
+        is precisely what :meth:`embedded_hamiltonian_spin` folds into ``h1_s`` and
+        therefore what :meth:`projection_energy` must subtract back off.  Verified:
+        ``h_core + v_emb_spin(s) + P_B_s`` reproduces the ``h_emb_s`` the downfold used to
+        ``0.0`` — while the same reconstruction with a *per-channel* ``veff_ll`` is 4.18 Ha
+        out, which is why the spin-summed ``veff_ll`` above is the correct convention here.
+
+        The spin-summed ``v_emb`` is the wrong operator for a per-spin density: it removes
+        a quantity the solver never added (+54.0 Ha on ``data/22.inp``).  See
+        :meth:`projection_energy`, which now derives its spin-summed ``correction`` /
+        ``projector_leak`` *from* the channels rather than contracting across them.
         """
         fock = self._require(
             None if self._fock_spin is None else self._fock_spin[ispin],
@@ -2479,11 +2586,18 @@ class ProjectionEmbeddingAdapter:
         (:meth:`build_orbitals_spin`'s second return value).  Pass it whenever the
         Hamiltonian was built by :meth:`embedded_hamiltonian_spin`: the two channels live
         in *different* spans, so the spin-summed ``rdm1`` cannot be lifted through one
-        set.  Every term here is a contraction of ``dm_hl`` against a spin-summed
-        operator, so getting ``dm_hl`` wrong moves the reported total -- measured
+        set.  Getting ``dm_hl`` wrong moves the reported total -- measured
         **0.0779 Ha (48.9 kcal/mol)** on the OH-radical doublet, with the electron count,
         the spin sector and the footing shift all still exact, which is why no existing
         check caught it.  Omit it on a restricted run (bit-identical to before).
+
+        **Passing it also selects the per-channel contraction.** With ``orbitals_b`` every
+        density-linear term is contracted channel-against-its-own-operator and the
+        spin-summed values derived from the pair; without it the restricted spin-summed
+        form is used.  So omitting ``orbitals_b`` on a per-spin downfold is not merely a
+        lift error -- it also reintroduces the cross-channel projector term, which ``mu``
+        scales to ``+2.4e4`` on ``data/22.inp``.  See the module docstring's
+        *known limits* for the measurements.
         """
         v_emb, p_b = self.v_emb, self.p_b
         # Bound to locals so the None-narrowing below reaches `rdm1_ao_spin` (reading the
@@ -2504,9 +2618,90 @@ class ProjectionEmbeddingAdapter:
         else:
             dm_hl = self.rdm1_ao(result.rdm1, orbitals)
 
-        leak = float(np.einsum("ij,ji->", dm_hl, p_b))
-        e_high_a = float(result.energy) - np.einsum("ij,ji->", dm_hl, v_emb) - leak
-        correction = float(np.einsum("ij,ji->", dm_hl - self._dm_a_arr_init, v_emb))
+        # Per-spin reference pair, needed by both the totals (below) and the split.
+        # `_dm_a_spin_init` is the round-0 pair captured once in `run_low_level`; fall back
+        # to halving the spin-summed reference only when there is none (a restricted
+        # adapter, or a snapshot predating it), where the two channels are equal anyway
+        # and halving is exact.  Read through `getattr` because the stub adapters in the
+        # tests are built via `object.__new__` and never run `__init__`.
+        spin_init = getattr(self, "_dm_a_spin_init", None)
+        if spin_init is not None:
+            init_a, init_b = spin_init
+        else:
+            init_a = init_b = 0.5 * self._dm_a_arr_init
+
+        # On a per-spin downfold, contract EACH CHANNEL AGAINST ITS OWN OPERATORS and sum
+        # -- do not contract the spin-summed density against the spin-summed ones.  The
+        # rule: subtract what the downfold actually folded in, channel by channel.
+        #
+        # `embedded_hamiltonian_spin` builds `h1_s` from `h_emb_s = F_emb_s - veff_ll`,
+        # i.e. each channel's own `v_emb_s` and `P_B_s` (verified: `hcore + v_emb_spin(s)
+        # + P_B_s` reproduces that `h_emb_s` to 0.0).  So `result.energy` already contains
+        # `sum_s tr[d_s v_emb_s]`, NOT `tr[dm v_emb]`, and it never contained a
+        # cross-channel projector term at all.
+        #
+        # Using the spin-summed operators instead is wrong twice over, because SPADE
+        # partitions each spin separately, so `span(A_alpha)` is S-orthogonal to
+        # `span(B_alpha)` but *not* to `span(B_beta)`:
+        #
+        # * The projector picks up the cross terms `tr[d_alpha P_beta]`, which the level
+        #   shift multiplies by `mu`.  Measured on data/22.inp (stretched C-N, 2.2 A):
+        #   own terms -1.2e-11 / +1.2e-10, cross terms +2.4e+04 / +5.4e+02, so the
+        #   spin-summed `leak` came out at +2.41e+04 -- a quantity documented as a
+        #   numerical zero -- and dragged the reported total to -24288 Ha on a ~-207 Ha
+        #   system.
+        # * The `v_emb` term removes something the solver never added, worth +54.0 Ha
+        #   there.
+        #
+        # Both together: `e_high_A` lands at -9.0917 against a closed-shell control on the
+        # SAME geometry at -9.1139 (totals -207.2066 vs -207.2108, a triplet ~0.1 eV above
+        # the singlet).  That two-path agreement is the evidence for this form.
+        #
+        # Two independent conditions, deliberately NOT collapsed into one:
+        #
+        # * `have_spin_operators` -- is there a per-spin `v_emb`/`P_B` at all?  Only then
+        #   can anything be contracted per channel.  It is false on every restricted run,
+        #   which is why those stay bit-identical.
+        # * `dm_a_hl`/`dm_b_hl` -- did the solver return a spin-resolved RDM?  A restricted
+        #   adapter can still get one (an unrestricted solver on a closed-shell downfold),
+        #   and that case must keep reporting the split it always did, against the
+        #   spin-summed operators, which are exact there because the two channels share one
+        #   span.
+        have_spin_operators = self._p_b_spin is not None and self._fock_spin is not None
+        leak_spin: tuple[float, float] | None = None
+        correction_spin: tuple[float, float] | None = None
+        if dm_a_hl is not None and dm_b_hl is not None:
+            if have_spin_operators:
+                # Genuine per-spin downfold: each channel against its OWN operators.
+                v_emb_a, v_emb_b = self.v_emb_spin(0), self.v_emb_spin(1)
+                p_b_pair = self._p_b_spin
+                assert p_b_pair is not None  # narrowed by `have_spin_operators`
+                p_b_a, p_b_b = p_b_pair
+            else:
+                # Restricted operators, spin-resolved density: the channels share a span,
+                # so the spin-summed operators are the right ones and the split is exact.
+                v_emb_a = v_emb_b = v_emb
+                p_b_a = p_b_b = p_b
+            leak_a = float(np.einsum("ij,ji->", dm_a_hl, p_b_a))
+            leak_b = float(np.einsum("ij,ji->", dm_b_hl, p_b_b))
+            corr_a = float(np.einsum("ij,ji->", dm_a_hl - init_a, v_emb_a))
+            corr_b = float(np.einsum("ij,ji->", dm_b_hl - init_b, v_emb_b))
+            leak_spin = (leak_a, leak_b)
+            correction_spin = (corr_a, corr_b)
+            # The spin-summed values are DERIVED from the channels, not the reverse.
+            # `sum(correction_spin) == correction` therefore still holds exactly -- by
+            # construction now, rather than by sharing one operator as before.
+            leak = leak_a + leak_b
+            correction = corr_a + corr_b
+            v_emb_term = float(
+                np.einsum("ij,ji->", dm_a_hl, v_emb_a) + np.einsum("ij,ji->", dm_b_hl, v_emb_b)
+            )
+        else:
+            leak = float(np.einsum("ij,ji->", dm_hl, p_b))
+            correction = float(np.einsum("ij,ji->", dm_hl - self._dm_a_arr_init, v_emb))
+            v_emb_term = float(np.einsum("ij,ji->", dm_hl, v_emb))
+
+        e_high_a = float(result.energy) - v_emb_term - leak
 
         # Rebase e_high_A onto E_low(A)'s (ghosted subsystem-A) nuclear footing.
         hcore_a, enuc_a = self._a_fragment_footing()
@@ -2515,55 +2710,6 @@ class ProjectionEmbeddingAdapter:
             + np.einsum("ij,ji->", dm_hl, self.ints.hcore() - hcore_a)
         )
         e_high_a -= footing_shift
-
-        # Per-spin split of the two density-linear terms.  Only the *decomposition* is
-        # new: each pair sums to the spin-summed value computed above, so `total` is
-        # untouched.  Both `tr[gamma P]` terms are linear in the density, so splitting
-        # them is exact -- unlike `e_high_A`, which carries the solver's total energy and
-        # has no per-spin decomposition without a per-spin energy from the solver.
-        correction_spin: tuple[float, float] | None = None
-        leak_spin: tuple[float, float] | None = None
-        if dm_a_hl is not None and dm_b_hl is not None:
-            # The very halves `dm_hl` was built from above, so the split decomposes *the
-            # density the totals were computed from* rather than a second, differently
-            # lifted one.  That identity is what makes `sum(correction_spin) ==
-            # correction` exact.
-            # The reference density must be split the way EmbASI actually polarised it,
-            # NOT halved.  `gamma^A_init` is genuinely spin-polarised on an open shell
-            # (measured 5 alpha / 4 beta on the OH doublet), so `0.5 * total` assigns 4.5
-            # electrons to each channel and mis-attributes a whole half-electron of
-            # reference density between them.  The spin-summed `correction` is unaffected
-            # (the two halves still sum to the total, which is all a sum check can see),
-            # but the reported per-channel split was wrong by -/+0.60 Ha and inverted the
-            # sign of the beta term: measured (+0.616, -0.593) against the true
-            # (+0.0117, +0.0115).
-            #
-            # `_dm_a_spin_init` is the round-0 pair; fall back to halving only when there
-            # is none (a restricted adapter, or a snapshot predating it), where the two
-            # channels are equal anyway and halving is exact.  Read through `getattr`
-            # because the stub adapters in the tests are built via `object.__new__` and
-            # never run `__init__`, so the attribute may not exist at all.
-            spin_init = getattr(self, "_dm_a_spin_init", None)
-            if spin_init is not None:
-                init_a, init_b = spin_init
-            else:
-                init_a = init_b = 0.5 * self._dm_a_arr_init
-            # Split the DENSITY against the same spin-summed operators the totals used.
-            # Both terms are linear in the density, so this is an exact decomposition by
-            # construction: the two halves sum to the reported total (pinned by a test).
-            #
-            # Deliberately NOT `v_emb_spin(ispin)`: the adapter's `v_emb` subtracts
-            # `h_core`/`veff_ll` once, so the per-channel potentials do not sum to it
-            # (~33 Ha apart) and contracting each channel against its own would produce a
-            # "decomposition" whose parts do not add up to the whole it decomposes.
-            correction_spin = (
-                float(np.einsum("ij,ji->", dm_a_hl - init_a, v_emb)),
-                float(np.einsum("ij,ji->", dm_b_hl - init_b, v_emb)),
-            )
-            leak_spin = (
-                float(np.einsum("ij,ji->", dm_a_hl, p_b)),
-                float(np.einsum("ij,ji->", dm_b_hl, p_b)),
-            )
 
         e_low_ab, e_low_a = self._low_level_energies()
         return ProjectionEnergy(

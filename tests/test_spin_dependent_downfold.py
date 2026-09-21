@@ -763,16 +763,19 @@ def test_rdm1_ao_spin_without_a_beta_set_is_the_restricted_lift():
 
 
 def test_projection_energy_lifts_the_spin_pair_through_both_sets():
-    """``projection_energy(result, alpha, beta)`` must contract the per-channel density.
+    """``projection_energy(result, alpha, beta)`` must contract each channel per spin.
 
-    Every term in the assembly (``e_high_A``, ``correction``, ``projector_leak``, the
-    footing shift) is a contraction of one spin-summed AO density, so lifting that
-    density through alpha alone moves the reported total -- measured **0.0779 Ha
-    (48.9 kcal/mol)** on the OH-radical doublet, with the electron count, the spin sector
-    and the footing shift all still exact.
+    Two claims, both about the same call:
 
-    The additive split must stay exact at the same time: ``correction_spin`` has to
-    decompose the density the totals were computed *from*, not a second one.
+    * **The beta set is used.** Lifting both channels through alpha alone moves the
+      reported total -- measured **0.0779 Ha (48.9 kcal/mol)** on the OH-radical doublet,
+      with the electron count, the spin sector and the footing shift all still exact.
+    * **Each channel is contracted against its OWN operators**, not against the
+      spin-summed ones. The spin-summed ``P_B`` includes cross terms ``tr[d_alpha
+      P_beta]`` between spans SPADE did not make S-orthogonal, which ``mu`` then scales:
+      this stub shows ``2.53`` against a per-channel ``-6.4e-11``, and on data/22.inp
+      ``+2.4e4`` against ``+5.1e-11``. The spin-summed totals are *derived* from the
+      channels, so the additive split stays exact by construction.
     """
     from embasi_qiskit_integration.contract import SolverResult
 
@@ -812,18 +815,38 @@ def test_projection_energy_lifts_the_spin_pair_through_both_sets():
     # The two disagree, or the beta set is being ignored and the fix is not wired up.
     assert not np.isclose(with_beta.total, alpha_only.total)
 
-    # The assembly used the summed per-channel density...
+    # Each channel is contracted against ITS OWN v_emb / P_B, and the summed values are
+    # derived from those -- not from a spin-summed contraction.
     dm_a, dm_b = ad.rdm1_ao_spin(ra, rb, alpha, beta)
-    v_emb, p_b = ad.v_emb, ad.p_b
-    assert with_beta.projector_leak == pytest.approx(
-        float(np.einsum("ij,ji->", dm_a + dm_b, p_b)), abs=1e-12
+    v_a, v_b = ad.v_emb_spin(0), ad.v_emb_spin(1)
+    p_a, p_b_ch = ad._p_b_spin
+    # This stub is built via `object.__new__` and never ran `__init__`, so there is no
+    # round-0 pair; the assembly then falls back to halving the spin-summed reference,
+    # which is what these expectations must mirror.  (The polarised-reference path has its
+    # own test: `test_per_spin_correction_uses_the_polarised_reference_not_a_half`.)
+    assert getattr(ad, "_dm_a_spin_init", None) is None
+    init_a = init_b = 0.5 * ad._dm_a_arr_init
+    assert with_beta.projector_leak_spin[0] == pytest.approx(
+        float(np.einsum("ij,ji->", dm_a, p_a)), abs=1e-12
     )
-    # ...and the split still decomposes exactly that density.
+    assert with_beta.projector_leak_spin[1] == pytest.approx(
+        float(np.einsum("ij,ji->", dm_b, p_b_ch)), abs=1e-12
+    )
+    assert with_beta.correction_spin[0] == pytest.approx(
+        float(np.einsum("ij,ji->", dm_a - init_a, v_a)), abs=1e-12
+    )
+    assert with_beta.correction_spin[1] == pytest.approx(
+        float(np.einsum("ij,ji->", dm_b - init_b, v_b)), abs=1e-12
+    )
+    # The split is exact BY CONSTRUCTION: the totals are the channel sums.
     assert sum(with_beta.correction_spin) == pytest.approx(with_beta.correction, abs=1e-12)
     assert sum(with_beta.projector_leak_spin) == pytest.approx(with_beta.projector_leak, abs=1e-12)
-    assert with_beta.correction_spin[0] == pytest.approx(
-        float(np.einsum("ij,ji->", dm_a - 0.5 * ad._dm_a_arr_init, v_emb)), abs=1e-12
-    )
+
+    # The old spin-summed contraction really is a different (and contaminated) number, so
+    # these assertions distinguish the fix rather than passing either way.
+    leak_summed = float(np.einsum("ij,ji->", dm_a + dm_b, ad.p_b))
+    assert abs(leak_summed - with_beta.projector_leak) > 1e-3
+    assert abs(with_beta.projector_leak) < 1e-8
 
 
 def test_veff_uhf_matches_an_eri_only_ground_truth():
