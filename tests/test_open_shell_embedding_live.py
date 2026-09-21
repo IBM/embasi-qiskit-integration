@@ -162,9 +162,13 @@ def test_downfold_matches_an_independently_rebuilt_hamiltonian(open_shell):
     c_a, c_b = alpha.c_active, beta.c_active
     veff_ll = adapter.ints.veff_ll(adapter._dm_a_arr)
 
-    # Frozen-core mean field, exactly as the downfold folds it in.
-    c_in = alpha.c_inactive
-    veff_in = adapter.ints.veff_hf(2.0 * (c_in @ c_in.T))
+    # Frozen-core mean field, exactly as the downfold folds it in: the sum of the two
+    # channels' own inactive densities (one electron per channel), shared by both
+    # channels.  This fixture runs at n_frozen_occ=0, so both blocks are empty and
+    # `veff_in` is zero -- spelled out in the correct form anyway, so that adding frozen
+    # orbitals here tests the downfold instead of re-deriving its assumption.
+    c_in_a, c_in_b = alpha.c_inactive, beta.c_inactive
+    veff_in = adapter.ints.veff_hf(c_in_a @ c_in_a.T + c_in_b @ c_in_b.T)
 
     def _h1(c, fock):
         h = c.T @ (fock - veff_ll + veff_in) @ c

@@ -2189,6 +2189,11 @@ class ProjectionEmbeddingAdapter:
         alpha-only tensor, because every consumer that cannot take the triple reads it.
         A backend without ``eri_mo_mixed`` yields ``h2_spin=None``, recorded in ``meta``
         as ``h2_spin_free`` rather than silently fabricated.
+
+        With ``n_frozen_occ > 0`` the frozen core is the *sum* of the two channels'
+        inactive densities, not twice either one: each channel freezes its own orbitals,
+        so both the folded ``veff`` and ``e_core`` are built from
+        ``c_in_a c_in_a^T + c_in_b c_in_b^T``.
         """
         alpha, beta = orbitals
         if alpha.n_active_orbitals != beta.n_active_orbitals:
@@ -2200,18 +2205,30 @@ class ProjectionEmbeddingAdapter:
         if self._p_b_spin is None:
             raise ValueError("no per-spin P_B available; call run_low_level() unrestricted")
 
+        # Frozen-core density, ONCE for the pair.  The two channels freeze *different*
+        # orbitals (SPADE partitions each spin separately), so the core is
+        # `c_in_a c_in_a^T + c_in_b c_in_b^T` -- one electron per channel.  The
+        # restricted `2 * c_in c_in^T` is not a valid stand-in: it has the right trace,
+        # so no electron-count check fires, but it is the wrong matrix wherever the two
+        # cores differ.  That error is invisible for a deep 1s core (<a|S|b> ~ 0.999998,
+        # ~0.4 kcal/mol on OH) and large once a frozen orbital is valence-like
+        # (<a|S|b> ~ 0.96, ~40 kcal/mol on triplet CH2).  It also cancels identically at
+        # `n_frozen_occ=0`, where both forms are zero.
+        dm_in = alpha.c_inactive @ alpha.c_inactive.T + beta.c_inactive @ beta.c_inactive.T
+        # Both channels see the SAME frozen-core mean field: veff is a functional of the
+        # total core density, not of one spin's half of it.
+        veff_in = self.ints.veff_hf(dm_in)
+
         h1_pair, leaks = [], []
         for ispin, orb in ((0, alpha), (1, beta)):
             c_act = orb.c_active
-            c_in = orb.c_inactive
             # Each channel's own projector must be invisible in its own active space.
             leaks.append(float(np.abs(c_act.T @ self._p_b_spin[ispin] @ c_act).max()))
             fock = self._fock_spin[ispin]  # type: ignore[index]
             # h_emb per channel: strip the low-level mean field, exactly as `h_emb` does
             # for the spin-summed Fock (see that property for why it is veff_ll).
             h_emb_s = fock - self.ints.veff_ll(self._dm_a_arr)
-            dm_in = 2.0 * (c_in @ c_in.T)
-            h1_s = c_act.T @ (h_emb_s + self.ints.veff_hf(dm_in)) @ c_act
+            h1_s = c_act.T @ (h_emb_s + veff_in) @ c_act
             asym = float(np.abs(h1_s - h1_s.T).max())
             if asym > 1e-6:
                 raise ValueError(
@@ -2246,13 +2263,11 @@ class ProjectionEmbeddingAdapter:
             # A backend without the mixed transform (e.g. a stub): fall back to the
             # spin-free tensor rather than fabricating a triple, and record it.
             h2_spin = None
-        c_in_a = alpha.c_inactive
-        dm_in_a = 2.0 * (c_in_a @ c_in_a.T)
         e_core = self.ints.energy_nuc() + np.einsum(
             "ij,ji->",
-            dm_in_a,
+            dm_in,
             (self._fock_spin[0] - self.ints.veff_ll(self._dm_a_arr))  # type: ignore[index]
-            + 0.5 * self.ints.veff_hf(dm_in_a),
+            + 0.5 * veff_in,
         )
         n_alpha = alpha.n_occ - alpha.inactive.size
         n_beta = beta.n_occ - beta.inactive.size

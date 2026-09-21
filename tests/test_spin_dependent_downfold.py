@@ -539,3 +539,155 @@ def test_v_emb_spin_is_not_an_additive_decomposition():
     summed_fock = fock_a + fock_b
     v_total_if_additive = summed_fock - veff - hcore - (pb_a + pb_b)
     assert not np.allclose(v_a + v_b, v_total_if_additive)
+
+
+# --------------------------------------------------------------------------- #
+# frozen core on the per-spin path
+# --------------------------------------------------------------------------- #
+def _frozen_core_stub(nao=6, n_occ_a=(3, 3)):
+    """A ``_spin_stub`` with an integral backend whose ``veff_hf`` is density-linear.
+
+    ``veff_hf`` has to actually depend on the density it is handed, or the frozen-core
+    fold cannot be wrong in a way a test can see.  A linear map is enough: it makes the
+    folded potential and ``e_core`` exact functions of ``dm_in``, so the assertions
+    below compare closed forms rather than tolerances.
+
+    Equal occupied counts per channel, because ``embedded_hamiltonian_spin`` requires a
+    common active-space dimension.  The two channels still localise *different* orbitals
+    (each gets its own QR draw), which is the property under test: their frozen cores
+    overlap by only ~0.43 here, so a wrong core is plainly visible.
+    """
+    ad = _spin_stub(nao=nao, n_occ_a=n_occ_a)
+    scale = np.diag(1.0 + np.arange(float(nao)))  # not proportional to the identity
+
+    class _Ints:
+        def veff_ll(self, dm):
+            return np.zeros((nao, nao))
+
+        def veff_hf(self, dm):
+            return scale @ np.asarray(dm) @ scale
+
+        def eri_mo(self, c):
+            n = c.shape[1]
+            return np.zeros((n,) * 4)
+
+        def energy_nuc(self):
+            return 0.0
+
+    ad.ints = _Ints()
+    ad._dm_a = np.eye(nao) * 0.5
+    return ad
+
+
+def test_frozen_core_on_the_spin_path_sums_both_channels():
+    """The frozen core is ``c_in_a c_in_a^T + c_in_b c_in_b^T``, not ``2 c_in c_in^T``.
+
+    Each spin channel freezes its *own* orbitals (SPADE partitions the spins
+    separately), so doubling either channel's core is the restricted expression applied
+    where it does not hold.  It has the right trace -- one electron per channel either
+    way -- so no electron-count check catches it; only the matrix differs, and only
+    where the two cores do.
+
+    Regression: both the folded ``veff_hf`` and ``e_core`` used ``2 * c_in_a c_in_a^T``.
+    On real doublets that is ~0.4 kcal/mol for a deep 1s core (the two cores overlap to
+    0.999998) and ~40 kcal/mol once a frozen orbital is valence-like (~0.96), so the
+    deep-core case would have hidden it indefinitely.
+    """
+    ad = _frozen_core_stub()
+    alpha, beta = ad.build_orbitals_spin(n_frozen_occ=1)
+    ham = ad.embedded_hamiltonian_spin((alpha, beta))
+
+    c_in_a, c_in_b = alpha.c_inactive, beta.c_inactive
+    # The two channels really do freeze different orbitals, or there is nothing to test.
+    assert not np.allclose(c_in_a, c_in_b)
+
+    dm_true = c_in_a @ c_in_a.T + c_in_b @ c_in_b.T
+    dm_wrong = 2.0 * (c_in_a @ c_in_a.T)
+    assert np.trace(dm_true) == pytest.approx(np.trace(dm_wrong), abs=1e-12)  # same count
+    assert not np.allclose(dm_true, dm_wrong)  # ...different matrix
+
+    veff_true = ad.ints.veff_hf(dm_true)
+    fock_a = ad._fock_spin[0]
+
+    def _h1(c, fock, veff):
+        h = c.T @ (fock - ad.ints.veff_ll(ad._dm_a) + veff) @ c
+        return 0.5 * (h + h.T)
+
+    # Both channels see the SAME potential: veff is a functional of the *total* core
+    # density, so alpha is screened by the beta core too.
+    assert np.allclose(ham.h1a, _h1(alpha.c_active, fock_a, veff_true))
+    assert np.allclose(ham.h1b, _h1(beta.c_active, ad._fock_spin[1], veff_true))
+    # ...and NOT what the doubled single-channel core would have produced, nor what
+    # giving each channel its own veff_hf(c_in_ispin) would (the other plausible wrong
+    # fix -- also not a mean field).
+    veff_wrong = ad.ints.veff_hf(dm_wrong)
+    assert not np.allclose(ham.h1a, _h1(alpha.c_active, fock_a, veff_wrong))
+    per_channel_a = ad.ints.veff_hf(c_in_a @ c_in_a.T)
+    assert not np.allclose(per_channel_a, veff_true)
+    assert not np.allclose(ham.h1a, _h1(alpha.c_active, fock_a, per_channel_a))
+
+    e_core_true = np.einsum(
+        "ij,ji->", dm_true, (fock_a - ad.ints.veff_ll(ad._dm_a)) + 0.5 * veff_true
+    )
+    assert ham.e_core == pytest.approx(float(e_core_true), abs=1e-10)
+    e_core_wrong = np.einsum(
+        "ij,ji->", dm_wrong, (fock_a - ad.ints.veff_ll(ad._dm_a)) + 0.5 * veff_wrong
+    )
+    assert abs(ham.e_core - float(e_core_wrong)) > 1e-8
+
+
+def test_frozen_core_is_inert_at_zero_frozen_occupied():
+    """At ``n_frozen_occ=0`` both the old and new forms vanish.
+
+    This is why every pinned open-shell number is unaffected by the fix: the default
+    path never built a frozen-core density at all.
+    """
+    ad = _frozen_core_stub()
+    alpha, beta = ad.build_orbitals_spin(n_frozen_occ=0)
+    assert alpha.c_inactive.shape[1] == 0 and beta.c_inactive.shape[1] == 0
+    ham = ad.embedded_hamiltonian_spin((alpha, beta))
+
+    fock_a = ad._fock_spin[0]
+    h_emb_a = fock_a - ad.ints.veff_ll(ad._dm_a)
+    h1a_bare = alpha.c_active.T @ h_emb_a @ alpha.c_active
+    assert np.allclose(ham.h1a, 0.5 * (h1a_bare + h1a_bare.T))
+    assert ham.e_core == pytest.approx(ad.ints.energy_nuc(), abs=1e-12)
+
+
+def test_spin_downfold_refuses_active_orbitals_that_leak_into_b():
+    """The per-spin projector guard must actually fire on a leaking active space.
+
+    ``embedded_hamiltonian_spin`` refuses a downfold whose active orbitals are not
+    annihilated by their own channel's ``P_B``: a level-shifted environment orbital
+    carries ``mu`` (1e6 here), so leaking one in swamps the Hamiltonian rather than
+    perturbing it.  Healthy input never trips the guard, so without this the branch was
+    unexercised -- disabling it entirely left the whole suite green.
+
+    Feeding the *other* channel's environment is the realistic failure: that is exactly
+    the cross-spin mixing the per-spin path exists to avoid (a spin-summed ``P_B`` leaks
+    ~2e-02 on a real doublet), so this is the guard's actual job, not an invented one.
+    """
+    from embasi_qiskit_integration.projection_embedding_adapter import EmbeddedOrbitals
+
+    ad = _frozen_core_stub()
+    alpha, beta = ad.build_orbitals_spin(n_frozen_occ=0)
+
+    # Splice one beta-environment column into alpha's active space, keeping the active
+    # dimension equal so the downfold reaches the leak check rather than the size check.
+    c_b_env = ad._mo[("B", 1)][:, :1]
+    bad_coeff = alpha.coeff.copy()
+    bad_coeff[:, alpha.active[0]] = c_b_env[:, 0]
+    leaky = EmbeddedOrbitals(
+        coeff=bad_coeff,
+        energy=alpha.energy,
+        n_occ=alpha.n_occ,
+        inactive=alpha.inactive,
+        active=alpha.active,
+    )
+    # The splice really does leak through alpha's own projector, or the guard is not
+    # what is being tested.
+    c_act = leaky.c_active
+    assert float(np.abs(c_act.T @ ad._p_b_spin[0] @ c_act).max()) > 1e-6
+
+    with pytest.raises(ValueError, match="leak into subsystem B per spin"):
+        ad.embedded_hamiltonian_spin((leaky, beta))
