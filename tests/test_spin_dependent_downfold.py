@@ -1404,3 +1404,78 @@ def test_apc_inactive_comes_from_the_occupation_not_column_position():
     assert not [
         i for i in range(n_orb) if i not in active_set and i not in from_occupation and occ[i] == 2
     ], "the occupation rule must account for every doubly-occupied column"
+
+
+def test_h_emb_strips_the_low_level_mean_field_not_the_high_level_one():
+    """``h_emb`` must subtract ``veff_ll``, because ``F_emb`` was built with ``veff_ll``.
+
+    ``F_emb`` is assembled from the ``A_LL`` one-electron blocks, so the mean field baked
+    into it is the **low-level** (``xc_ll``) one.  Subtracting ``veff_hl`` instead leaves
+    the residual ``veff_ll - veff_hl`` inside ``h_emb`` -- hence inside ``v_emb`` and every
+    downfolded Hamiltonian handed to the solver.
+
+    The residual cancels identically when ``xc_hl == xc_ll``, which is why the rest of the
+    suite cannot see it: every other fixture builds one mean field and uses it for both
+    levels.  This test therefore uses two *different* functionals (PBE low, HF high --
+    this repo's WF-in-DFT default pairing), which is the only configuration where the two
+    conventions differ at all.
+
+    The reference is built from the integrals directly (``veff_ll``/``veff_hl`` on the same
+    density), never from ``h_emb`` itself, so this pins the physics rather than restating
+    the implementation.  The control at the end is the ``xc_hl == xc_ll`` case, where both
+    conventions must agree to round-off.
+    """
+    from pyscf import dft, gto, scf
+
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        ProjectionEmbeddingAdapter,
+        PySCFIntegrals,
+    )
+
+    mol = gto.M(atom="O 0 0 0; H 0 0 0.96; H 0.93 0 -0.24", basis="sto-3g", verbose=0)
+    mf_ll = dft.RKS(mol, xc="PBE")
+    mf_ll.kernel()
+    mf_hl = scf.RHF(mol)
+    mf_hl.kernel()
+
+    ints = PySCFIntegrals(mf_hl, mf_ll)
+    nao = mol.nao
+    dm = np.asarray(mf_ll.make_rdm1())
+
+    # The two conventions differ by exactly this operator.  Measured on this fixture it is
+    # a ~1.8 Ha one-body error, so the choice is not a rounding detail.
+    delta = ints.veff_ll(dm) - ints.veff_hl(dm)
+    assert np.abs(delta).max() == pytest.approx(1.8027, abs=1e-3)
+    assert np.einsum("ij,ji->", dm, delta) == pytest.approx(6.1505, abs=1e-3)
+
+    # A minimal adapter: `h_emb` reads only `_fock_arr`, `ints` and `_dm_a_for_veff`.
+    ad = ProjectionEmbeddingAdapter.__new__(ProjectionEmbeddingAdapter)
+    ad.unrestricted = False
+    ad.ints = ints
+    ad._dm_a_spin = None
+    ad._dm_a = dm
+    # A stand-in F_emb; `h_emb` is F_emb minus a mean field, so any fixed operator here
+    # isolates WHICH mean field is removed.
+    fock = np.asarray(mf_ll.get_fock(dm=dm))
+    ad._fock = fock
+
+    h_emb = np.asarray(ad.h_emb)
+    assert h_emb.shape == (nao, nao)
+
+    # The low-level convention, built independently of `h_emb`.
+    expected_ll = fock - ints.veff_ll(dm)
+    wrong_hl = fock - ints.veff_hl(dm)
+    np.testing.assert_allclose(h_emb, expected_ll, atol=1e-10)
+    # And it is genuinely NOT the high-level one: the two differ by the residual above.
+    assert np.abs(h_emb - wrong_hl).max() == pytest.approx(np.abs(delta).max(), abs=1e-8)
+
+    # Control: with one mean field for both levels the residual vanishes, which is exactly
+    # why a single-functional fixture cannot distinguish the two conventions.
+    ints_same = PySCFIntegrals(mf_hl, mf_hl)
+    ad_same = ProjectionEmbeddingAdapter.__new__(ProjectionEmbeddingAdapter)
+    ad_same.unrestricted = False
+    ad_same.ints = ints_same
+    ad_same._dm_a_spin = None
+    ad_same._dm_a = dm
+    ad_same._fock = fock
+    np.testing.assert_allclose(np.asarray(ad_same.h_emb), fock - ints_same.veff_hl(dm), atol=1e-10)

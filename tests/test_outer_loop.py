@@ -485,60 +485,92 @@ def test_reseed_advances_seed_when_solver_has_one():
     assert stub2.seed == base
 
 
-def test_diis_survives_the_convergence_vector_changing_shape():
-    """A DIIS subspace must not span both spin-summed and per-spin residuals.
+def test_diis_subspace_is_reset_when_the_convergence_vector_changes_shape():
+    """``_run_outer_loop`` must survive ``spin_mixed`` flipping between cycles.
 
-    ``spin_mixed`` is decided per cycle: the loop demotes to the spin-summed vector
-    whenever the solver resolved the channels but the adapter has no per-spin ``gamma^A``
-    to form a residual against.  So a run can append a ``(nao, nao)`` residual on one
-    cycle and a stacked ``(2, nao, nao)`` one on the next.
+    ``spin_mixed`` is decided per cycle: the loop uses the stacked ``(2, nao, nao)``
+    per-spin vector when the solver resolved the channels *and* the adapter has a
+    per-spin ``gamma^A`` to form a residual against, and demotes to the spin-summed
+    ``(nao, nao)`` total when it does not.  So a run can append a ``(nao, nao)``
+    residual on one cycle and a ``(2, nao, nao)`` one on the next, leaving the DIIS
+    history spanning two incommensurable spaces.
 
-    ``np.vdot`` then flattens the two to different lengths and raises ``ValueError`` --
-    not the ``LinAlgError`` that ``diis_extrapolate`` guards -- which aborted the whole
-    outer loop rather than degrading.  The fix drops the stale-shape history, restarting
-    the subspace from the current cycle.
+    ``_diis_extrapolate`` then flattens the pair to different lengths and raises
+    ``ValueError`` -- *not* the ``LinAlgError`` it guards and converts into a linear-mixing
+    fallback -- so the exception escaped ``_run_outer_loop`` and aborted the whole run
+    partway through a scan.  The in-cycle guard covered a mismatch *within* one cycle;
+    nothing checked the history *across* cycles.
 
-    Exercises the loop's own buffer logic (append, then extrapolate over the history)
-    rather than a live unrestricted run: making the mock genuinely unrestricted requires a
-    spin sector it cannot supply, and the defect is in the buffer bookkeeping, which is
-    shape-driven and independent of where the shapes came from.
+    This drives the real loop rather than a transcription of its guard: the adapter is
+    wrapped so ``unrestricted`` and ``_dm_a_spin`` are present on odd cycles and absent on
+    even ones, and the solver returns a genuinely spin-resolved result, which is precisely
+    the demotion the loop reacts to.  Without the fix this test raises; with it the run
+    completes and logs the reset.
     """
-    nao = 4
-    rng = np.random.default_rng(0)
-    residuals: list[np.ndarray] = []
-    outputs: list[np.ndarray] = []
+    adapter = _build_adapter()
+    adapter.run_low_level()
+
+    dm_a = np.asarray(adapter._dm_a)
+    half = 0.5 * dm_a
+
+    class _FlipFlopAdapter:
+        """Delegates to the real adapter, toggling the per-spin sector each cycle.
+
+        ``_dm_a_spin`` present -> the loop stacks the pair (per-spin vector);
+        absent -> it falls back to the spin-summed total.  Toggling it on every
+        ``run_low_level_a_only`` (the last call of each cycle) alternates the
+        convergence vector's shape, which is the condition under test.
+        """
+
+        unrestricted = True
+
+        def __init__(self, inner):
+            self._inner = inner
+            self._spin_on = True
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        @property
+        def _dm_a_spin(self):
+            # A polarised pair whose sum is the real spin-summed density, so the
+            # energy assembly stays on honest numbers.
+            return (half * 1.05, half * 0.95) if self._spin_on else None
+
+        def rdm1_ao_spin(self, rdm1a, rdm1b, orbitals, orbitals_b=None):
+            a = self._inner.rdm1_ao(rdm1a, orbitals)
+            b = self._inner.rdm1_ao(rdm1b, orbitals)
+            return a, b
+
+        def run_low_level_a_only(self, dma_in=None, dmb_in=None):
+            # Feed the summed total through: the mock takes one (nao, nao) block.
+            if isinstance(dma_in, tuple):
+                dma_in = dma_in[0] + dma_in[1]
+            out = self._inner.run_low_level_a_only(dma_in=dma_in, dmb_in=dmb_in)
+            self._spin_on = not self._spin_on  # flip the shape for the next cycle
+            return out
+
+    class _SpinResolvedFCI:
+        """FCI, reported as a spin-resolved result (rdm1a + rdm1b == rdm1)."""
+
+        def solve(self, ham):
+            result = FCISolver().solve(ham)
+            half_rdm = 0.5 * np.asarray(result.rdm1)
+            return result.model_copy(update={"rdm1a": half_rdm, "rdm1b": half_rdm})
+
+    wrapped = _FlipFlopAdapter(adapter)
     logs: list[str] = []
+    wf = _workflow(solver="fci", max_cycles=4, diis=True, e_tol=0.0, rho_tol=0.0)
 
-    def _cycle(vec_now, vec_fed, spin_mixed):
-        """The exact guard + append sequence from ``_run_outer_loop``."""
-        if residuals and np.asarray(residuals[-1]).shape != np.asarray(vec_fed - vec_now).shape:
-            logs.append("   DIIS subspace reset: the convergence vector changed shape.")
-            residuals.clear()
-            outputs.clear()
-        residuals.append(vec_fed - vec_now)
-        outputs.append(vec_fed)
-        if len(residuals) >= 2:
-            return EmbeddingWorkflow._diis_extrapolate(residuals, outputs)
-        return None
+    # Before the fix this raised ValueError out of the loop.
+    energy = wf._run_outer_loop(wrapped, _SpinResolvedFCI(), None, rank=0, log=logs.append)
 
-    # Cycle 1: spin-summed (the adapter had no per-spin gamma^A this round).
-    _cycle(rng.standard_normal((nao, nao)), rng.standard_normal((nao, nao)), False)
-    assert residuals[-1].shape == (nao, nao)
-
-    # Cycle 2: per-spin.  Before the fix this raised ValueError from np.vdot.
-    out = _cycle(rng.standard_normal((2, nao, nao)), rng.standard_normal((2, nao, nao)), True)
-    assert logs, "the shape change must be reported, not silently absorbed"
-    assert [r.shape for r in residuals] == [(2, nao, nao)], "stale history must be dropped"
-    assert out is None, "a one-vector subspace cannot extrapolate yet"
-
-    # Cycle 3: still per-spin -> a real extrapolation, in the new shape.
-    out = _cycle(rng.standard_normal((2, nao, nao)), rng.standard_normal((2, nao, nao)), True)
-    assert out is not None and np.asarray(out).shape == (2, nao, nao)
-
-    # And back again: demotion must reset just as cleanly.
-    logs.clear()
-    _cycle(rng.standard_normal((nao, nao)), rng.standard_normal((nao, nao)), False)
-    assert logs and [r.shape for r in residuals] == [(nao, nao)]
+    assert energy is not None, "the loop must complete, not abort on the shape change"
+    resets = [line for line in logs if "DIIS subspace reset" in line]
+    assert resets, "the shape change must be reported, not silently absorbed"
+    # The vector alternates every cycle, so the reset is hit more than once, and the
+    # message must name the direction it went.
+    assert any("per-spin" in line for line in resets), resets
 
 
 def test_diis_extrapolate_refuses_a_mixed_shape_subspace_loudly():
