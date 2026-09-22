@@ -17,8 +17,11 @@ jobs:
       - name: Set up Python
         run: uv venv --python 3.12
 
+      - name: Install MPI (EmbASI needs mpi4py)
+        run: sudo apt-get update && sudo apt-get install -y libopenmpi-dev openmpi-bin
+
       - name: Install project
-        run: uv pip install -e ".[dev,quantum,fermions]"
+        run: uv pip install -e ".[dev,quantum,fermions,embed]"
 
       - name: Check formatting (ruff)
         run: uv run ruff format --check src scripts tests
@@ -26,5 +29,16 @@ jobs:
       - name: Lint (ruff)
         run: uv run ruff check src scripts tests
 
+      # EMBASI_AVAILABLE=1 un-skips the `embasi`-marked tests, which need the `embed`
+      # extra installed above.  They are PySCF-backed, so they need no FHI-aims binary.
       - name: Run unit tests
         run: uv run pytest -q
+        env:
+          EMBASI_AVAILABLE: "1"
+
+      # The `embasi` marker is deselected by the addopts in pyproject.toml, so the run
+      # above never collects it; -m embasi selects exactly that set.
+      - name: Run EmbASI-backed tests
+        run: uv run pytest -q -m embasi
+        env:
+          EMBASI_AVAILABLE: "1"
