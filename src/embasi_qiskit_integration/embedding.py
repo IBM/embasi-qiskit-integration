@@ -531,6 +531,10 @@ class EmbeddingWorkflow(BaseSettings):
     #   (``mulliken``: per-fragment cap; ``spade``: cap after the σ² gap; ``concentric-cl``:
     #   ceiling on the shell-determined k, truncating the outermost shell tail for small
     #   simulations; ``none``: the fixed energy-ordered cut).
+    #   With ``spin_downfold=True`` it caps the COMMON active-orbital count instead,
+    #   counted above the widest channel's active occupied block: the two spin channels
+    #   have different occupied counts, so one per-channel virtual count cannot give them
+    #   the same ``norb`` (see ``build_orbitals_spin``).
     # ``concentric-cl`` by default: the full iterative Concentric Localization of
     # Claudino 2019 (JCTC 15, 6085), the paper-faithful cut.  It keeps a nested,
     # size-consistent active-virtual space (an energy-ordered "none" cut is non-nested
@@ -804,11 +808,14 @@ class EmbeddingWorkflow(BaseSettings):
                 # its own span(A), downfolded to an (h1a, h1b) pair.  Selectors do not
                 # apply here (see the `spin_downfold` field comment).
                 # A *localiser* (spade, concentric-cl) is supported: it is applied per
-                # channel and the two virtual counts reconciled to their min (see
-                # `build_orbitals_spin`).  An index `selector` (mulliken) and the APC
-                # `orbital_builder` are not: both pick/rank columns against a single
-                # spin-summed Fock and neither has a per-channel reconciliation, so they
-                # would silently mix the channels the per-spin path exists to separate.
+                # channel, and `build_orbitals_spin` then reconciles the two channels to a
+                # common active-ORBITAL count (deriving each one's virtual count from its
+                # own occupied count, since an open shell has n_occ_alpha != n_occ_beta).
+                # An index `selector` (mulliken) and the APC `orbital_builder` are not:
+                # both pick/rank columns against a single spin-summed Fock and neither has
+                # a per-channel form, so they would silently mix the channels the per-spin
+                # path exists to separate.  `--n_virtual` IS usable here -- it caps the
+                # common active space rather than each channel's virtuals.
                 if selector is not None or orbital_builder is not None:
                     raise ValueError(
                         f"spin_downfold=True does not support selector={self.selector!r}: "

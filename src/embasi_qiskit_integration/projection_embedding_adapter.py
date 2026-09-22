@@ -145,10 +145,21 @@ per-spin leak ~2e-10, ``E_solver = -53.522493`` Ha.
 **Known limits of the per-spin path** (none of them silent):
 
 * **Localisers work per channel; index selectors do not.**  ``spade`` /
-  ``concentric-cl`` are applied to each channel's own virtual block and the two counts
-  reconciled to their ``min`` (the downfold needs one ``norb``).  ``mulliken`` and
+  ``concentric-cl`` are applied to each channel's own virtual block.  ``mulliken`` and
   ``apc-concentric`` rank columns against a single spin-summed Fock and have no
   per-channel form, so ``EmbeddingWorkflow`` refuses them with ``spin_downfold``.
+* **The active-orbital count is reconciled across the channels, the electron counts are
+  not.**  ``build_orbitals_spin`` equalises ``norb`` -- that is the only thing
+  ``fci.direct_uhf`` requires, since it takes one orbital dimension with an asymmetric
+  ``(n_alpha, n_beta)`` -- and derives each channel's *virtual* count from its own
+  occupied count, so the channel with fewer electrons takes more virtuals.  ``n_virtual``
+  is consequently a ceiling on the active space, counted above the widest channel's active
+  occupied block, **not** a per-channel virtual count: an open shell has
+  ``n_occ_alpha != n_occ_beta``, so one number applied to both would leave the two active
+  spaces differing by exactly ``A_spin``.  ``n_frozen_occ`` stays per channel (a shared
+  *count* does not freeze corresponding orbitals) and is validated against the narrower
+  channel, with a warning when a frozen pair's ``|<a_i|S|b_i>|`` drops below
+  ``_FROZEN_OVERLAP_TOL``.
 * **Only FCI consumes the pair.**  SQD's ``diagonalize_fermionic_hamiltonian`` and the
   FCIDUMP format each take a single one-body tensor; both fall back to the spin-averaged
   ``h1`` and warn.  ``h2_spin`` is likewise FCI-only.  This is an upstream
@@ -222,6 +233,14 @@ _EV2HA = 1.0 / _EMBASI_HA2EV
 # dtype.  A nonzero imaginary part above this is a genuine error (multi-k / open
 # shell / a bug), not round-off -- so we assert rather than silently discard it.
 _IMAG_TOL = 1.0e-9
+
+# `n_frozen_occ` freezes the lowest k orbitals of EACH spin channel, but SPADE orders
+# them per spin, so the two cores denote one shared set only while they overlap.  Below
+# this, `build_orbitals_spin` warns: measured on the stretched C-N geometry the pairs run
+# 1.000 / 1.000 / 0.982 / 0.951 and then fall off a cliff to 1e-04, so the boundary is
+# sharp and a threshold anywhere in (0.95, 1) separates "corresponding" from "unrelated".
+# 0.9 is deliberately permissive -- it flags the cliff, not ordinary polarisation.
+_FROZEN_OVERLAP_TOL = 0.9
 
 
 # --------------------------------------------------------------------------- #
@@ -2340,6 +2359,40 @@ class ProjectionEmbeddingAdapter:
         member.  Selectors are deliberately not accepted here -- an independent cut per
         channel could keep different orbital counts, and the downfold needs a common
         active-space dimension.
+
+        **The two channels are reconciled to a common active-orbital count.**  An open
+        shell has ``n_occ_alpha != n_occ_beta`` (by ``A_spin``), so applying one
+        ``n_virtual`` to both leaves ``n_occ - n_frozen_occ + n_virtual`` differing by
+        exactly ``A_spin`` and :meth:`embedded_hamiltonian_spin` then refuses the pair.
+        What the solver actually requires is a single ``norb`` -- ``fci.direct_uhf`` takes
+        one orbital dimension with an *asymmetric* ``(n_alpha, n_beta)`` sector, which is
+        the whole point of an unrestricted solve.  So ``norb`` is equalised and each
+        channel's **virtual** count is derived from its own occupied count: the channel
+        with fewer electrons simply takes more virtuals.  ``n_virtual`` is therefore a
+        ceiling on the *active space*, not a per-channel virtual count -- which is the
+        only reading under which it can mean the same thing for both spins.
+
+        Args:
+            n_frozen_occ: occupied orbitals frozen into ``e_core``, **per channel**.
+                Validated against ``min(n_occ_alpha, n_occ_beta)`` up front, so an
+                out-of-range value is reported once against the binding limit rather than
+                when the loop happens to reach the narrower channel.  Deliberately *not*
+                reconciled: freezing the same *count* in both channels does not freeze
+                corresponding orbitals, and a mismatched pair is warned about (see below)
+                rather than silently accepted.
+            n_virtual: ceiling on the common active-orbital count, expressed as virtuals
+                above the *widest* channel's active occupied block.  ``None`` takes the
+                largest space both channels can support.
+            virtual_localizer: applied per channel before the cut, as before.
+            use_relaxed: diagonalize the relaxed per-spin Fock.
+
+        Warns:
+            UserWarning: a frozen pair's overlap ``|<a_i|S|b_i>|`` falls below
+                ``_FROZEN_OVERLAP_TOL``.  The two channels' frozen orbitals correspond
+                only while they overlap: measured on the stretched C-N geometry the first
+                pairs run 1.000 / 1.000 / 0.982 / 0.951 and then collapse to 1e-04, so
+                freezing five in each channel freezes *physically different* orbitals in
+                the fifth slot.  The count matching cannot detect that; the overlap can.
         """
         if self._fock_spin is None:
             raise ValueError(
@@ -2352,7 +2405,12 @@ class ProjectionEmbeddingAdapter:
                 "use_relaxed=True needs a relaxed per-spin Fock; call relax_active_hf() "
                 "on an unrestricted adapter first"
             )
-        out = []
+
+        # Pass 1: each channel's own eigenbasis and counts.  Nothing is cut yet -- the cut
+        # needs both channels' numbers, which is why this cannot stay a single loop.
+        eps_c: list[tuple[np.ndarray, np.ndarray]] = []
+        n_occs: list[int] = []
+        n_virt_totals: list[int] = []
         for ispin in (0, 1):
             eps, c = self._eigh_subsystem_a_spin(ispin, use_relaxed=use_relaxed)
             n_occ = self._mo_spin(self.p.mo_coeffs_A_LL, ispin).shape[1]
@@ -2362,17 +2420,117 @@ class ProjectionEmbeddingAdapter:
                     f"spin {ispin}: subsystem-A space has {c.shape[1]} orbitals but "
                     f"{n_occ} are occupied; the partition and the MOs disagree"
                 )
-            n_virt = n_virt_total if n_virtual is None else min(n_virtual, n_virt_total)
-            if not 0 <= n_frozen_occ < n_occ:
+            eps_c.append((eps, c))
+            n_occs.append(n_occ)
+            n_virt_totals.append(n_virt_total)
+
+        # Validate `n_frozen_occ` against the BINDING channel, naming it.  Reporting this
+        # up front is the difference between "n_frozen_occ=5 outside [0, 5) for spin 1"
+        # (which reads as beta being at fault) and a message that says the shared knob is
+        # capped by the channel with fewer electrons.
+        n_occ_min = min(n_occs)
+        if not 0 <= n_frozen_occ < n_occ_min:
+            raise ValueError(
+                f"n_frozen_occ={n_frozen_occ} outside [0, {n_occ_min}): subsystem A has "
+                f"n_occ={n_occs[0]} alpha / {n_occs[1]} beta, and the frozen count applies "
+                f"to both channels, so the smaller one binds. Reduce n_frozen_occ to at "
+                f"most {n_occ_min - 1}."
+            )
+
+        # Reconcile to a common ACTIVE-ORBITAL count.  Each channel can support at most
+        # `n_occ_s - n_frozen_occ + n_virt_total_s` active orbitals, so the smaller of the
+        # two is the largest `norb` both can realise.  `n_virtual` then caps it, counted
+        # above the WIDEST channel's active occupied block -- as a per-channel virtual
+        # count it cannot mean the same thing for two channels with different occupancies,
+        # which is exactly the bug this replaces.
+        n_act_occ = [n - n_frozen_occ for n in n_occs]
+        supported = [n_act_occ[s] + n_virt_totals[s] for s in (0, 1)]
+        n_act = min(supported)
+        if n_virtual is not None:
+            n_act = min(n_act, max(n_act_occ) + n_virtual)
+        if n_act < max(n_act_occ):
+            # `norb` cannot cover both channels' active occupied blocks.  Two distinct
+            # causes, and the message has to say which -- they need opposite fixes.
+            #
+            # `_eigh_subsystem_a_spin` returns span(A_s) = the S-orthogonal complement of
+            # span(B_s), whose width is `nao - n_occ_B_s` and so differs per channel.  On
+            # the real doublets here both come out equal (19 or 20 wide), but nothing
+            # guarantees it: when the narrower span cannot hold the wider channel's
+            # occupied block, no `n_virtual` helps and the partition itself is the limit.
+            binding_span = min(supported) < max(n_act_occ)
+            if binding_span:
                 raise ValueError(
-                    f"n_frozen_occ={n_frozen_occ} outside [0, {n_occ}) for spin {ispin}"
+                    f"the two spin channels cannot share an active-orbital count: spin 0 "
+                    f"supports {supported[0]} active orbitals and spin 1 supports "
+                    f"{supported[1]}, but the wider channel's active occupied block alone "
+                    f"needs {max(n_act_occ)} (n_occ={n_occs[0]}/{n_occs[1]} minus "
+                    f"n_frozen_occ={n_frozen_occ}). The per-channel span(A) widths differ "
+                    f"({n_occs[0] + n_virt_totals[0]}/{n_occs[1] + n_virt_totals[1]}), so "
+                    f"this is a property of EmbASI's partition, not of n_virtual -- "
+                    f"raising it cannot fix this. Freeze more occupied orbitals "
+                    f"(n_frozen_occ > {n_frozen_occ}) to shrink the active occupied block."
                 )
+            raise ValueError(
+                f"n_virtual={n_virtual} gives a {n_act}-orbital active space, smaller than "
+                f"the active occupied block of one channel ({max(n_act_occ)}: n_occ="
+                f"{n_occs[0]}/{n_occs[1]} minus n_frozen_occ={n_frozen_occ}); that would "
+                f"drop occupied orbitals from both the core and the active space, losing "
+                f"electrons. n_virtual counts above the widest channel's active occupied "
+                f"block, so it must be >= 0 -- which it is here, meaning the cap is simply "
+                f"below what the sector needs."
+            )
+
+        out = []
+        for ispin in (0, 1):
+            eps, c = eps_c[ispin]
+            n_occ = n_occs[ispin]
+            # Each channel's virtual count follows from the COMMON active size and its own
+            # occupied count: fewer electrons -> more virtuals, same `norb`.
+            n_virt = n_act - n_act_occ[ispin]
             active = np.arange(n_frozen_occ, n_occ + n_virt)
             inactive = np.arange(n_frozen_occ, dtype=int)
             out.append(
                 EmbeddedOrbitals(coeff=c, energy=eps, n_occ=n_occ, inactive=inactive, active=active)
             )
+
+        self._warn_on_mismatched_frozen_core(out[0], out[1])
         return out[0], out[1]
+
+    def _warn_on_mismatched_frozen_core(
+        self, alpha: EmbeddedOrbitals, beta: EmbeddedOrbitals
+    ) -> None:
+        """Warn when the two channels' frozen orbitals do not correspond.
+
+        ``n_frozen_occ`` freezes the lowest *k* orbitals of each channel independently, so
+        the two cores match only while ``|<a_i|S|b_i>|`` stays near 1.  When it does not,
+        the pair is still dimensionally valid and every count-based check passes -- the
+        electron count, the spin sector, the projector leak -- while ``e_core`` charges
+        two physically different orbitals to one frozen slot.  Only the overlap sees it,
+        which is why it is checked rather than inferred.
+
+        A warning, not an error: the frozen core is folded *unrestricted*
+        (:meth:`AOIntegrals.veff_uhf`), so a mismatched pair is handled correctly as two
+        distinct densities.  What degrades is the *interpretation* -- "frozen core" implies
+        a shared set -- and how well a fixed count truncates the two channels alike.
+        """
+        if not alpha.inactive.size:
+            return
+        s = self._s_arr
+        c_a, c_b = alpha.c_inactive, beta.c_inactive
+        overlaps = np.abs(np.diag(c_a.T @ s @ c_b))
+        bad = [(i, float(o)) for i, o in enumerate(overlaps) if o < _FROZEN_OVERLAP_TOL]
+        if bad:
+            detail = ", ".join(f"i={i}: {o:.3g}" for i, o in bad)
+            warnings.warn(
+                f"the two spin channels' frozen orbitals do not correspond ({detail}; "
+                f"|<a_i|S|b_i>| < {_FROZEN_OVERLAP_TOL}). n_frozen_occ freezes the lowest "
+                f"{alpha.inactive.size} orbitals of EACH channel, and SPADE orders them "
+                f"per spin, so a matching count does not mean matching orbitals. The core "
+                f"is folded unrestricted so the energy is still assembled correctly, but "
+                f"'frozen core' no longer denotes one shared set -- reduce n_frozen_occ to "
+                f"stay inside the corresponding block.",
+                stacklevel=3,
+            )
 
     def embedded_hamiltonian_spin(
         self, orbitals: tuple[EmbeddedOrbitals, EmbeddedOrbitals]

@@ -12,6 +12,7 @@ so rather than silently presenting a restricted answer as an unrestricted one.
 
 from __future__ import annotations
 
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -99,12 +100,25 @@ def test_fcidump_does_not_warn_without_a_pair(tmp_path, recwarn):
 # --------------------------------------------------------------------------- #
 # per-spin downfold plumbing (no EmbASI needed)
 # --------------------------------------------------------------------------- #
-def _spin_stub(nao=6, n_occ_a=(3, 2)):
+def _spin_stub(nao=6, n_occ_a=(3, 2), n_occ_b=2):
     """Adapter with per-spin state whose two channels are genuinely orthogonal.
 
     Mimics what EmbASI hands back on an open shell: each spin channel gets its own
     A/B split, so ``span(A_ispin)`` is S-orthogonal to ``span(B_ispin)`` but NOT to
     the other channel's environment -- the property that forces a per-spin downfold.
+
+    ``n_occ_b`` is the **environment** size, shared by both channels, which sets each
+    channel's span(A) width to ``nao - n_occ_b`` (that span is the S-orthogonal complement
+    of span(B); see ``_eigh_subsystem_a_spin``). Both channels therefore get the *same*
+    span width, as they do on a real molecule -- one environment, both spans ~equally wide
+    (measured 19 or 20 on the butyronitrile geometries). That matters because
+    ``build_orbitals_spin`` reconciles the two channels to one active-orbital count, which
+    is only possible when the narrower span can hold the wider channel's occupied block.
+
+    Passing ``n_occ_b=None`` instead makes B the exact complement of A, which leaves
+    span(A) with *no virtual room* and -- when the occupied counts differ -- span widths
+    that differ too. That configuration has no common ``norb`` and is refused; it is kept
+    reachable only to test that refusal.
     """
     from embasi_qiskit_integration.projection_embedding_adapter import (
         ProjectionEmbeddingAdapter,
@@ -120,7 +134,11 @@ def _spin_stub(nao=6, n_occ_a=(3, 2)):
     mo, pb, fock = {}, [], []
     for ispin, n_a in enumerate(n_occ_a):
         q = np.linalg.qr(rng.standard_normal((nao, nao)))[0]
-        c_a, c_b = q[:, :n_a], q[:, n_a:]
+        n_b = nao - n_a if n_occ_b is None else n_occ_b
+        # A takes the first n_a columns; B takes n_b columns from the REMAINING ones, so
+        # span(A_s) = complement of span(B_s) is (nao - n_b) wide and leaves
+        # (nao - n_b - n_a) virtuals above A's occupied block.
+        c_a, c_b = q[:, :n_a], q[:, nao - n_b :]
         mo[("A", ispin)], mo[("B", ispin)] = c_a, c_b
         # Level-shift projector onto THIS channel's environment.
         pb.append(ad.mu * (c_b @ c_b.T))
@@ -1075,3 +1093,128 @@ def test_feedback_calls_run_low_level_with_the_split_densities():
     # A is the correlated density alone; B stays separate rather than being folded in.
     assert np.allclose(seen["dma_in"], ad.rdm1_ao(np.eye(2), orbitals))
     assert np.allclose(seen["dmb_in"], ad._dm_b)
+
+
+def test_build_orbitals_spin_reconciles_norb_across_channels():
+    """``n_virtual`` must yield ONE ``norb``, not two differing by ``A_spin``.
+
+    An open shell has ``n_occ_alpha != n_occ_beta``, and the active size is
+    ``n_occ - n_frozen_occ + n_virt``. So applying one ``n_virtual`` per channel -- which
+    is what this did -- leaves the two active spaces differing by exactly ``A_spin``, and
+    ``embedded_hamiltonian_spin`` then refuses the pair. Measured on data/22.inp
+    (``A_spin=2``): ``n_virtual=2`` gave 9 vs 7.
+
+    What the solver actually needs is one ``norb``: ``fci.direct_uhf`` takes a single
+    orbital dimension with an *asymmetric* ``(n_alpha, n_beta)``. So ``n_virtual`` caps the
+    common active space and each channel's virtual count follows from its own occupied
+    count -- fewer electrons, more virtuals.
+    """
+    # nao=8 with a 3-orbital environment gives BOTH channels a 5-wide span(A) (as a
+    # real molecule does: one environment), so there is virtual room to cut.
+    ad = _spin_stub(nao=8, n_occ_a=(3, 2), n_occ_b=3)  # a_spin = 1
+    for n_virtual in (None, 1, 2):
+        alpha, beta = ad.build_orbitals_spin(n_virtual=n_virtual)
+        assert alpha.n_active_orbitals == beta.n_active_orbitals, (
+            f"n_virtual={n_virtual} gave {alpha.n_active_orbitals} vs "
+            f"{beta.n_active_orbitals}; the channels were not reconciled"
+        )
+        # The spin is preserved, not flattened into a common electron count: alpha keeps
+        # its extra electron.  (Each set reports its own channel in slot 0.)
+        n_a = alpha.n_active_electrons_spin[0]
+        n_b = beta.n_active_electrons_spin[0]
+        assert n_a - n_b == 1, f"expected A_spin=1 in the sector, got {n_a} - {n_b}"
+        # Beta, with fewer electrons, takes MORE virtuals to reach the same norb.
+        n_virt_a = alpha.n_active_orbitals - n_a
+        n_virt_b = beta.n_active_orbitals - n_b
+        assert n_virt_b == n_virt_a + 1
+
+    # And the pair the reconciliation produces is one the DOWNFOLD accepts -- previously
+    # `embedded_hamiltonian_spin` raised "active spaces differ in size" for exactly this
+    # call.  Needs an integral backend, so use the stub that has one.
+    ad_ints = _frozen_core_stub(nao=8, n_occ_a=(3, 2))
+    alpha, beta = ad_ints.build_orbitals_spin(n_virtual=2)
+    assert alpha.n_active_orbitals == beta.n_active_orbitals
+    ham = ad_ints.embedded_hamiltonian_spin((alpha, beta))
+    assert ham.is_spin_dependent
+    assert ham.nelec[0] - ham.nelec[1] == 1
+
+
+def test_n_virtual_caps_the_common_active_space():
+    """``n_virtual`` is a ceiling on ``norb``, counted above the widest active occupied.
+
+    Pinning the *meaning*, not just the equality: the count is
+    ``max(n_occ - n_frozen) + n_virtual``, which is the only reading that gives both
+    channels the same ``norb`` when their occupied counts differ.
+    """
+    # nao=8, env=3 -> both spans 5 wide; alpha 3 occupied, beta 2.
+    ad = _spin_stub(nao=8, n_occ_a=(3, 2), n_occ_b=3)
+    for n_frozen_occ in (0, 1):
+        for n_virtual in (1, 2):
+            alpha, _ = ad.build_orbitals_spin(n_frozen_occ=n_frozen_occ, n_virtual=n_virtual)
+            assert alpha.n_active_orbitals == (3 - n_frozen_occ) + n_virtual
+    # `None` takes the largest space BOTH channels support: each span is 5 wide, so alpha
+    # is 3 occ + 2 virt and beta 2 occ + 3 virt -- the same 5.
+    alpha, beta = ad.build_orbitals_spin()
+    assert alpha.n_active_orbitals == beta.n_active_orbitals == 5
+
+
+def test_n_frozen_occ_is_validated_against_the_narrower_channel():
+    """The shared ``n_frozen_occ`` is capped by the channel with FEWER electrons.
+
+    Previously this surfaced from inside the per-channel loop as "outside [0, 2) for spin
+    1", which reads as beta being at fault rather than as a shared knob hitting the
+    binding limit. The message must name both counts and the limit.
+    """
+    ad = _spin_stub(nao=8, n_occ_a=(3, 2), n_occ_b=3)
+    # Fine for alpha (3 occupied) but not for beta (2).
+    with pytest.raises(ValueError, match="the smaller one binds"):
+        ad.build_orbitals_spin(n_frozen_occ=2)
+    with pytest.raises(ValueError, match=r"n_occ=3 alpha / 2 beta"):
+        ad.build_orbitals_spin(n_frozen_occ=2)
+    # One below the limit is accepted, and still reconciles.
+    alpha, beta = ad.build_orbitals_spin(n_frozen_occ=1)
+    assert alpha.n_active_orbitals == beta.n_active_orbitals
+
+
+def test_warns_when_the_two_frozen_cores_do_not_correspond():
+    """A matching frozen *count* does not mean matching frozen *orbitals*.
+
+    SPADE orders each channel's orbitals independently, so the two cores denote one shared
+    set only while ``|<a_i|S|b_i>|`` stays near 1. On data/08.inp (compressed C-N, 0.80 A)
+    the 4th pair is 0.025 while on data/16 and data/22 it is 0.98 / 0.95 -- so the
+    condition is real and geometry-dependent, and no count-based check can see it.
+
+    A warning rather than an error: the core is folded unrestricted, so the energy is still
+    assembled correctly from two distinct densities. What degrades is the *meaning* of
+    "frozen core".
+    """
+    # `_spin_stub` draws each channel's orbitals from its own QR, so the cores are
+    # essentially unrelated -- exactly the condition the warning is for.
+    ad = _spin_stub(nao=8, n_occ_a=(3, 2), n_occ_b=3)
+    with pytest.warns(UserWarning, match="frozen orbitals do not correspond"):
+        ad.build_orbitals_spin(n_frozen_occ=1)
+    # At n_frozen_occ=0 there is no core, so there is nothing to warn about.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        ad.build_orbitals_spin(n_frozen_occ=0)
+
+
+def test_refuses_when_the_two_spans_cannot_share_a_norb():
+    """Differing span(A) widths are a partition property, and the message must say so.
+
+    ``_eigh_subsystem_a_spin`` returns the S-orthogonal complement of ``span(B_s)``, so its
+    width is ``nao - n_occ_B_s`` and need not match between channels. When the narrower span
+    cannot hold the wider channel's occupied block there is no common ``norb``, and no
+    ``n_virtual`` can create one -- so the error must not send the caller to that knob.
+
+    ``n_occ_b=None`` makes B the exact complement of A, which is precisely that case:
+    spans of 3 and 2 against an alpha occupied block of 3. The old code returned the
+    mismatched (3, 2) pair and left ``embedded_hamiltonian_spin`` to refuse it one call
+    later, with a message about active-space sizes that named neither cause.
+    """
+    ad = _spin_stub(nao=6, n_occ_a=(3, 2), n_occ_b=None)
+    with pytest.raises(ValueError, match="cannot share an active-orbital count"):
+        ad.build_orbitals_spin()
+    # It names the spans, and says raising n_virtual will not help.
+    with pytest.raises(ValueError, match="not of n_virtual"):
+        ad.build_orbitals_spin(n_virtual=4)
