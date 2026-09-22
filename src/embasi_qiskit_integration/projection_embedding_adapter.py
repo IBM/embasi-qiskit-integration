@@ -2313,7 +2313,24 @@ class ProjectionEmbeddingAdapter:
         n_orb = c_full.shape[1]
         n_occ = orbitals.n_occ
 
-        dm_a = 2.0 * c_full[:, :n_occ] @ c_full[:, :n_occ].T
+        # The ranking density must carry subsystem A's ACTUAL electron count.  The
+        # restricted `2 * c_occ c_occ^T` is `2 * n_alpha`, which on an open shell invents
+        # `n_alpha - n_beta` extra electrons: measured on the live OH doublet
+        # (n_alpha=5, n_beta=4, EmbASI reporting A_pop=9.0) it fed 10 electrons in, and
+        # `k_diag` came out up to 0.88 Ha high -- systematically, and most on the SOMO.
+        # `k_diag_virt` feeds `apc_pair_coefficients` directly, so the entropies inherit
+        # that error.  The ranking ORDER happens to survive it on this small system, so
+        # this is a latent defect rather than a currently-wrong active space -- but it
+        # would bite exactly where two candidates are near-tied, which is the regime the
+        # `fixed=True` stability note below is about.
+        if orbitals.is_open_shell and orbitals.n_occ_b is not None:
+            n_occ_b = orbitals.n_occ_b
+            dm_a = (
+                c_full[:, :n_occ] @ c_full[:, :n_occ].T
+                + c_full[:, :n_occ_b] @ c_full[:, :n_occ_b].T
+            )
+        else:
+            dm_a = 2.0 * c_full[:, :n_occ] @ c_full[:, :n_occ].T
         k_ao = self.ints.get_k(dm_a)
         f_diag = np.einsum("pi,pq,qi->i", c_full, fock, c_full)
         k_diag = np.einsum("pi,pq,qi->i", c_full, k_ao, c_full)
@@ -2352,7 +2369,39 @@ class ProjectionEmbeddingAdapter:
             occ_pattern = np.where(np.arange(n_orb) < n_occ, 2, 0)
         active = apc_active_space(occ_pattern, entropies, max_size, fixed=fixed)
         print(f"ACTIVE SPACE: {active}")
-        inactive = np.array([i for i in range(n_occ) if i not in set(active.tolist())], dtype=int)
+        # `inactive` must be derived from the OCCUPATION, not from column position.  The
+        # four lines above exist precisely because concentric localization has rotated
+        # within blocks, so "the first n_occ columns are the occupied ones" no longer
+        # holds -- and `range(n_occ)` here would reintroduce that very assumption one line
+        # later.  A frozen column is one that is doubly occupied and not active: anything
+        # else in `c_inactive` is charged into `e_core`/`veff_in` as `2 * c c^T`, so an
+        # *empty* column frozen this way injects two electrons that do not exist, and
+        # `n_active_electrons_spin` (which subtracts `len(inactive)` from both channels)
+        # then reports a sector short by the same amount.
+        #
+        # Latent rather than active on the fixtures here: PySCF's `Chooser` gives a
+        # singly-occupied column synthetic max entropy so a SOMO is never dropped, and on
+        # the live OH doublet the projected pattern comes out positional
+        # ([2, 2, 2, 2, 1, 0, 0, 0]), so the two rules agree.  But they need not -- over
+        # 1719 synthetic (occupation, entropy, budget) combinations the positional rule put
+        # an *empty* column into `inactive` in 789 of them -- and the count-only
+        # cross-check in `_occupation_pattern` cannot see a positional disagreement,
+        # because it compares only `(n_alpha, n_beta)` totals.
+        active_set = set(active.tolist())
+        occ_arr = np.asarray(occ_pattern)
+        inactive = np.array(
+            [i for i in range(n_orb) if i not in active_set and occ_arr[i] == 2], dtype=int
+        )
+        # Anything occupied-but-not-active that is not doubly occupied cannot be folded
+        # into a closed-shell core, and silently dropping it would lose electrons.
+        stranded = [i for i in range(n_orb) if i not in active_set and occ_arr[i] == 1]
+        if stranded:
+            raise ValueError(
+                f"APC left singly-occupied column(s) {stranded} outside the active space "
+                f"(occupation pattern {occ_arr.tolist()}). A SOMO cannot be folded into "
+                "the doubly-occupied frozen core, and dropping it would lose an electron: "
+                "raise max_size, or use fixed=False so the ranking may keep it."
+            )
         return EmbeddedOrbitals(
             coeff=c_full,
             energy=orbitals.energy,

@@ -994,3 +994,48 @@ def test_stretched_state_roundtrip_reproduces_the_per_spin_energy():
     # Withholding the pair must raise, not silently assemble the spin-summed (wrong) form.
     with pytest.raises(ValueError, match="open-shell"):
         projection_energy_from_state(state, solver_energy=result.energy, rdm1_ao=dm_a + dm_b)
+
+
+def test_apc_ranks_against_subsystem_a_real_electron_count(open_shell):
+    """The APC exchange ranking must use ``n_alpha + n_beta``, not ``2 * n_alpha``.
+
+    ``build_orbitals_apc_concentric`` built its ranking density as the restricted
+    ``2 * c_occ c_occ^T``, which on an open shell is ``2 * n_alpha`` and so invents
+    ``n_alpha - n_beta`` extra electrons.  ``k_diag_virt`` feeds ``apc_pair_coefficients``
+    directly, so the entropies inherit the error: measured on this doublet it fed 10
+    electrons where EmbASI reports ``A_pop = 9.0``, and ``k_diag`` came out up to 0.88 Ha
+    high, most of it on the SOMO.
+
+    The ranking *order* survives it on a system this small, so the selected space is
+    unchanged -- which is why only a check on the density itself can see it, and why it
+    would bite where two candidates are near-tied.
+    """
+    from embasi_qiskit_integration.selectors import fragment_ao_indices
+
+    adapter = open_shell[0]
+    s = np.asarray(adapter._s_arr)
+    seen: list[float] = []
+    original = adapter.ints.get_k
+
+    def spy(dm):
+        seen.append(float(np.einsum("ij,ji->", np.asarray(dm), s)))
+        return original(dm)
+
+    adapter.ints.get_k = spy
+    try:
+        frag = fragment_ao_indices(adapter.ints.mol, [0, 1])
+        adapter.build_orbitals_apc_concentric(
+            fragment_ao=frag, n_shells=1, max_size=(4, 4), fixed=True
+        )
+    finally:
+        adapter.ints.get_k = original
+
+    assert seen, "the APC ranking never called get_k"
+    a_pop = float(adapter.p.A_pop)
+    assert a_pop == pytest.approx(9.0, abs=1e-6)  # the doublet: 5 alpha + 4 beta
+    for n in seen:
+        assert n == pytest.approx(a_pop, abs=1e-6), (
+            f"ranking density carries {n} electrons; subsystem A has {a_pop}"
+        )
+        # And specifically not the restricted 2 * n_alpha reading.
+        assert n != pytest.approx(10.0, abs=1e-6)

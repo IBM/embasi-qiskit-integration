@@ -1349,3 +1349,58 @@ def test_the_adapter_hands_veff_ll_the_pair_it_has():
     _ = ad.h_emb
     assert len(seen) == 1 and not isinstance(seen[0], tuple)
     assert np.allclose(seen[0], dm_a + dm_b)
+
+
+def test_apc_inactive_comes_from_the_occupation_not_column_position():
+    """A frozen column must be one that is actually doubly occupied.
+
+    ``build_orbitals_apc_concentric`` computes its occupation pattern
+    rotation-invariantly (concentric localization has just rotated within blocks, so
+    column position no longer implies occupancy) -- and then used to derive ``inactive``
+    as ``range(n_occ) - active``, reintroducing the very positional rule those lines
+    exist to avoid.
+
+    ``c_inactive`` is folded in as ``2 * c c^T``, so freezing an *empty* column injects
+    two electrons that do not exist, and ``n_active_electrons_spin`` (which subtracts
+    ``len(inactive)`` from both channels) then reports a sector short by the same amount.
+    Over 1719 synthetic (occupation, entropy, budget) combinations the positional rule put
+    an empty column into ``inactive`` in 789 of them; the count-only cross-check in
+    ``_occupation_pattern`` cannot see it, because it compares only ``(n_alpha, n_beta)``
+    totals.
+
+    Checks the rule directly against a non-positional pattern, since reaching it through
+    a live EmbASI partition needs an F_emb aufbau order that disagrees with the density
+    occupation -- latent on the fixtures here, not impossible.
+    """
+    occ = np.array([2, 2, 2, 0, 2, 0])  # column 3 is EMPTY but sits inside range(n_occ=4)
+    n_occ, n_orb = 4, 6
+    active = np.array([0, 2, 5])
+
+    positional = [i for i in range(n_occ) if i not in set(active.tolist())]
+    assert 3 in positional, "the fixture must exercise the empty-column case"
+
+    active_set = set(active.tolist())
+    from_occupation = [i for i in range(n_orb) if i not in active_set and occ[i] == 2]
+    assert from_occupation == [1, 4], from_occupation
+    assert 3 not in from_occupation, "an empty column must never be frozen as doubly occupied"
+
+    # The two rules genuinely disagree here, so a test written against either one is not
+    # accidentally testing the other.
+    assert positional != from_occupation
+
+    # The occupation rule freezes only genuinely-doubly-occupied columns; the positional
+    # one freezes an empty column while LEAVING a doubly-occupied one (index 4) neither
+    # frozen nor active, so it both invents and discards electrons.  Note the two happen
+    # to freeze the same NUMBER of columns here, which is exactly why a count-based check
+    # cannot distinguish them -- the defect is in *which* columns, not how many.
+    assert all(occ[i] == 2 for i in from_occupation)
+    assert any(occ[i] != 2 for i in positional)
+    stranded_by_position = [
+        i for i in range(n_orb) if i not in active_set and i not in positional and occ[i] == 2
+    ]
+    assert stranded_by_position == [4], (
+        "the positional rule must be shown to lose a real doubly-occupied column"
+    )
+    assert not [
+        i for i in range(n_orb) if i not in active_set and i not in from_occupation and occ[i] == 2
+    ], "the occupation rule must account for every doubly-occupied column"
