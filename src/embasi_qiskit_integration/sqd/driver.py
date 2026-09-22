@@ -130,12 +130,27 @@ def run_sqd(
         # one channel arbitrarily, and say so: the result is then ROHF-like on an
         # open shell, not UHF-quality, and comparing it against an unrestricted
         # reference without knowing that would be misleading.
+        #
+        # The warning names the TWO-BODY loss as well, deliberately.  `ham.h2` is the
+        # *alpha-only* tensor (see `EmbeddedHamiltonian.h2`), so on a per-spin downfold
+        # this call drops `h2_spin`'s genuine `(aa, ab, bb)` triple too -- a second,
+        # independent approximation on top of the `h1` averaging, and the larger of the
+        # two.  Measured ~2.96 Ha on the OH radical (the repo's own open-shell fixture),
+        # and on a synthetic polarised (3, 1) sector the ERI loss was 6.5 Ha against
+        # 1.0 Ha for the `h1` averaging.  A warning that mentioned only `h1` would leave
+        # a reader believing the ERIs were exact.
+        h2_note = (
+            " The two-body tensor is alpha-only as well (h2_spin's (aa, ab, bb) triple "
+            "cannot be passed either), which is typically the LARGER error of the two."
+            if ham.has_spin_dependent_eri
+            else ""
+        )
         warnings.warn(
             "this Hamiltonian carries a spin-dependent (h1a, h1b) pair, but SQD's "
             "diagonalize_fermionic_hamiltonian accepts only one one-body tensor; "
             "using the spin-averaged h1. The result is spin-restricted (ROHF-like) "
-            "even though the downfold was not. Use the FCI solver for a genuine "
-            "unrestricted solve.",
+            f"even though the downfold was not.{h2_note} Use the FCI solver for a "
+            "genuine unrestricted solve.",
             stacklevel=2,
         )
     result = diagonalize_fermionic_hamiltonian(

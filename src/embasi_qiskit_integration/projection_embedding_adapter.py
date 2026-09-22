@@ -1187,6 +1187,23 @@ class ProjectionEmbeddingAdapter:
                 None if (a := getattr(getattr(self, "p", None), "A_spin", None)) is None else int(a)
             ),
         }
+        # WHICH orbitals are subsystem A, not just how many basis functions there are.
+        # `a_nmos` (CLI `--a_nmos`, forwarded as `a_nspade_mos`) moves the SPADE cut, so
+        # two runs on an identical molecule/basis/mu/xc partition differently and produce
+        # snapshots that are otherwise fingerprint-identical: same `nao`, same shapes,
+        # integral `tr(gamma^A S)` and `tr(gamma^B S)` on both sides, and a clean
+        # projector leak after the cross-restore -- every existing guard passes while the
+        # energy moves ~1.4 Ha (859 kcal/mol, measured on H6/sto-3g at A=2 vs A=1).
+        # The electron count in A is the cheapest faithful observable of the cut: it is an
+        # integer by construction, needs no MO layout assumption, and differs exactly when
+        # the partition does.
+        try:
+            n_a = float(np.einsum("ij,ji->", self._dm_a_arr, np.asarray(self.ints.overlap())))
+            fingerprint["a_nelec"] = int(round(n_a))
+        except (AttributeError, ValueError):
+            # Before `run_low_level` there is no density to measure; a fingerprint taken
+            # then simply omits the field, and two such fingerprints still compare equal.
+            fingerprint["a_nelec"] = None
         if mol is not None:
             coords = np.round(np.asarray(mol.atom_coords(), dtype=float), 8)
             fingerprint["basis"] = str(mol.basis)
@@ -1355,6 +1372,25 @@ class ProjectionEmbeddingAdapter:
                 setattr(self, name, (stacked[0], stacked[1]))
             else:
                 setattr(self, name, None)
+
+        # The relaxed embedded-HF reference is NOT part of the snapshot, and after a
+        # restore it is worse than absent: `relax_active_hf` converges it "in the frozen
+        # v_emb/P_B potential run_low_level already built", and `restore_state` has just
+        # replaced v_emb/P_B/the densities with the SENDER's.  So a surviving
+        # `_fock_relaxed` was converged against a potential this adapter no longer holds --
+        # the frozen-potential invariant that justifies reusing it in-process is exactly
+        # what a restore breaks.  Measured: `max|_fock_relaxed - _fock| = 0.137` with
+        # orbital energies 0.982 Ha apart, consumed without complaint by
+        # `build_orbitals(use_relaxed=True)`.
+        #
+        # Clearing is the same rule `_STATE_SPIN_ARRAYS` follows just above ("a restricted
+        # snapshot cannot leave a previous run's spin state standing"), and it fails loudly
+        # rather than silently: `_fock_relaxed_arr` raises via `_require`, and
+        # `build_orbitals_spin(use_relaxed=True)` already refuses a `None` pair.  Call
+        # `relax_active_hf()` again after restoring to rebuild it in the restored potential.
+        self._fock_relaxed = None
+        self._dm_a_relaxed = None
+        self._fock_relaxed_spin = None
 
         self._assemble_fock_a_only()
         # `_assemble_fock_a_only` rebuilds `_fock_spin` from the restored v_emb/P_B pair
@@ -2457,7 +2493,10 @@ class ProjectionEmbeddingAdapter:
             n_virtual: ceiling on the common active-orbital count, expressed as virtuals
                 above the *widest* channel's active occupied block.  ``None`` takes the
                 largest space both channels can support.
-            virtual_localizer: applied per channel before the cut, as before.
+            virtual_localizer: rotates and cuts **each channel's own** virtual block
+                (its own sigma^2 ordering, since each was diagonalized in its own
+                span(A)), before the two channels are reconciled to a common ``norb``.
+                The per-channel cut therefore bounds what the reconciliation may promise.
             use_relaxed: diagonalize the relaxed per-spin Fock.
 
         Warns:
@@ -2494,6 +2533,31 @@ class ProjectionEmbeddingAdapter:
                     f"spin {ispin}: subsystem-A space has {c.shape[1]} orbitals but "
                     f"{n_occ} are occupied; the partition and the MOs disagree"
                 )
+            if virtual_localizer is not None:
+                # Rotate THIS channel's virtual block and cut on its own sigma^2 gap,
+                # exactly as `build_orbitals` does for the restricted path.  It has to
+                # happen here, in pass 1: the cut changes how many virtuals the channel
+                # can offer, which is an input to the reconciliation below -- applying it
+                # afterwards would let `n_act` promise orbitals the localiser had removed.
+                #
+                # Each channel gets its own sigma^2 ordering because each was diagonalized
+                # in its own span(A); reusing alpha's rotation for beta is the same
+                # per-channel-basis error the rest of this method exists to avoid.
+                from embasi_qiskit_integration.selectors import _gap_cut
+
+                c, sigma2 = virtual_localizer(c, n_occ)
+                eps = eps.copy()
+                eps[n_occ:] = np.nan  # rotated-virtual eigenvalues are meaningless
+                # Read the cut knobs immediately after THIS call: `concentric-cl` pins
+                # `max_virtual`/`min_virtual` as mutable attributes on the closure, so a
+                # single localiser object reused across channels is last-call-wins.
+                kept = _gap_cut(
+                    sigma2,
+                    gap_tol=getattr(virtual_localizer, "gap_tol", 1.0e-3),
+                    max_virtual=getattr(virtual_localizer, "max_virtual", None),
+                    min_virtual=getattr(virtual_localizer, "min_virtual", 0),
+                )
+                n_virt_total = min(int(kept), n_virt_total)
             eps_c.append((eps, c))
             n_occs.append(n_occ)
             n_virt_totals.append(n_virt_total)

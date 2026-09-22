@@ -659,7 +659,44 @@ def test_localiser_is_applied_per_channel_and_reconciled(open_shell):
     adapter = open_shell[0]
     frag = fragment_ao_indices(adapter.ints.mol, [0, 1])
     loc = concentric_localization_selector(adapter._s_arr, frag, adapter._fock_spin[0], n_shells=1)
-    alpha, beta = adapter.build_orbitals_spin(virtual_localizer=loc)
+
+    # The localiser must actually RUN, once per channel, and actually change the result.
+    # Every assertion below about a common `norb`, the sector and the leak holds whether or
+    # not it ran -- the reconciliation equalises `norb` on its own and the sector comes from
+    # the partition -- so without these two checks this test passed vacuously while
+    # `build_orbitals_spin` accepted `virtual_localizer` and silently ignored it (the
+    # parameter appeared only in the signature and the docstring).  That left
+    # `--spin_downfold --selector spade/concentric-cl` producing an UNCUT active space: a
+    # 6-qubit overrun on this fixture, with no warning.
+    calls: list[int] = []
+
+    def counting(c_virt, n_occ):
+        calls.append(1)
+        return loc(c_virt, n_occ)
+
+    for attr in ("gap_tol", "max_virtual", "min_virtual"):
+        if hasattr(loc, attr):
+            setattr(counting, attr, getattr(loc, attr))
+
+    baseline_alpha, _ = adapter.build_orbitals_spin()
+    alpha, beta = adapter.build_orbitals_spin(virtual_localizer=counting)
+    assert len(calls) == 2, f"localiser ran {len(calls)} times; expected once per channel"
+    assert not np.array_equal(alpha.coeff, baseline_alpha.coeff), (
+        "the virtual block must be rotated, not merely re-sliced"
+    )
+
+    # ...and a localiser with a real virtual budget must shrink `norb`.  This CL config
+    # happens to keep all three virtuals, so the rotation above is what distinguishes
+    # "ran" from "ignored" for it; `max_virtual` is what proves the CUT is honoured.
+    capped = concentric_localization_selector(
+        adapter._s_arr, frag, adapter._fock_spin[0], n_shells=1, max_virtual=1
+    )
+    cut_alpha, cut_beta = adapter.build_orbitals_spin(virtual_localizer=capped)
+    assert cut_alpha.n_active_orbitals < baseline_alpha.n_active_orbitals, (
+        "max_virtual must cut the active space, not leave it at the uncut size"
+    )
+    assert cut_alpha.n_active_orbitals == cut_beta.n_active_orbitals
+
     assert alpha.n_active_orbitals == beta.n_active_orbitals
 
     ham = adapter.embedded_hamiltonian_spin((alpha, beta))
