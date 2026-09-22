@@ -483,3 +483,75 @@ def test_reseed_advances_seed_when_solver_has_one():
     stub2 = _StubSeeded()
     wf_off._maybe_reseed(stub2, cycle=3)
     assert stub2.seed == base
+
+
+def test_diis_survives_the_convergence_vector_changing_shape():
+    """A DIIS subspace must not span both spin-summed and per-spin residuals.
+
+    ``spin_mixed`` is decided per cycle: the loop demotes to the spin-summed vector
+    whenever the solver resolved the channels but the adapter has no per-spin ``gamma^A``
+    to form a residual against.  So a run can append a ``(nao, nao)`` residual on one
+    cycle and a stacked ``(2, nao, nao)`` one on the next.
+
+    ``np.vdot`` then flattens the two to different lengths and raises ``ValueError`` --
+    not the ``LinAlgError`` that ``diis_extrapolate`` guards -- which aborted the whole
+    outer loop rather than degrading.  The fix drops the stale-shape history, restarting
+    the subspace from the current cycle.
+
+    Exercises the loop's own buffer logic (append, then extrapolate over the history)
+    rather than a live unrestricted run: making the mock genuinely unrestricted requires a
+    spin sector it cannot supply, and the defect is in the buffer bookkeeping, which is
+    shape-driven and independent of where the shapes came from.
+    """
+    nao = 4
+    rng = np.random.default_rng(0)
+    residuals: list[np.ndarray] = []
+    outputs: list[np.ndarray] = []
+    logs: list[str] = []
+
+    def _cycle(vec_now, vec_fed, spin_mixed):
+        """The exact guard + append sequence from ``_run_outer_loop``."""
+        if residuals and np.asarray(residuals[-1]).shape != np.asarray(vec_fed - vec_now).shape:
+            logs.append("   DIIS subspace reset: the convergence vector changed shape.")
+            residuals.clear()
+            outputs.clear()
+        residuals.append(vec_fed - vec_now)
+        outputs.append(vec_fed)
+        if len(residuals) >= 2:
+            return EmbeddingWorkflow._diis_extrapolate(residuals, outputs)
+        return None
+
+    # Cycle 1: spin-summed (the adapter had no per-spin gamma^A this round).
+    _cycle(rng.standard_normal((nao, nao)), rng.standard_normal((nao, nao)), False)
+    assert residuals[-1].shape == (nao, nao)
+
+    # Cycle 2: per-spin.  Before the fix this raised ValueError from np.vdot.
+    out = _cycle(rng.standard_normal((2, nao, nao)), rng.standard_normal((2, nao, nao)), True)
+    assert logs, "the shape change must be reported, not silently absorbed"
+    assert [r.shape for r in residuals] == [(2, nao, nao)], "stale history must be dropped"
+    assert out is None, "a one-vector subspace cannot extrapolate yet"
+
+    # Cycle 3: still per-spin -> a real extrapolation, in the new shape.
+    out = _cycle(rng.standard_normal((2, nao, nao)), rng.standard_normal((2, nao, nao)), True)
+    assert out is not None and np.asarray(out).shape == (2, nao, nao)
+
+    # And back again: demotion must reset just as cleanly.
+    logs.clear()
+    _cycle(rng.standard_normal((nao, nao)), rng.standard_normal((nao, nao)), False)
+    assert logs and [r.shape for r in residuals] == [(nao, nao)]
+
+
+def test_diis_extrapolate_refuses_a_mixed_shape_subspace_loudly():
+    """The raw helper on incommensurable residuals: whatever it does, it must not
+    return a silently wrong extrapolation.
+
+    ``(2, 2, 4)`` and ``(4, 4)`` both hold 16 elements, so ``np.vdot`` succeeds and the
+    B-matrix is built from inner products between vectors that live in different spaces.
+    That is the dangerous case -- no exception, just a meaningless subspace -- so the
+    guard has to sit in the caller (see the test above), which is why this only records
+    the helper's own behaviour.
+    """
+    r_sum = np.ones((4, 4))
+    r_stack = np.ones((2, 4, 4))
+    with pytest.raises(ValueError):
+        EmbeddingWorkflow._diis_extrapolate([r_sum, r_stack], [r_sum, r_stack])

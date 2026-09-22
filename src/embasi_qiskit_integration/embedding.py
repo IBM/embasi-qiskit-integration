@@ -978,6 +978,27 @@ class EmbeddingWorkflow(BaseSettings):
             mixing_desc = f"mix_alpha={self.mix_alpha}"
             extrapolated = None
             if self.diis:
+                # The convergence vector's SHAPE can change between cycles: `spin_mixed`
+                # is demoted whenever the solver resolved the channels but the adapter has
+                # no per-spin `gamma^A` to form a residual against, so a run can append a
+                # spin-summed `(nao, nao)` residual on one cycle and a stacked
+                # `(2, nao, nao)` one on the next.  A DIIS subspace spanning both is not a
+                # subspace at all -- `np.vdot` flattens the two to different lengths and
+                # raises `ValueError` (not the `LinAlgError` `diis_extrapolate` guards),
+                # which aborts the whole outer loop.  Dropping the stale-shape history is
+                # the standard response to a changed convergence vector: the subspace
+                # restarts from this cycle rather than mixing incommensurable errors.
+                if (
+                    diis_residuals
+                    and np.asarray(diis_residuals[-1]).shape != np.asarray(vec_fed - vec_now).shape
+                ):
+                    log(
+                        "   DIIS subspace reset: the convergence vector changed shape "
+                        f"({'spin-summed -> per-spin' if spin_mixed else 'per-spin -> spin-summed'})."
+                    )
+                    diis_inputs.clear()
+                    diis_outputs.clear()
+                    diis_residuals.clear()
                 diis_inputs.append(vec_now)
                 diis_outputs.append(vec_fed)
                 diis_residuals.append(vec_fed - vec_now)
