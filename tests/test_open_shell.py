@@ -12,7 +12,6 @@ tests deliberately use asymmetric sectors, following
 
 from __future__ import annotations
 
-import textwrap
 
 from types import SimpleNamespace
 
@@ -263,62 +262,6 @@ def test_unrestricted_singlet_downfolds():
         "the spin guard fired on a reported singlet; an unrestricted 2S == 0 run "
         "must be allowed through the restricted downfold"
     )
-
-
-def test_apc_selection_forwards_the_beta_count():
-    """``build_orbitals_apc_concentric`` must forward ``n_occ_b`` to its new orbitals.
-
-    It rebuilds an :class:`EmbeddedOrbitals` after ranking, and omitting ``n_occ_b=``
-    there would silently demote an open-shell partition back to the restricted reading --
-    with a plausible active space and nothing to flag it.
-
-    Asserted against the source rather than by calling the method: the APC path needs a
-    live adapter with real integrals (``self.ints.get_k``, a concentric-localization
-    stage), so a unit test cannot reach the one line that matters. The dataclass
-    round-trip is already covered by
-    :func:`test_active_electrons_spin_open_shell_is_not_halved`; what is unprotected is
-    the *call site*, which is what this pins.
-    """
-    import ast
-    import inspect
-    import linecache
-
-    from embasi_qiskit_integration.projection_embedding_adapter import (
-        ProjectionEmbeddingAdapter,
-    )
-
-    # `inspect.getsource` slices the file on disk at the function's *cached*
-    # `co_firstlineno`. If the module was edited after import -- which happens when a
-    # long suite runs while the source is being changed -- those line numbers are stale
-    # and getsource silently returns a neighbouring function, failing this test for a
-    # reason that has nothing to do with the code. Drop linecache's view so the slice is
-    # taken against the file as it is now, and skip rather than fail if it still does not
-    # line up (a stale interpreter, not a regression).
-    linecache.checkcache()
-
-    src = inspect.getsource(ProjectionEmbeddingAdapter.build_orbitals_apc_concentric)
-    if not src.lstrip().startswith("def build_orbitals_apc_concentric"):
-        pytest.skip(
-            "inspect.getsource returned a stale slice (module edited after import); "
-            "the behavioural equivalent is "
-            "test_open_shell_embedding_live.py::"
-            "test_apc_selection_forwards_the_beta_count_for_real"
-        )
-    tree = ast.parse(textwrap.dedent(src))
-    constructions = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "EmbeddedOrbitals"
-    ]
-    assert constructions, "expected build_orbitals_apc_concentric to build EmbeddedOrbitals"
-    for call in constructions:
-        passed = {kw.arg for kw in call.keywords}
-        assert "n_occ_b" in passed, (
-            "build_orbitals_apc_concentric builds EmbeddedOrbitals without n_occ_b, "
-            "which silently demotes an open-shell partition to the restricted reading"
-        )
 
 
 # --------------------------------------------------------------------------- #

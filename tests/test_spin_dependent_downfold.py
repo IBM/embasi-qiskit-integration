@@ -103,22 +103,18 @@ def test_fcidump_does_not_warn_without_a_pair(tmp_path, recwarn):
 def _spin_stub(nao=6, n_occ_a=(3, 2), n_occ_b=2):
     """Adapter with per-spin state whose two channels are genuinely orthogonal.
 
-    Mimics what EmbASI hands back on an open shell: each spin channel gets its own
-    A/B split, so ``span(A_ispin)`` is S-orthogonal to ``span(B_ispin)`` but NOT to
-    the other channel's environment -- the property that forces a per-spin downfold.
+    Mimics EmbASI on an open shell: each channel gets its own A/B split, so
+    ``span(A_ispin)`` is S-orthogonal to ``span(B_ispin)`` but NOT to the other channel's
+    environment -- the property that forces a per-spin downfold.
 
-    ``n_occ_b`` is the **environment** size, shared by both channels, which sets each
-    channel's span(A) width to ``nao - n_occ_b`` (that span is the S-orthogonal complement
-    of span(B); see ``_eigh_subsystem_a_spin``). Both channels therefore get the *same*
-    span width, as they do on a real molecule -- one environment, both spans ~equally wide
-    (measured 19 or 20 on the butyronitrile geometries). That matters because
-    ``build_orbitals_spin`` reconciles the two channels to one active-orbital count, which
-    is only possible when the narrower span can hold the wider channel's occupied block.
+    ``n_occ_b`` is the **environment** size, shared by both channels, setting each span(A)
+    width to ``nao - n_occ_b``.  Both channels therefore get the same width, as on a real
+    molecule, which matters because ``build_orbitals_spin`` can only reconcile them to one
+    active-orbital count when the narrower span holds the wider channel's occupied block.
 
-    Passing ``n_occ_b=None`` instead makes B the exact complement of A, which leaves
-    span(A) with *no virtual room* and -- when the occupied counts differ -- span widths
-    that differ too. That configuration has no common ``norb`` and is refused; it is kept
-    reachable only to test that refusal.
+    ``n_occ_b=None`` makes B the exact complement of A, leaving span(A) with no virtual
+    room and (when the occupied counts differ) unequal widths.  That has no common ``norb``
+    and is refused; it stays reachable only to test that refusal.
     """
     from embasi_qiskit_integration.projection_embedding_adapter import (
         ProjectionEmbeddingAdapter,
@@ -1223,19 +1219,13 @@ def test_refuses_when_the_two_spans_cannot_share_a_norb():
 def test_veff_ll_takes_the_spin_pair_not_the_summed_density():
     """A KS low level must see the two channels, not ``d/2`` twice.
 
-    ``PySCFIntegrals.veff_ll`` reduces a spin-resolved *return* by averaging (a potential
-    is per-electron).  This pins the separate question of what goes **in**: handed a
-    spin-summed 2-D matrix, an unrestricted ``get_veff`` warns "Incompatible dm dimension"
-    and silently substitutes ``d/2`` for *both* channels -- reconstructing a fictitious
-    unpolarised density.
+    ``veff_ll`` reduces a spin-resolved *return* by averaging; this pins what goes **in**.
+    Handed a spin-summed matrix, an unrestricted ``get_veff`` substitutes ``d/2`` for both
+    channels, reconstructing a fictitious unpolarised density.  Harmless for an HF low
+    level (J and K are linear), a real error for a KS one.
 
-    For an HF low level that is exactly harmless, which is why it went unnoticed:
-    ``veff_s = J[d_a+d_b] - K[d_s]`` is linear, so the average is
-    ``J[d_tot] - 0.5 K[d_tot]`` either way.  For a KS low level the xc functional is
-    nonlinear in the spin densities and the substitution is a real error.
-
-    The reference is PySCF's own ``eval_xc`` on the two spin densities -- deliberately not
-    another ``veff_ll`` call, so this tests the physics rather than restating the formula.
+    The reference is PySCF's own ``eval_xc`` on the two spin densities, deliberately not
+    another ``veff_ll`` call, so this tests the physics rather than the formula.
     """
     from pyscf import dft, gto, scf
 
@@ -1354,23 +1344,13 @@ def test_the_adapter_hands_veff_ll_the_pair_it_has():
 def test_apc_inactive_comes_from_the_occupation_not_column_position():
     """A frozen column must be one that is actually doubly occupied.
 
-    ``build_orbitals_apc_concentric`` computes its occupation pattern
-    rotation-invariantly (concentric localization has just rotated within blocks, so
-    column position no longer implies occupancy) -- and then used to derive ``inactive``
-    as ``range(n_occ) - active``, reintroducing the very positional rule those lines
-    exist to avoid.
+    ``c_inactive`` is folded in as ``2 * c c^T``, so freezing an *empty* column injects two
+    electrons that do not exist and leaves ``n_active_electrons_spin`` short by the same
+    amount.  The count-only cross-check in ``_occupation_pattern`` cannot see it, since it
+    compares only ``(n_alpha, n_beta)`` totals.
 
-    ``c_inactive`` is folded in as ``2 * c c^T``, so freezing an *empty* column injects
-    two electrons that do not exist, and ``n_active_electrons_spin`` (which subtracts
-    ``len(inactive)`` from both channels) then reports a sector short by the same amount.
-    Over 1719 synthetic (occupation, entropy, budget) combinations the positional rule put
-    an empty column into ``inactive`` in 789 of them; the count-only cross-check in
-    ``_occupation_pattern`` cannot see it, because it compares only ``(n_alpha, n_beta)``
-    totals.
-
-    Checks the rule directly against a non-positional pattern, since reaching it through
-    a live EmbASI partition needs an F_emb aufbau order that disagrees with the density
-    occupation -- latent on the fixtures here, not impossible.
+    Checks the rule directly against a non-positional pattern: reaching it through a live
+    partition needs an F_emb aufbau order that disagrees with the density occupation.
     """
     occ = np.array([2, 2, 2, 0, 2, 0])  # column 3 is EMPTY but sits inside range(n_occ=4)
     n_occ, n_orb = 4, 6
@@ -1409,21 +1389,14 @@ def test_apc_inactive_comes_from_the_occupation_not_column_position():
 def test_h_emb_strips_the_low_level_mean_field_not_the_high_level_one():
     """``h_emb`` must subtract ``veff_ll``, because ``F_emb`` was built with ``veff_ll``.
 
-    ``F_emb`` is assembled from the ``A_LL`` one-electron blocks, so the mean field baked
-    into it is the **low-level** (``xc_ll``) one.  Subtracting ``veff_hl`` instead leaves
-    the residual ``veff_ll - veff_hl`` inside ``h_emb`` -- hence inside ``v_emb`` and every
-    downfolded Hamiltonian handed to the solver.
+    ``F_emb`` comes from the ``A_LL`` one-electron blocks, so the mean field baked into it
+    is the LOW-level one.  Subtracting ``veff_hl`` leaves the residual inside ``h_emb``,
+    hence inside ``v_emb`` and every downfolded Hamiltonian.
 
-    The residual cancels identically when ``xc_hl == xc_ll``, which is why the rest of the
-    suite cannot see it: every other fixture builds one mean field and uses it for both
-    levels.  This test therefore uses two *different* functionals (PBE low, HF high --
-    this repo's WF-in-DFT default pairing), which is the only configuration where the two
-    conventions differ at all.
-
-    The reference is built from the integrals directly (``veff_ll``/``veff_hl`` on the same
-    density), never from ``h_emb`` itself, so this pins the physics rather than restating
-    the implementation.  The control at the end is the ``xc_hl == xc_ll`` case, where both
-    conventions must agree to round-off.
+    The residual cancels when ``xc_hl == xc_ll``, which is why no other fixture can see it:
+    they all build one mean field for both levels.  Hence two different functionals here.
+    The reference comes from the integrals directly, never from ``h_emb``, and the control
+    at the end is the ``xc_hl == xc_ll`` case where both conventions must agree.
     """
     from pyscf import dft, gto, scf
 

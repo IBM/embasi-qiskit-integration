@@ -175,17 +175,13 @@ def test_downfold_matches_an_independently_rebuilt_hamiltonian(open_shell):
     adapter, alpha, beta, ham, result = open_shell
     c_a, c_b = alpha.c_active, beta.c_active
     # The PAIR, not the spin-summed `_dm_a_arr`: at `xc_ll=PBE` the xc functional is
-    # nonlinear in the spin densities, so a summed input has PySCF substitute `d/2` for
-    # both channels and silently depolarise the low-level mean field (worth ~0.065 Ha on
-    # triplet CH2).  Passing `_dm_a_arr` here would restate the old bug and make this
-    # rebuild agree with a downfold that was wrong.
+    # nonlinear in the spin densities, so a summed input has PySCF substitute `d/2` for both
+    # channels and depolarise the low-level mean field.
     veff_ll = adapter.ints.veff_ll(adapter._dm_a_for_veff)
 
-    # Frozen-core mean field, exactly as the downfold folds it in: the sum of the two
-    # channels' own inactive densities (one electron per channel), shared by both
-    # channels.  This fixture runs at n_frozen_occ=0, so both blocks are empty and
-    # `veff_in` is zero -- spelled out in the correct form anyway, so that adding frozen
-    # orbitals here tests the downfold instead of re-deriving its assumption.
+    # Frozen-core mean field as the downfold folds it: the sum of both channels' inactive
+    # densities.  Zero at this fixture's n_frozen_occ=0, but spelled out correctly so
+    # adding frozen orbitals tests the downfold rather than re-deriving its assumption.
     c_in_a, c_in_b = alpha.c_inactive, beta.c_inactive
     veff_in = adapter.ints.veff_hf(c_in_a @ c_in_a.T + c_in_b @ c_in_b.T)
 
@@ -240,10 +236,9 @@ def test_energy_split_is_an_exact_decomposition(open_shell):
         float(np.einsum("ij,ji->", dm_b_hl, p_b)), abs=1e-12
     )
 
-    # The projector leak is a numerical zero ONLY per channel.  The spin-summed
-    # contraction is 0.08 Ha here -- small enough to read as noise on this system, which is
-    # exactly why it went unnoticed, and +2.4e4 on a stretched C-N bond.  Assert both, so
-    # the distinction is pinned rather than the magnitude of one system.
+    # The projector leak is a numerical zero ONLY per channel; the spin-summed contraction
+    # is small enough here to read as noise and enormous on a stretched C-N bond.  Assert
+    # both, so the distinction is pinned rather than one system's magnitude.
     assert abs(energy.projector_leak) < 1e-10
     leak_summed = float(np.einsum("ij,ji->", dm_a_hl + dm_b_hl, adapter.p_b))
     assert abs(leak_summed) > 1e-3
@@ -339,10 +334,9 @@ def test_frozen_core_e_core_charges_each_channel_to_its_own_fock(open_shell_froz
     h_emb_a = adapter._fock_spin[0] - veff_ll
     h_emb_b = adapter._fock_spin[1] - veff_ll
 
-    # Two-body core term from the raw AO ERIs, independent of the adapter's own fold (see
-    # the note in `test_frozen_core_downfold_matches_an_independent_rebuild`): the
-    # unrestricted core energy is `0.5 tr[d J[d]] - 0.5 sum_sigma tr[d_sigma K[d_sigma]]`,
-    # which is NOT `0.5 tr[d veff_hf(d)]`.
+    # Two-body core term from the raw AO ERIs, independent of the adapter's own fold: the
+    # unrestricted core energy is `0.5 tr[d J[d]] - 0.5 sum_s tr[d_s K[d_s]]`, NOT
+    # `0.5 tr[d veff_hf(d)]`.
     from pyscf import ao2mo
 
     eri_ao = ao2mo.restore(1, adapter.ints.mol.intor("int2e"), adapter.ints.mol.nao)
@@ -392,12 +386,10 @@ def test_frozen_core_downfold_matches_an_independent_rebuild(open_shell_frozen):
     dm_core_a, dm_core_b = c_in_a @ c_in_a.T, c_in_b @ c_in_b.T
     dm_core = dm_core_a + dm_core_b
 
-    # Build the frozen-core mean field from the raw AO ERIs, NOT from
-    # `adapter.ints.veff_uhf` (nor `veff_hf`).  Calling the adapter's own helper here
-    # would restate the formula under test: an earlier version of this test used
-    # `veff_hf`, and so could not see that the per-spin core was being folded with the
-    # *restricted* `J - K/2` instead of the unrestricted `J[d] - K[d_sigma]`.  Only an
-    # independent contraction distinguishes the two.
+    # Build the frozen-core mean field from the raw AO ERIs, NOT from the adapter's
+    # `veff_uhf`/`veff_hf`: calling its own helper would restate the formula under test.
+    # Only an independent contraction distinguishes restricted `J - K/2` from the
+    # unrestricted `J[d] - K[d_sigma]`.
     eri_ao = ao2mo.restore(1, adapter.ints.mol.intor("int2e"), adapter.ints.mol.nao)
 
     def _j(d):
@@ -442,10 +434,8 @@ def test_frozen_core_downfold_matches_an_independent_rebuild(open_shell_frozen):
     assert float(e_elec + e_core_indep) == pytest.approx(result.energy, abs=1e-9)
 
     # The spin-averaged fold really is a different answer, so the agreement above is
-    # evidence about the unrestricted core and not a tolerance that would absorb either.
-    # On this doublet the frozen orbital is a deep 1s (the two channels' cores overlap to
-    # ~1e-7), so the gap is small here -- it reaches ~1.9 kcal/mol at n_frozen_occ=2 and
-    # ~0.8 Ha once a frozen orbital is genuinely valence-like.
+    # evidence about the unrestricted core rather than a tolerance absorbing either.  The
+    # gap is small on this deep-1s core and grows once a frozen orbital is valence-like.
     veff_avg = adapter.ints.veff_hf(dm_core)
     e_core_avg = (
         adapter.ints.energy_nuc()
@@ -511,11 +501,9 @@ def test_workflow_drives_the_open_shell_path(tmp_path):
     )
     energy = workflow.run(log=lambda *_a, **_k: None)
     assert energy.is_spin_resolved
-    # At one cycle the workflow must reproduce the adapter-level pinned total exactly.
-    # The previous loose bracket (-120 < total < -100) passed while the workflow lifted
-    # BOTH spin channels through alpha's active space -- a 0.0779 Ha error that sat well
-    # inside a 20 Ha window.  Pin it, so the CLI surface is held to the same number the
-    # adapter tests are.
+    # At one cycle the workflow must reproduce the adapter-level pinned total exactly: a
+    # loose bracket would hide a per-channel lift error inside its window, so the CLI
+    # surface is held to the same number as the adapter tests.
     assert float(energy.total) == pytest.approx(REF_TOTAL, abs=1e-6)
     assert energy.correction_spin[1] == pytest.approx(REF_CORRECTION_SPIN[1], abs=1e-6)
 
@@ -627,14 +615,11 @@ def test_localiser_is_applied_per_channel_and_reconciled(open_shell):
     frag = fragment_ao_indices(adapter.ints.mol, [0, 1])
     loc = concentric_localization_selector(adapter._s_arr, frag, adapter._fock_spin[0], n_shells=1)
 
-    # The localiser must actually RUN, once per channel, and actually change the result.
-    # Every assertion below about a common `norb`, the sector and the leak holds whether or
-    # not it ran -- the reconciliation equalises `norb` on its own and the sector comes from
-    # the partition -- so without these two checks this test passed vacuously while
-    # `build_orbitals_spin` accepted `virtual_localizer` and silently ignored it (the
-    # parameter appeared only in the signature and the docstring).  That left
-    # `--spin_downfold --selector spade/concentric-cl` producing an UNCUT active space: a
-    # 6-qubit overrun on this fixture, with no warning.
+    # The localiser must actually RUN, once per channel, and change the result.  Every
+    # assertion below about a common `norb`, the sector and the leak holds whether or not it
+    # ran -- the reconciliation equalises `norb` itself and the sector comes from the
+    # partition -- so without these two checks the test passes vacuously against a
+    # `virtual_localizer` that is accepted and ignored.
     calls: list[int] = []
 
     def counting(c_virt, n_occ):
@@ -797,12 +782,9 @@ def test_apc_selection_forwards_the_beta_count_for_real(open_shell):
 # --------------------------------------------------------------------------- #
 # A geometry where the two spin channels' spans genuinely differ.
 #
-# Everything above runs on the OH-radical fixture, whose channels overlap enough that a
-# cross-channel error reads as noise: the spin-summed projector leak there is 0.08 Ha
-# against a per-channel ~1e-16, which is why contracting across channels went unnoticed
-# through several rounds of review.  This block uses the stretched end of the C-N
-# dissociation scan (2.20 A, the `data/22.inp` geometry), where the same error is +2.4e4
-# and a wrong assembly cannot hide.
+# The OH-radical fixture above overlaps enough that a cross-channel error reads as noise.
+# This block uses the stretched end of the C-N scan (2.20 A, `data/22.inp`), where the
+# same error is four orders larger and a wrong assembly cannot hide.
 # --------------------------------------------------------------------------- #
 
 # Stretched butyronitrile, C-N at 2.20 A: `data/22.inp`, inlined so the test does not
@@ -918,10 +900,9 @@ def test_stretched_open_shell_total_matches_a_closed_shell_control():
     control_result = FCISolver().solve(control.embedded_hamiltonian(orbitals))
     control_energy = control.projection_energy(control_result, orbitals)
 
-    # `e_high_A` is the term the bug corrupted (-24090 against -9.11), and it is the one
-    # that should agree closely: both are HF on the same fragment, differing only in spin
-    # state.  Measured 0.022 Ha apart; 0.5 Ha is loose enough not to be brittle and tight
-    # enough that the 24 kHa regression cannot pass.
+    # `e_high_A` is the term a cross-channel contraction corrupts, and the one that should
+    # agree closely: both are HF on the same fragment, differing only in spin state.  The
+    # 0.5 Ha window is loose enough not to be brittle, tight enough to catch that.
     assert energy.e_high_A == pytest.approx(control_energy.e_high_A, abs=0.5)
     assert float(energy.total) == pytest.approx(float(control_energy.total), abs=1.0)
     # An absolute sanity bracket, in case BOTH paths ever regress together.
