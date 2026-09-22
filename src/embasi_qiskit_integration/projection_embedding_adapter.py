@@ -220,12 +220,10 @@ from embasi_qiskit_integration.contract import EmbeddedHamiltonian, SolverResult
 # Environment orbitals come out of the generalized eigenproblem at ~mu * N_B.
 _ENV_EIGENVALUE_FLOOR = 1.0e3
 
-# EmbASI works internally in eV.  Its Hartree->eV factor is a bare literal
-# 27.211384500 repeated inline throughout embasi/{embedding,atoms_embedding_asi,
-# qmcode_adapters}.py -- it is never bound to an importable symbol, so we mirror
-# the exact literal here.  It MUST equal EmbASI's value (not CODATA 27.211386...)
-# so that dividing its eV energies back to Hartree exactly inverts what EmbASI
-# multiplied; a different constant would reintroduce a ~1e-7 relative error.
+# EmbASI works internally in eV, with its Hartree->eV factor a bare inline literal
+# never bound to an importable symbol, so mirror the exact value here.  It MUST be
+# EmbASI's, not CODATA 27.211386..., or converting its energies back no longer inverts
+# what EmbASI multiplied.
 _EMBASI_HA2EV = 27.211384500  # keep in sync with embasi's inline factor
 _EV2HA = 1.0 / _EMBASI_HA2EV
 
@@ -234,12 +232,10 @@ _EV2HA = 1.0 / _EMBASI_HA2EV
 # shell / a bug), not round-off -- so we assert rather than silently discard it.
 _IMAG_TOL = 1.0e-9
 
-# `n_frozen_occ` freezes the lowest k orbitals of EACH spin channel, but SPADE orders
-# them per spin, so the two cores denote one shared set only while they overlap.  Below
-# this, `build_orbitals_spin` warns: measured on the stretched C-N geometry the pairs run
-# 1.000 / 1.000 / 0.982 / 0.951 and then fall off a cliff to 1e-04, so the boundary is
-# sharp and a threshold anywhere in (0.95, 1) separates "corresponding" from "unrelated".
-# 0.9 is deliberately permissive -- it flags the cliff, not ordinary polarisation.
+# `n_frozen_occ` freezes the lowest k orbitals of EACH channel, but SPADE orders them per
+# spin, so the two cores denote one shared set only while they overlap.  Corresponding
+# pairs sit near 1.0 and unrelated ones fall away sharply, so 0.9 is deliberately
+# permissive: it flags the cliff, not ordinary polarisation.
 _FROZEN_OVERLAP_TOL = 0.9
 
 
@@ -359,14 +355,10 @@ class PySCFIntegrals:
         self.mf = mf_hl  # the same object passed to calc_base_hl
         self.mf_ll = mf_hl if mf_ll is None else mf_ll  # the one passed to calc_base_ll
         self.mol = mf_hl.mol
-        # Integral engine only; never kernel()'d.  `scf.hf.RHF` explicitly, NOT
-        # `mol.RHF()`: on a `spin != 0` Mole the latter dispatches to **ROHF**, whose
-        # `get_veff`/`get_k` return a `(2, nao, nao)` spin pair.  The downfold and the
-        # APC ranking both contract those against `(nao, nao)` blocks, so an open-shell
-        # run died with "operands could not be broadcast together with shapes (2,n,n)
-        # (n,n,2)".  `scf.hf.RHF` is the restricted class regardless of `mol.spin`, and
-        # is bit-identical to `mol.RHF()` whenever the Mole is closed shell -- verified,
-        # so this changes nothing for restricted runs.
+        # Integral engine only; never kernel()'d.  `scf.hf.RHF` explicitly, NOT `mol.RHF()`:
+        # on a `spin != 0` Mole the latter dispatches to ROHF, whose `get_veff`/`get_k`
+        # return a `(2, nao, nao)` pair that the downfold and APC ranking cannot contract
+        # against `(nao, nao)` blocks.  Restricted regardless of `mol.spin`.
         from pyscf import scf as _pyscf_scf
 
         self._hf = _pyscf_scf.hf.RHF(mf_hl.mol)
@@ -665,10 +657,9 @@ def projection_energy_from_state(
     # subsystem A's nuclear-electron term).  Mixing the two is a silent energy error.
     v_emb = _array("v_emb")
 
-    # An open-shell snapshot is identifiable by the per-spin arrays `export_state` adds
-    # only when they exist.  Without the matching per-spin density there is nothing to
-    # contract per channel, and the spin-summed fallback is not merely approximate here --
-    # it is off by `mu` times the cross-channel overlap.  Refuse instead.
+    # An open-shell snapshot carries the per-spin arrays `export_state` adds only when they
+    # exist.  Without the matching per-spin density the spin-summed fallback is off by `mu`
+    # times the cross-channel overlap, not merely approximate, so refuse instead.
     is_open_shell = "p_b_spin" in state and "v_emb_spin" in state
     if is_open_shell and rdm1_ao_spin is None:
         raise ValueError(
@@ -682,19 +673,12 @@ def projection_energy_from_state(
     leak_spin: tuple[float, float] | None = None
     correction_spin: tuple[float, float] | None = None
     if rdm1_ao_spin is not None:
-        # Mirrors the two conditions in `ProjectionEmbeddingAdapter.projection_energy`, so
-        # the two implementations agree bit-for-bit rather than only to within the
-        # summation-order difference between `tr[d_a P] + tr[d_b P]` and `tr[(d_a+d_b) P]`
-        # (which `mu` amplifies to ~1e-10 in the projector, on a quantity that is a
-        # numerical zero either way).
-        #
-        # Open shell -> each channel against its OWN operators, the rule the in-process
-        # path documents.  `v_emb_spin_adapter` is the ADAPTER's per-channel `v_emb` pair
-        # (`h_emb_s - hcore - P_B_s`); EmbASI's `v_emb_spin` in the same snapshot follows
-        # the other convention and is NOT interchangeable with it.
-        #
-        # Restricted snapshot with a spin-resolved density -> the channels share one span,
-        # so the spin-summed operators are exact and are what the live path uses too.
+        # Mirrors the two conditions in `projection_energy` so both paths agree bit-for-bit.
+        # Open shell -> each channel against its OWN operators.  Note `v_emb_spin_adapter`
+        # is the ADAPTER's per-channel pair (`h_emb_s - hcore - P_B_s`); EmbASI's
+        # `v_emb_spin` in the same snapshot is a different convention, NOT interchangeable
+        # (see `export_state`).  Restricted snapshot with a spin-resolved density -> the
+        # channels share one span, so the spin-summed operators are exact.
         dm_a_hl = np.asarray(rdm1_ao_spin[0], dtype=float)
         dm_b_hl = np.asarray(rdm1_ao_spin[1], dtype=float)
         if is_open_shell:
@@ -754,17 +738,14 @@ class ProjectionEnergy:
     e_low_A: float  # E_L[γ^A]
     e_high_A: float  # E_H[Ψ̃^A], embedding pot. removed, rebased to E_low(A)'s footing
     correction: float  # tr[(γ̃^A - γ^A) v_emb]
-    # tr[γ̃^A P_B], a numerical zero when clean.  On a per-spin downfold this is the sum
-    # of the per-channel traces (each density against its OWN projector), not a
-    # contraction of the spin-summed density against the spin-summed projector -- the
-    # latter includes cross-channel terms scaled by mu and is *not* a numerical zero.
+    # tr[γ̃^A P_B], a numerical zero when clean.  On a per-spin downfold this is the sum of
+    # the per-channel traces (each density against its OWN projector); the spin-summed
+    # contraction picks up mu-scaled cross terms and is not a numerical zero.
     projector_leak: float
     footing_shift: float = 0.0  # nuclei/hcore rebasing applied to e_high_A (see below)
-    # Per-spin split of the two density-linear terms, when the solver returned a
-    # spin-resolved RDM and the adapter has a per-spin v_emb/P_B.  ``None`` on any
-    # restricted path.  These are a *decomposition* of the spin-summed fields above, not
-    # an alternative to them: each pair sums to its total (asserted in the tests), so
-    # ``total`` is unchanged and remains the authoritative number.
+    # Per-spin split of the two density-linear terms; ``None`` on any restricted path.
+    # A *decomposition* of the spin-summed fields above, not an alternative: each pair sums
+    # to its total, so ``total`` remains the authoritative number.
     correction_spin: tuple[float, float] | None = None
     projector_leak_spin: tuple[float, float] | None = None
 
@@ -809,17 +790,10 @@ class ProjectionEmbeddingAdapter:
         self.unrestricted = unrestricted
         projection_kind = getattr(projection, "projection", None)
         if projection_kind != "level-shift":
-            # P_B and v_emb are now read directly from construct_embedding_potential
-            # (see run_low_level), so the export no longer reconstructs P_B from the
-            # level-shift closed form mu*S*gamma^B*S -- the earlier hard guard was
-            # protecting that reconstruction, not the physics.  A non-level-shift
-            # projection whose construct_embedding_potential yields a usable
-            # (gamma^A, gamma^B, S, v_emb, P_B) can therefore flow through.  The
-            # paper (Sec. 2.1) shows H^AB_H collapses to the supersystem low-level
-            # Hamiltonian when the high/low xc match, making P_B constant and
-            # exportable in exactly the WF-in-DFT regime.  Correctness for such a
-            # projection is UNVERIFIED in-repo (the only regression case, methanol,
-            # is level-shift), so this is a warning rather than a silent pass.
+            # P_B and v_emb are read directly from construct_embedding_potential, so a
+            # non-level-shift projection that exports a usable
+            # (gamma^A, gamma^B, S, v_emb, P_B) can flow through.  UNVERIFIED in-repo (the
+            # only regression case is level-shift), hence a warning rather than a pass.
             warnings.warn(
                 f"projection={projection_kind!r} is untested for external export; "
                 "only 'level-shift' has an in-repo regression case. P_B/v_emb are "
@@ -851,11 +825,10 @@ class ProjectionEmbeddingAdapter:
         self._p_b_spin: tuple[np.ndarray, np.ndarray] | None = None
         self._v_emb_spin: tuple[np.ndarray, np.ndarray] | None = None
         self._dm_a_spin: tuple[np.ndarray, np.ndarray] | None = None
-        # The (alpha, beta) halves of `_dm_a_init`, captured on the FIRST run_low_level
-        # only (like `_dm_a_init` itself) and never refreshed -- `_dm_a_spin` tracks the
-        # *current* cycle, so it cannot serve as the Eq. 8 reference.  Without this pair
-        # the per-spin correction has to halve the spin-summed reference, which is wrong
-        # whenever gamma^A is polarised: see `projection_energy`.
+        # The (alpha, beta) halves of `_dm_a_init`, captured on the FIRST run_low_level and
+        # never refreshed: `_dm_a_spin` tracks the current cycle, so it cannot be the Eq. 8
+        # reference.  Without this pair the per-spin correction must halve the spin-summed
+        # reference, which is wrong whenever gamma^A is polarised.
         self._dm_a_spin_init: tuple[np.ndarray, np.ndarray] | None = None
         self._dm_b_spin: tuple[np.ndarray, np.ndarray] | None = None
         self._fock_spin: tuple[np.ndarray, np.ndarray] | None = None
@@ -882,11 +855,8 @@ class ProjectionEmbeddingAdapter:
 
         self.p.A_LL.run_noscf(dm_in=wrapped_dma_in)
 
-        # EmbASI returns SpinKpointArray objects (leading (nspin, nkpt) axes)
-        # holding real restricted data in a complex128 dtype; _as_ao_matrix
-        # squeezes the length-1 leading axes and drops the (asserted-negligible)
-        # imaginary part, so everything downstream (einsum, sla.eigh, veff) sees
-        # a bare 2-occupancy real (nao, nao) matrix.
+        # `_as_ao_matrix` normalises EmbASI's SpinKpointArray to a real (nao, nao) block
+        # (see `_as_ao_matrix` for the dtype convention).
         #
         # A fed-back pair is split: the total goes to `_dm_a` (every existing consumer),
         # the channels to `_dm_a_spin` (the per-spin downfold).  Storing the tuple in
@@ -925,20 +895,15 @@ class ProjectionEmbeddingAdapter:
         h_kin_a = self._as_ao_total(self.p.A_LL.hamiltonian_kinetic)
         h_estat_xc_a = self._as_ao_total(self.p.A_LL.hamiltonian_estat_plus_xc)
         self._fock = h_kin_a + h_estat_xc_a + self._v_emb_embasi + self._p_b
-        # Rebuild the per-spin Fock from the same (unchanged) v_emb/P_B pair whenever one
-        # is available -- `A_LL`'s per-spin one-electron blocks have just been refreshed
-        # by `run_noscf`, and the embedding potential is frozen for the A-only step.  This
-        # is what lets a multi-cycle per-spin outer loop survive past cycle 1.  When no
-        # pair is available (`restore_state`, or a restricted run) it clears to None, so
-        # consumers still see an honest "no spin-resolved information" rather than a
-        # stale pair from a previous cycle.
+        # Rebuild the per-spin Fock from the same (unchanged) v_emb/P_B pair: `A_LL`'s
+        # one-electron blocks were just refreshed and the potential is frozen for the
+        # A-only step.  Clears to None when no pair is available, so consumers see "no
+        # spin-resolved information" rather than a stale pair from a previous cycle.
         self._assemble_fock_spin()
         self._validate_densities()
 
-        # Cross-check our level-shift mu against the value EmbASI used inside the
-        # SCF.  We now read P_B directly, but self.mu still parameterises the
-        # adapter (e.g. the p_b property fallback and meta), so a silent mismatch
-        # would be confusing; keep the loud check.
+        # Cross-check our mu against the value EmbASI used inside the SCF: P_B is read
+        # directly now, but self.mu still parameterises the adapter, so keep the loud check.
         mu_embasi = getattr(self.p, "mu_val", None)
         if mu_embasi is not None and not np.isclose(float(mu_embasi), self.mu, rtol=1e-9, atol=0.0):
             raise ValueError(
@@ -997,55 +962,37 @@ class ProjectionEmbeddingAdapter:
         ``(alpha, beta)`` tuple; the pair is handed to EmbASI at ``n_spin=2`` so an
         unrestricted outer loop can feed back genuine spin resolution.
         """
-        # TODO(embasi-api): EmbASI does not expose the retained-AO index array
-        # under basis truncation (paper Sec. 2.4, threshold tau).  With
-        # truncation on, every matrix below must return in the *same* truncated
-        # AO ordering and mo_coeffs_A_LL be sliced to match; without the index
-        # map the adapter can only *trust* that ints.overlap() and F_emb share a
-        # basis, not assert it -- a mismatch would corrupt every downstream
-        # contraction silently.
-        # Drive EmbASI through ``construct_embedding_potential``, which returns the
-        # embedding potential ``v_emb`` and the projector ``P_B`` *directly* (rather
-        # than only the assembled ``F_emb`` from ``construct_embedded_fock``).  We no
-        # longer reconstruct ``P_B`` as ``mu * S gamma^B S`` by subtraction -- we read
-        # EmbASI's own projector.  ``F_emb`` is then assembled exactly as EmbASI's
-        # ``construct_embedded_fock`` does it, so the downfold is unchanged:
+        # TODO(embasi-api): EmbASI does not expose the retained-AO index array under basis
+        # truncation, so the adapter can only trust that ints.overlap() and F_emb share a
+        # basis, not assert it.
+        #
+        # `construct_embedding_potential` returns v_emb and P_B directly; F_emb is then
+        # assembled as EmbASI's own `construct_embedded_fock` does:
         #     F_emb = h_kin^A + h_estat_xc^A + v_emb + P_B
-        # (see embasi.embedding.ProjectionEmbedding.construct_embedded_fock).
-        # EmbASI wants these as SpinKpointArrays, not the plain (nao, nao) density the
-        # outer loop feeds back -- wrap them (mirror of the _as_ao_matrix squeeze on the
-        # way out) so the multi-cycle loop runs against real EmbASI.  A *pair* is wrapped
-        # at n_spin=2, which EmbASI reads as two genuine channels; a single matrix keeps
-        # the restricted n_spin=1 shape.
+        # Densities go back in as SpinKpointArrays: a PAIR at n_spin=2 (two genuine
+        # channels), a single matrix at the restricted n_spin=1.
         wrapped_dma_in = self._wrap_density(dma_in)
         wrapped_dmb_in = self._wrap_density(dmb_in)
         dm_a, dm_b, _overlap, v_emb_embasi, p_b_embasi = self.p.construct_embedding_potential(
             dma_in=wrapped_dma_in, dmb_in=wrapped_dmb_in, a_nspade_mos=a_nmos
         )
 
-        # EmbASI returns SpinKpointArray objects (leading (nspin, nkpt) axes)
-        # holding real restricted data in a complex128 dtype; _as_ao_matrix
-        # squeezes the length-1 leading axes and drops the (asserted-negligible)
-        # imaginary part, so everything downstream (einsum, sla.eigh, veff) sees
-        # a bare 2-occupancy real (nao, nao) matrix.
+        # `_as_ao_matrix` normalises EmbASI's SpinKpointArray to a real (nao, nao) block
+        # (see `_as_ao_matrix` for the dtype convention).
         #
-        # `_as_ao_total` SUMS the spin axis here, deliberately: these spin-summed
-        # copies are what the restricted path, the energy assembly and the export all
-        # read.  The per-spin halves are kept ALONGSIDE them just below
-        # (`_dm_a_spin`/`_dm_b_spin` via `_as_ao_pair`), which is what the per-spin
-        # downfold uses -- so nothing is lost.  Note `dm_a`/`dm_b` are subsystems A and
-        # B, NOT alpha/beta: each carries its own spin axis, so an unrestricted run has
-        # four blocks.
+        # `_as_ao_total` SUMS the spin axis: these copies feed the restricted path, the
+        # energy assembly and the export, with the per-spin halves kept alongside below.
+        # `dm_a`/`dm_b` are subsystems A and B, NOT alpha/beta -- each carries its own spin
+        # axis, so an unrestricted run has four blocks.
         self._dm_a = self._as_ao_total(dm_a)
         if self._dm_a_init is None:
             self._dm_a_init = self._as_ao_total(dm_a)
         self._dm_b = self._as_ao_total(dm_b)
         self._s = self.ints.overlap()
 
-        # v_emb / P_B read straight from EmbASI (no longer reconstructed by
-        # subtraction).  P_B may be None for projection modes that build it inside
-        # the SCF (huzinaga-sc); the __init__ guard already rejects those, so a
-        # None here is an upstream contract change and we fail loudly.
+        # v_emb / P_B read straight from EmbASI.  P_B is None for modes that build it inside
+        # the SCF (huzinaga-sc), which __init__ already rejects -- so a None here means an
+        # upstream contract change and we fail loudly.
         if p_b_embasi is None:
             raise ValueError(
                 "construct_embedding_potential returned P_B=None; only "
@@ -1061,10 +1008,9 @@ class ProjectionEmbeddingAdapter:
         self._v_emb_spin = self._as_ao_pair(v_emb_embasi)
         self._dm_a_spin = self._as_ao_pair(dm_a)
         self._dm_b_spin = self._as_ao_pair(dm_b)
-        # Captured once, on the first run_low_level ever -- the per-spin counterpart of
-        # `_dm_a_init` above, and set under the same condition so the two always describe
-        # the same cycle.  `_dm_a_spin` is refreshed every cycle and must not be used as
-        # the reference (see `projection_energy`'s per-spin split).
+        # Captured once on the first run_low_level -- the per-spin counterpart of
+        # `_dm_a_init`, set under the same condition so both describe the same cycle.
+        # `_dm_a_spin` is refreshed every cycle and must NOT be used as the reference.
         if self._dm_a_spin_init is None and self._dm_a_spin is not None:
             self._dm_a_spin_init = (self._dm_a_spin[0].copy(), self._dm_a_spin[1].copy())
 
@@ -1104,10 +1050,9 @@ class ProjectionEmbeddingAdapter:
             # Target the right sector: without this the embedded SCF fills alpha/beta by
             # aufbau on the *total* count and can converge to the wrong spin state.
             self.p.A_HL.input_fragment_spin = self.p.A_spin
-        # Hand EmbASI the per-spin density/potential/projector when there is one -- the
-        # single-channel wrapper would feed a spin-summed density into an unrestricted SCF
-        # and silently relax against the wrong reference.  `_wrap_density` picks n_spin=2
-        # for a pair and n_spin=1 for a matrix.
+        # Hand EmbASI the per-spin blocks when there is a pair: the single-channel wrapper
+        # would feed a spin-summed density into an unrestricted SCF and silently relax
+        # against the wrong reference.
         spin_pairs = (
             self._dm_a_spin is not None
             and self._v_emb_spin is not None
@@ -1178,25 +1123,19 @@ class ProjectionEmbeddingAdapter:
             "mu": float(self.mu),
             "xc_hl": str(getattr(mf, "xc", None)),
             "density_fit": str(getattr(self.ints, "_density_fit", None)),
-            # Subsystem A's own spin, as the SPADE partition assigned it.  Neither
-            # `unrestricted` (a bool) nor `mol.spin` (the *supersystem*'s) captures it,
-            # so without this a doublet snapshot and a singlet adapter are
-            # indistinguishable: same basis, same geometry, same array shapes, different
-            # meaning for every exported matrix.  None when EmbASI exposed no A_spin.
+            # Subsystem A's own spin, as SPADE assigned it.  Neither `unrestricted` (a bool)
+            # nor `mol.spin` (the supersystem's) captures it, so without this a doublet
+            # snapshot and a singlet adapter are indistinguishable.  None when no A_spin.
             "a_spin": (
                 None if (a := getattr(getattr(self, "p", None), "A_spin", None)) is None else int(a)
             ),
         }
         # WHICH orbitals are subsystem A, not just how many basis functions there are.
-        # `a_nmos` (CLI `--a_nmos`, forwarded as `a_nspade_mos`) moves the SPADE cut, so
-        # two runs on an identical molecule/basis/mu/xc partition differently and produce
-        # snapshots that are otherwise fingerprint-identical: same `nao`, same shapes,
-        # integral `tr(gamma^A S)` and `tr(gamma^B S)` on both sides, and a clean
-        # projector leak after the cross-restore -- every existing guard passes while the
-        # energy moves ~1.4 Ha (859 kcal/mol, measured on H6/sto-3g at A=2 vs A=1).
-        # The electron count in A is the cheapest faithful observable of the cut: it is an
-        # integer by construction, needs no MO layout assumption, and differs exactly when
-        # the partition does.
+        # `a_nmos` moves the SPADE cut, so two runs on an identical molecule/basis/mu/xc
+        # partition differently while staying fingerprint-identical under every other
+        # guard.  A's electron count is the cheapest faithful observable of the cut:
+        # integral by construction, no MO layout assumption, and differs exactly when the
+        # partition does.
         try:
             n_a = float(np.einsum("ij,ji->", self._dm_a_arr, np.asarray(self.ints.overlap())))
             fingerprint["a_nelec"] = int(round(n_a))
@@ -1301,10 +1240,9 @@ class ProjectionEmbeddingAdapter:
             if pair is not None:
                 state[name.lstrip("_")] = np.asarray(np.stack(pair))
         # The ADAPTER's per-channel `v_emb` pair (`h_emb_s - hcore - P_B_s`), which
-        # `projection_energy` contracts each channel against.  Exported under its own key
-        # because `v_emb_spin` above is EmbASI's pair, on the other convention (it omits
-        # subsystem A's nuclear-electron term); the two are not interchangeable, and
-        # `projection_energy_from_state` needs this one to reproduce the live energy.
+        # `projection_energy` contracts each channel against.  Its own key because
+        # `v_emb_spin` above is EmbASI's pair on the other convention (it omits subsystem A's
+        # nuclear-electron term): the two are NOT interchangeable.
         if self._fock_spin is not None and self._p_b_spin is not None:
             state["v_emb_spin_adapter"] = np.asarray(
                 np.stack((self.v_emb_spin(0), self.v_emb_spin(1)))
@@ -1373,21 +1311,10 @@ class ProjectionEmbeddingAdapter:
             else:
                 setattr(self, name, None)
 
-        # The relaxed embedded-HF reference is NOT part of the snapshot, and after a
-        # restore it is worse than absent: `relax_active_hf` converges it "in the frozen
-        # v_emb/P_B potential run_low_level already built", and `restore_state` has just
-        # replaced v_emb/P_B/the densities with the SENDER's.  So a surviving
-        # `_fock_relaxed` was converged against a potential this adapter no longer holds --
-        # the frozen-potential invariant that justifies reusing it in-process is exactly
-        # what a restore breaks.  Measured: `max|_fock_relaxed - _fock| = 0.137` with
-        # orbital energies 0.982 Ha apart, consumed without complaint by
-        # `build_orbitals(use_relaxed=True)`.
-        #
-        # Clearing is the same rule `_STATE_SPIN_ARRAYS` follows just above ("a restricted
-        # snapshot cannot leave a previous run's spin state standing"), and it fails loudly
-        # rather than silently: `_fock_relaxed_arr` raises via `_require`, and
-        # `build_orbitals_spin(use_relaxed=True)` already refuses a `None` pair.  Call
-        # `relax_active_hf()` again after restoring to rebuild it in the restored potential.
+        # The relaxed Fock is not in the snapshot, and after a restore it is worse than
+        # absent: `relax_active_hf` converged it in the frozen v_emb/P_B potential that
+        # `restore_state` has just replaced with the sender's.  Clear it so the accessors
+        # fail loudly; call `relax_active_hf()` again to rebuild it in the new potential.
         self._fock_relaxed = None
         self._dm_a_relaxed = None
         self._fock_relaxed_spin = None
@@ -1431,10 +1358,9 @@ class ProjectionEmbeddingAdapter:
             )
 
     # ---------------- low-level state accessors ---------------- #
-    # ``_dm_a``/``_dm_b``/``_fock``/``_s`` are only populated by run_low_level().
-    # These accessors turn "used before the embedding ran" from an AttributeError
-    # on None deep inside a contraction into one clear message, and give the type
-    # checker the non-optional arrays the numerics below require.
+    # ``_dm_a``/``_dm_b``/``_fock``/``_s`` are populated only by run_low_level().  These
+    # turn "used before the embedding ran" into one clear message instead of an
+    # AttributeError deep inside a contraction, and narrow the types for the numerics.
 
     def _require(self, value: np.ndarray | None, name: str) -> np.ndarray:
         """Return ``value``, or explain that :meth:`run_low_level` has not run."""
@@ -1553,11 +1479,9 @@ class ProjectionEmbeddingAdapter:
                 a partition/MO disagreement, and passing it through would hand the
                 solver a valid-looking wrong spin sector.
         """
-        # EmbASI declares no __init__ default for A_spin (it is only assigned inside
-        # construct_embedding_potential), so a read before that call raises
-        # AttributeError; getattr also buys tolerance for a pre-spin EmbASI for free.
-        # The outer getattr covers a stub adapter built without `p` at all (the selector
-        # tests construct one via object.__new__, bypassing __init__).
+        # A_spin has no __init__ default (it is assigned inside
+        # construct_embedding_potential), so a read before that call raises AttributeError.
+        # The outer getattr covers stub adapters built via object.__new__ in the tests.
         a_spin = getattr(getattr(self, "p", None), "A_spin", None)
         if a_spin is None:
             return None
@@ -1843,14 +1767,10 @@ class ProjectionEmbeddingAdapter:
 
     def _as_ao_by_mo(self, c) -> np.ndarray:
         """Fix layout: ASI/Fortran may hand back (nmo, nao) or a leading spin axis."""
-        # Take the spin channel BEFORE np.asarray.  On a live open shell EmbASI's
-        # per-spin MO blocks have DIFFERENT widths -- measured (13, 5) alpha vs
-        # (13, 4) beta for an OH radical in sto-3g, since SPADE slices each channel
-        # at its own occupied count -- so the pair is a *ragged* nested sequence and
-        # `np.asarray` on it raises "inhomogeneous shape" before any spin handling
-        # below can run.  `_spin_block` indexes the SpinKpointArray instead, which is
-        # width-agnostic.  Without this, `mo_a_ll` cannot be read at all on a doublet
-        # and `build_orbitals` dies before it reaches the spin sector logic.
+        # Take the spin channel BEFORE np.asarray: on a live open shell the per-spin MO
+        # blocks have DIFFERENT widths (SPADE slices each channel at its own occupied
+        # count), so the pair is a ragged nested sequence and `np.asarray` raises
+        # "inhomogeneous shape".  `_spin_block` indexes the SpinKpointArray, width-agnostic.
         c = self._spin_block(c)
         c = np.asarray(c)
         if c.ndim == 3 and c.shape[0] == 2 and getattr(self, "unrestricted", False):
@@ -1860,11 +1780,9 @@ class ProjectionEmbeddingAdapter:
             # Per-channel access is `_mo_spin`, used by the per-spin downfold.
             c = c[0]
         if c.ndim == 3:  # (nspin, ., .) -- closed shell only
-            # Open-shell embedding is a deferred package rewrite (see the
-            # module docstring): everything downstream assumes a 2-occupancy
-            # density and a spin-restricted downfold, so supporting open shells
-            # means separate alpha/beta orbital sets, an (h1a, h1b) pair, and
-            # SQD's spin-symmetry handling on the solver side.
+            # Open-shell embedding is a deferred package rewrite (see the module
+            # docstring): separate alpha/beta sets, an (h1a, h1b) pair, and SQD's
+            # spin-symmetry handling on the solver side.
             if c.shape[0] != 1:
                 raise NotImplementedError(
                     "open-shell embedding not wired up (spin axis has length "
@@ -1872,12 +1790,10 @@ class ProjectionEmbeddingAdapter:
                 )
             c = c[0]
         if np.iscomplexobj(c):
-            # Same real-in-complex dtype as the density/Fock blocks (see
-            # _as_ao_matrix): SPADE carries real restricted MO coefficients in a
-            # complex128 array.  Drop the imaginary part -- but only after
-            # asserting it is negligible, so a genuinely complex block is caught
-            # loudly.  Left complex, these coefficients push the downstream
-            # ao2mo onto PySCF's relativistic (spinor) path, which mis-broadcasts.
+            # Real-in-complex dtype, as for the density/Fock blocks: drop the imaginary
+            # part, but only after asserting it is negligible so a genuinely complex block
+            # fails loudly.  Left complex, these coefficients push ao2mo onto PySCF's
+            # relativistic spinor path, which mis-broadcasts.
             max_imag = float(np.abs(c.imag).max()) if c.size else 0.0
             if max_imag > _IMAG_TOL:
                 raise ValueError(
@@ -2107,10 +2023,9 @@ class ProjectionEmbeddingAdapter:
 
         n_occ = self.mo_a_ll.shape[1]  # inferred, never passed in (the ALPHA count)
 
-        # Beta occupied count from EmbASI's A_spin, or None for the restricted reading.
-        # `_as_ao_by_mo` still keeps only the alpha channel, so the downfold below stays
-        # spin-RESTRICTED (one h1, one MO set) -- this fixes the reported *sector*, not
-        # the orbitals, so the result is ROHF-like rather than UKS-quality.
+        # Beta occupied count from A_spin, or None for the restricted reading.  `_as_ao_by_mo`
+        # keeps only alpha, so the downfold stays spin-RESTRICTED: this fixes the reported
+        # *sector*, not the orbitals, making the result ROHF-like rather than UKS-quality.
         n_occ_b = self._n_occ_b_from_embasi(n_occ)
 
         n_virt_total = c.shape[1] - n_occ
@@ -2150,15 +2065,6 @@ class ProjectionEmbeddingAdapter:
                     )
         else:
             active = np.arange(n_frozen_occ, n_occ + n_virt)
-
-        # from pyscf.tools import cubegen
-        # for occ_idx in np.arange(0,n_occ):
-        #    print(occ_idx)
-        #    cubegen.orbital(self.p.A_LL.atoms.calc.method.mol, f'orbital_occ_{occ_idx}.cube', c[:, occ_idx])
-        #
-        # for virt_idx in np.arange(n_occ,n_occ+n_virt):
-        #    print(virt_idx)
-        #    cubegen.orbital(self.p.A_LL.atoms.calc.method.mol, f'orbital_virt_{virt_idx}.cube', c[:, virt_idx])
 
         inactive = np.array([i for i in range(n_occ) if i not in set(active.tolist())], dtype=int)
         return EmbeddedOrbitals(
@@ -2231,42 +2137,27 @@ class ProjectionEmbeddingAdapter:
     ) -> EmbeddedOrbitals:
         """Concentric localization for locality, then APC to rank and truncate.
 
-        Two-stage active-space construction (King & Gagliardi, *J. Chem. Theory
-        Comput.* **2021**, 17, 7387, doi:10.1021/acs.jctc.1c00037):
+        Two-stage active-space construction (King & Gagliardi, *J. Chem. Theory Comput.*
+        **2021**, 17, 7387, doi:10.1021/acs.jctc.1c00037):
 
-        1. :func:`~embasi_qiskit_integration.selectors.concentric_localization_selector`
-           rotates the virtual block into fragment-coupled shells -- this answers
-           *which virtuals are spatially/electronically relevant to the embedded
-           region*, the question the level-shift embedding leaves open (it removes
-           subsystem B entirely, but says nothing about which of subsystem A's
-           virtuals matter for the active atoms specifically). Its own shell count
-           (``n_shells``) sets the candidate pool; it is called uncapped
-           (``max_virtual=None``) since APC, not CL's own cap, does the truncation.
-        2. APC (:func:`~embasi_qiskit_integration.selectors.apc_pair_coefficients`
-           / ``apc_orbital_entropies`` / ``apc_active_space``) then ranks *every*
-           candidate orbital -- occupied and virtual together -- by an approximate
-           multiconfigurational pair-coefficient entropy, and truncates to
-           ``max_size``. Unlike every other selector in this package, APC can drop
-           occupied candidates -- it supersedes ``n_frozen_occ`` for this active
-           space; occupied freezing is a ranking outcome, not a caller-set count.
+        1. ``concentric_localization_selector`` rotates the virtual block into
+           fragment-coupled shells, answering which virtuals are relevant to the embedded
+           region. Called uncapped (``max_virtual=None``) since APC does the truncation;
+           ``n_shells`` sets the candidate pool.
+        2. APC ranks *every* candidate -- occupied and virtual together -- by an approximate
+           pair-coefficient entropy and truncates to ``max_size``. Alone among the selectors
+           here it can drop occupied candidates, so it supersedes ``n_frozen_occ``:
+           occupied freezing is a ranking outcome, not a caller-set count.
 
-        CL's kept virtuals are rotated, not Fock eigenvectors, so ``ε_a`` in APC's
-        eq. 19 is recomputed as the expectation value ``diag(C^T F_emb C)`` in
-        the *current* (possibly rotated) basis rather than read off
-        ``EmbeddedOrbitals.energy`` (which CL already sets to ``NaN`` for exactly
-        this reason -- see :meth:`build_orbitals`). The exchange diagonal is
-        computed the same way against ``self.ints.get_k`` at the full-A 2-occupancy
-        density, mirroring the inactive-core downfold's ``dm_in`` in
-        :meth:`embedded_hamiltonian`.
+        CL's kept virtuals are rotated, not Fock eigenvectors, so APC's ``ε_a`` is
+        recomputed as ``diag(C^T F_emb C)`` in the current basis rather than read off
+        ``EmbeddedOrbitals.energy`` (which CL sets to ``NaN``). The exchange diagonal
+        follows the same route against ``ints.get_k``.
 
-        Outer-loop stability: this selection is recomputed every self-consistency
-        cycle from the current ``F_emb`` (see ``EmbeddingWorkflow._run_outer_loop``).
-        ``fixed=True`` (with a ``(nelec, norb)`` ``max_size``) pins the selection to
-        exactly that size every cycle; the default dynamic drop-until-budget
-        (``fixed=False``) can flip which near-tied orbital is dropped as the Fock
-        matrix drifts cycle to cycle, changing the active-space size -- and hence
-        the qubit count -- mid-run. Use ``fixed=True`` for anything feeding
-        ``_run_outer_loop`` with ``max_cycles > 1``.
+        Outer-loop stability: the selection is recomputed every cycle from the current
+        ``F_emb``. ``fixed=True`` (with a ``(nelec, norb)`` ``max_size``) pins the size;
+        the dynamic default can flip which near-tied orbital is dropped as the Fock drifts,
+        changing the qubit count mid-run. Use ``fixed=True`` whenever ``max_cycles > 1``.
 
         Args:
             fragment_ao: AO indices of the active-fragment atoms (as
@@ -2313,16 +2204,10 @@ class ProjectionEmbeddingAdapter:
         n_orb = c_full.shape[1]
         n_occ = orbitals.n_occ
 
-        # The ranking density must carry subsystem A's ACTUAL electron count.  The
-        # restricted `2 * c_occ c_occ^T` is `2 * n_alpha`, which on an open shell invents
-        # `n_alpha - n_beta` extra electrons: measured on the live OH doublet
-        # (n_alpha=5, n_beta=4, EmbASI reporting A_pop=9.0) it fed 10 electrons in, and
-        # `k_diag` came out up to 0.88 Ha high -- systematically, and most on the SOMO.
-        # `k_diag_virt` feeds `apc_pair_coefficients` directly, so the entropies inherit
-        # that error.  The ranking ORDER happens to survive it on this small system, so
-        # this is a latent defect rather than a currently-wrong active space -- but it
-        # would bite exactly where two candidates are near-tied, which is the regime the
-        # `fixed=True` stability note below is about.
+        # The ranking density must carry subsystem A's ACTUAL electron count: the restricted
+        # `2 * c_occ c_occ^T` is `2 * n_alpha`, inventing `n_alpha - n_beta` electrons on an
+        # open shell.  `k_diag_virt` feeds `apc_pair_coefficients`, so the entropies inherit
+        # any error -- which bites where two candidates are near-tied.
         if orbitals.is_open_shell and orbitals.n_occ_b is not None:
             n_occ_b = orbitals.n_occ_b
             dm_a = (
@@ -2344,49 +2229,23 @@ class ProjectionEmbeddingAdapter:
         c_pairs = apc_pair_coefficients(f_diag[cand_occ], f_diag[cand_virt], k_diag[cand_virt])
         s_occ, s_virt = apc_orbital_entropies(c_pairs)
 
-        # from pyscf.tools import cubegen
-        # for occ_idx in np.arange(0,n_occ):
-        #    print(occ_idx)
-        #    cubegen.orbital(self.p.A_LL.atoms.calc.method.mol, f'orbital_occ_{occ_idx}.cube', c_full[:, occ_idx])
-
-        # for virt_idx in np.arange(n_occ,n_orb):
-        #    print(virt_idx)
-        #    cubegen.orbital(self.p.A_LL.atoms.calc.method.mol, f'orbital_virt_{virt_idx}.cube', c_full[:, virt_idx])
-
         entropies = np.full(n_orb, -1.0e18)
         entropies[cand_occ], entropies[cand_virt] = s_occ, s_virt
 
-        # Which columns hold the unpaired electrons must be asked of the DENSITY, not
-        # of column position: this method has just run concentric localization, which
-        # rotates within blocks and so destroys the energy ordering that
-        # `somo_occupation_pattern`'s positional rule assumes.  For OH/sto-3g the
-        # projected occupation is [2, 2, 2, 1, 2, 0] -- the SOMO sits at index 3, not
-        # atop the occupied block -- so the positional reading would hand APC the wrong
-        # orbital to protect.  `column_occupation_from_density` is rotation-invariant.
+        # Ask the DENSITY which columns hold the unpaired electrons, not column position:
+        # concentric localization has just rotated within blocks, destroying the energy
+        # ordering a positional rule assumes.  `_occupation_pattern` is rotation-invariant.
         if orbitals.is_open_shell:
             occ_pattern = self._occupation_pattern(c_full, n_orb, n_occ, orbitals.n_occ_b)
         else:
             occ_pattern = np.where(np.arange(n_orb) < n_occ, 2, 0)
         active = apc_active_space(occ_pattern, entropies, max_size, fixed=fixed)
         print(f"ACTIVE SPACE: {active}")
-        # `inactive` must be derived from the OCCUPATION, not from column position.  The
-        # four lines above exist precisely because concentric localization has rotated
-        # within blocks, so "the first n_occ columns are the occupied ones" no longer
-        # holds -- and `range(n_occ)` here would reintroduce that very assumption one line
-        # later.  A frozen column is one that is doubly occupied and not active: anything
-        # else in `c_inactive` is charged into `e_core`/`veff_in` as `2 * c c^T`, so an
-        # *empty* column frozen this way injects two electrons that do not exist, and
-        # `n_active_electrons_spin` (which subtracts `len(inactive)` from both channels)
-        # then reports a sector short by the same amount.
-        #
-        # Latent rather than active on the fixtures here: PySCF's `Chooser` gives a
-        # singly-occupied column synthetic max entropy so a SOMO is never dropped, and on
-        # the live OH doublet the projected pattern comes out positional
-        # ([2, 2, 2, 2, 1, 0, 0, 0]), so the two rules agree.  But they need not -- over
-        # 1719 synthetic (occupation, entropy, budget) combinations the positional rule put
-        # an *empty* column into `inactive` in 789 of them -- and the count-only
-        # cross-check in `_occupation_pattern` cannot see a positional disagreement,
-        # because it compares only `(n_alpha, n_beta)` totals.
+        # Derive `inactive` from the OCCUPATION, not column position: `range(n_occ)` would
+        # reintroduce the positional assumption the lines above exist to avoid.  A frozen
+        # column is doubly occupied and not active -- `c_inactive` is folded in as
+        # `2 * c c^T`, so freezing an *empty* column injects two electrons that do not
+        # exist and leaves `n_active_electrons_spin` short by the same amount.
         active_set = set(active.tolist())
         occ_arr = np.asarray(occ_pattern)
         inactive = np.array(
@@ -2416,13 +2275,10 @@ class ProjectionEmbeddingAdapter:
     # ---------------- downfolding ---------------- #
     def embedded_hamiltonian(self, orbitals: EmbeddedOrbitals) -> EmbeddedHamiltonian:
         """CASCI-style downfold of h_emb + bare ERIs onto the active space."""
-        # Key the refusal on the *reported* spin, not on `unrestricted` alone.  EmbASI's
-        # `A_spin` now supplies the beta count (see `_n_occ_b_from_embasi`), so an
-        # unrestricted run whose partition reports `2S == 0` is a genuine singlet:
-        # `n_alpha == n_beta`, which the restricted downfold represents exactly, and
-        # refusing it would reject a well-posed run.  What must still be refused is an
-        # unrestricted run whose beta count went *missing* -- there the restricted split
-        # is a silent guess at the sector rather than a faithful representation of it.
+        # Key the refusal on the *reported* spin, not on `unrestricted` alone: an
+        # unrestricted run reporting `2S == 0` is a genuine singlet the restricted downfold
+        # represents exactly.  What must be refused is a MISSING beta count, where the
+        # restricted split would be a silent guess at the sector.
         if self.unrestricted and orbitals.n_occ_b is None and self._spin_is_unknown():
             raise NotImplementedError(
                 "unrestricted=True but these orbitals carry no beta occupied count and "
@@ -2440,12 +2296,10 @@ class ProjectionEmbeddingAdapter:
         veff_in = self.ints.veff_hf(dm_in)  # HF, regardless of the high level
 
         h1 = c_act.T @ (h_emb + veff_in) @ c_act
-        # (h_emb + veff_in) is a symmetric operator and c_act is real, so h1 is
-        # Hermitian in exact arithmetic.  The C^T M C rotation accumulates
-        # round-off that grows with the active-space size (~1e-10 at 10 orbitals,
-        # ~1e-7 at 112), which trips the contract's strict Hermiticity check.
-        # Assert the asymmetry is at round-off scale -- so a genuinely
-        # non-Hermitian input still fails loudly -- then symmetrize it away.
+        # h1 is Hermitian in exact arithmetic, but the C^T M C rotation accumulates
+        # round-off that grows with active-space size and trips the contract's strict
+        # check.  Assert the asymmetry is at round-off scale -- so a genuinely
+        # non-Hermitian input still fails -- then symmetrize it away.
         asym = float(np.abs(h1 - h1.T).max())
         if asym > 1e-6:
             raise ValueError(
@@ -2464,13 +2318,11 @@ class ProjectionEmbeddingAdapter:
         if leak > 1e-6:
             msg = f"active orbitals leak into subsystem B (|P_B| = {leak:.2e})"
             if self.unrestricted:
-                # Measured on an OH radical in water: span(A_alpha) is S-orthogonal to
-                # span(B_alpha) to ~9e-15 but to span(B_beta) only to ~3e-4, because
-                # SPADE partitions each spin channel independently.  A spin-RESTRICTED
-                # downfold takes the alpha MOs (`_as_ao_by_mo` keeps alpha) against a
-                # spin-summed P_B, mixing the channels -- so the leak is structural
-                # here, not a tolerance to relax, and no reduction of P_B (alpha, beta,
-                # sum or mean) removes it: all give the same magnitude.
+                # SPADE partitions each spin independently, so span(A_alpha) is
+                # S-orthogonal to span(B_alpha) but only to ~3e-4 against span(B_beta).  A
+                # spin-RESTRICTED downfold takes the alpha MOs against a spin-summed P_B,
+                # mixing the channels: the leak is STRUCTURAL, not a tolerance to relax,
+                # and no reduction of P_B (alpha, beta, sum or mean) removes it.
                 msg += (
                     ".  This is an unrestricted run, where the A/B separation holds "
                     "PER SPIN CHANNEL only: EmbASI's SPADE partitions alpha and beta "
@@ -2583,15 +2435,11 @@ class ProjectionEmbeddingAdapter:
                     f"{n_occ} are occupied; the partition and the MOs disagree"
                 )
             if virtual_localizer is not None:
-                # Rotate THIS channel's virtual block and cut on its own sigma^2 gap,
-                # exactly as `build_orbitals` does for the restricted path.  It has to
-                # happen here, in pass 1: the cut changes how many virtuals the channel
-                # can offer, which is an input to the reconciliation below -- applying it
-                # afterwards would let `n_act` promise orbitals the localiser had removed.
-                #
-                # Each channel gets its own sigma^2 ordering because each was diagonalized
-                # in its own span(A); reusing alpha's rotation for beta is the same
-                # per-channel-basis error the rest of this method exists to avoid.
+                # Rotate THIS channel's virtual block and cut on its own sigma^2 gap, as
+                # `build_orbitals` does.  Must happen in pass 1: the cut changes how many
+                # virtuals the channel can offer, an input to the reconciliation below.
+                # Each channel needs its own ordering -- each was diagonalized in its own
+                # span(A), so alpha's rotation does not apply to beta.
                 from embasi_qiskit_integration.selectors import _gap_cut
 
                 c, sigma2 = virtual_localizer(c, n_occ)
@@ -2611,10 +2459,9 @@ class ProjectionEmbeddingAdapter:
             n_occs.append(n_occ)
             n_virt_totals.append(n_virt_total)
 
-        # Validate `n_frozen_occ` against the BINDING channel, naming it.  Reporting this
-        # up front is the difference between "n_frozen_occ=5 outside [0, 5) for spin 1"
-        # (which reads as beta being at fault) and a message that says the shared knob is
-        # capped by the channel with fewer electrons.
+        # Validate `n_frozen_occ` against the BINDING channel and name it: otherwise the
+        # message reads as beta being at fault rather than saying the shared knob is capped
+        # by the channel with fewer electrons.
         n_occ_min = min(n_occs)
         if not 0 <= n_frozen_occ < n_occ_min:
             raise ValueError(
@@ -2624,26 +2471,21 @@ class ProjectionEmbeddingAdapter:
                 f"most {n_occ_min - 1}."
             )
 
-        # Reconcile to a common ACTIVE-ORBITAL count.  Each channel can support at most
-        # `n_occ_s - n_frozen_occ + n_virt_total_s` active orbitals, so the smaller of the
-        # two is the largest `norb` both can realise.  `n_virtual` then caps it, counted
-        # above the WIDEST channel's active occupied block -- as a per-channel virtual
-        # count it cannot mean the same thing for two channels with different occupancies,
-        # which is exactly the bug this replaces.
+        # Reconcile to a common ACTIVE-ORBITAL count: each channel supports at most
+        # `n_occ_s - n_frozen_occ + n_virt_total_s`, so the smaller is the largest `norb`
+        # both can realise.  `n_virtual` caps it above the WIDEST channel's occupied block --
+        # as a per-channel count it cannot mean the same for two different occupancies.
         n_act_occ = [n - n_frozen_occ for n in n_occs]
         supported = [n_act_occ[s] + n_virt_totals[s] for s in (0, 1)]
         n_act = min(supported)
         if n_virtual is not None:
             n_act = min(n_act, max(n_act_occ) + n_virtual)
         if n_act < max(n_act_occ):
-            # `norb` cannot cover both channels' active occupied blocks.  Two distinct
-            # causes, and the message has to say which -- they need opposite fixes.
-            #
-            # `_eigh_subsystem_a_spin` returns span(A_s) = the S-orthogonal complement of
-            # span(B_s), whose width is `nao - n_occ_B_s` and so differs per channel.  On
-            # the real doublets here both come out equal (19 or 20 wide), but nothing
-            # guarantees it: when the narrower span cannot hold the wider channel's
-            # occupied block, no `n_virtual` helps and the partition itself is the limit.
+            # `norb` cannot cover both channels' active occupied blocks.  Two causes
+            # needing opposite fixes, so the message must say which.  span(A_s) is the
+            # S-orthogonal complement of span(B_s), width `nao - n_occ_B_s`, which differs
+            # per channel: when the narrower span cannot hold the wider channel's occupied
+            # block, no `n_virtual` helps and the partition itself is the limit.
             binding_span = min(supported) < max(n_act_occ)
             if binding_span:
                 raise ValueError(
@@ -2763,45 +2605,30 @@ class ProjectionEmbeddingAdapter:
         if self._p_b_spin is None:
             raise ValueError("no per-spin P_B available; call run_low_level() unrestricted")
 
-        # Frozen-core density, ONCE for the pair.  The two channels freeze *different*
-        # orbitals (SPADE partitions each spin separately), so the core is
-        # `c_in_a c_in_a^T + c_in_b c_in_b^T` -- one electron per channel.  The
-        # restricted `2 * c_in c_in^T` is not a valid stand-in: it has the right trace,
-        # so no electron-count check fires, but it is the wrong matrix wherever the two
-        # cores differ.  That error is invisible for a deep 1s core (<a|S|b> ~ 0.999998,
-        # ~0.4 kcal/mol on OH) and large once a frozen orbital is valence-like
-        # (<a|S|b> ~ 0.96, ~40 kcal/mol on triplet CH2).  It also cancels identically at
-        # `n_frozen_occ=0`, where both forms are zero.
-        # Kept as separate halves as well as the sum: the one-body part of `e_core` below
-        # contracts each channel's core against its own operator, which the summed
-        # density alone cannot express.
+        # Frozen-core density, ONCE for the pair.  The channels freeze *different* orbitals
+        # (SPADE partitions each spin separately), so the core is one electron per channel:
+        # `c_in_a c_in_a^T + c_in_b c_in_b^T`.  The restricted `2 * c_in c_in^T` has the
+        # right trace -- so no electron-count check fires -- but the wrong matrix wherever
+        # the two cores differ.  Kept as separate halves as well as the sum, since `e_core`
+        # below charges each channel's core to its own operator.
         dm_core_a = alpha.c_inactive @ alpha.c_inactive.T
         dm_core_b = beta.c_inactive @ beta.c_inactive.T
         dm_in = dm_core_a + dm_core_b
-        # The frozen-core mean field is UNRESTRICTED: `J` is a functional of the total
-        # core density, but exchange couples like spins only, so each channel sees
-        # `J[d_a + d_b] - K[d_sigma]` and the two differ.  The restricted `J - K/2`
-        # (`veff_hf`) is correct only when both channels freeze the SAME orbitals; here
-        # they do not, because SPADE partitions the spins separately.  Measured against an
-        # ERI-only UHF ground truth with valence-like cores (overlap 0.34): the averaged
-        # form is 1.09 Ha off per channel and +0.78 Ha (+492 kcal/mol) on the CAS total.
-        # It is invisible for a deep 1s core (overlap 0.9999998, 0.02 kcal/mol), which is
-        # why the pinned OH numbers barely move -- and why this had to be checked against
-        # a rebuild that does not itself call `veff_hf`.
+        # The frozen-core mean field is UNRESTRICTED: J is a functional of the total core
+        # density but exchange couples like spins, so each channel sees
+        # `J[d_a + d_b] - K[d_sigma]`.  The restricted `J - K/2` (`veff_hf`) holds only when
+        # both channels freeze the SAME orbitals, which a per-spin partition does not give.
         #
-        # `e_two_body` comes back from the same call rather than being recomputed as
-        # `0.5 tr[d veff]`: that identity holds for the restricted `J - K/2` only, since
-        # the exchange self-interaction does not factor out once the two channels have
-        # different K.
+        # `e_two_body` must come back from the same call, not be recomputed as
+        # `0.5 tr[d veff]`: that identity holds for the restricted `J - K/2` only, since the
+        # exchange self-interaction stops factoring out once the channels have different K.
         if hasattr(self.ints, "veff_uhf"):
             veff_in_a, veff_in_b, e_core_two_body = self.ints.veff_uhf(dm_core_a, dm_core_b)
             veff_spin_free = False
         else:
-            # A backend without the unrestricted fold (the stub integral classes in the
-            # tests): keep the restricted form rather than fabricating one, and record it
-            # in `meta` so a consumer can tell the fold was spin-averaged.  Identical to
-            # the previous behaviour, and inert at `n_frozen_occ=0` where both cores are
-            # empty and every form below is zero.
+            # A backend without the unrestricted fold (the test stubs): keep the restricted
+            # form rather than fabricating one, and record it in `meta` so a consumer can
+            # tell the fold was spin-averaged.  Inert at `n_frozen_occ=0`.
             veff_in_a = veff_in_b = self.ints.veff_hf(dm_in)
             e_core_two_body = 0.5 * float(np.einsum("ij,ji->", dm_in, veff_in_a))
             veff_spin_free = True
@@ -2855,15 +2682,10 @@ class ProjectionEmbeddingAdapter:
             # A backend without the mixed transform (e.g. a stub): fall back to the
             # spin-free tensor rather than fabricating a triple, and record it.
             h2_spin = None
-        # Frozen-core energy, per channel.  Each channel's core density is charged to
-        # ITS OWN embedded one-body operator (the very `h_emb_s` its h1 is built from),
-        # not to alpha's for both: the two channels see different Focks, so contracting
-        # beta's core against `h_emb_a` charges it at the wrong potential.  The error is
-        # exactly `tr[d_b (h_emb_a - h_emb_b)]` -- 0.0162 Ha (10.2 kcal/mol) on the OH
-        # radical at n_frozen_occ=1, with the right electron count and spin sector, so
-        # nothing else flags it.  The two-body term stays on the TOTAL core density
-        # (`veff_in` is a functional of it) and is counted once, hence the single 0.5.
-        # Vanishes identically at n_frozen_occ=0, where both cores are empty.
+        # Frozen-core energy, per channel: each core density is charged to ITS OWN `h_emb_s`
+        # (the one its h1 is built from), since the channels see different Focks.  The
+        # two-body term stays on the TOTAL core density (`veff_in` is a functional of it)
+        # and is counted once.
         e_core = float(
             self.ints.energy_nuc()
             + np.einsum("ij,ji->", dm_core_a, h_emb_pair[0])
@@ -2945,10 +2767,8 @@ class ProjectionEmbeddingAdapter:
         *known limits* for the measurements.
         """
         v_emb, p_b = self.v_emb, self.p_b
-        # Bound to locals so the None-narrowing below reaches `rdm1_ao_spin` (reading the
-        # attributes back off `result` widens them to `ndarray | None` again).  Together
-        # these are `result.is_spin_resolved`, which the contract validates as
-        # all-or-nothing.
+        # Bound to locals so the None-narrowing reaches `rdm1_ao_spin`: reading them back
+        # off `result` re-widens to `ndarray | None`.
         rdm1a_in, rdm1b_in = result.rdm1a, result.rdm1b
         dm_a_hl: np.ndarray | None = None
         dm_b_hl: np.ndarray | None = None
@@ -2963,55 +2783,31 @@ class ProjectionEmbeddingAdapter:
         else:
             dm_hl = self.rdm1_ao(result.rdm1, orbitals)
 
-        # Per-spin reference pair, needed by both the totals (below) and the split.
-        # `_dm_a_spin_init` is the round-0 pair captured once in `run_low_level`; fall back
-        # to halving the spin-summed reference only when there is none (a restricted
-        # adapter, or a snapshot predating it), where the two channels are equal anyway
-        # and halving is exact.  Read through `getattr` because the stub adapters in the
-        # tests are built via `object.__new__` and never run `__init__`.
+        # Per-spin reference pair for both the totals and the split.  `_dm_a_spin_init` is
+        # the round-0 pair; fall back to halving the spin-summed reference only when there
+        # is none, where the channels are equal anyway and halving is exact.  `getattr`
+        # because the test stubs are built via `object.__new__`.
         spin_init = getattr(self, "_dm_a_spin_init", None)
         if spin_init is not None:
             init_a, init_b = spin_init
         else:
             init_a = init_b = 0.5 * self._dm_a_arr_init
 
-        # On a per-spin downfold, contract EACH CHANNEL AGAINST ITS OWN OPERATORS and sum
-        # -- do not contract the spin-summed density against the spin-summed ones.  The
-        # rule: subtract what the downfold actually folded in, channel by channel.
+        # On a per-spin downfold, contract EACH CHANNEL AGAINST ITS OWN OPERATORS and sum:
+        # subtract what the downfold actually folded in, channel by channel.
+        # `embedded_hamiltonian_spin` builds `h1_s` from each channel's own `v_emb_s` and
+        # `P_B_s`, so `result.energy` holds `sum_s tr[d_s v_emb_s]`, never `tr[dm v_emb]`.
+        # The spin-summed operators would pick up `mu`-scaled cross terms
+        # (`tr[d_alpha P_beta]`), since SPADE makes span(A_alpha) S-orthogonal to
+        # span(B_alpha) but not to span(B_beta).
         #
-        # `embedded_hamiltonian_spin` builds `h1_s` from `h_emb_s = F_emb_s - veff_ll`,
-        # i.e. each channel's own `v_emb_s` and `P_B_s` (verified: `hcore + v_emb_spin(s)
-        # + P_B_s` reproduces that `h_emb_s` to 0.0).  So `result.energy` already contains
-        # `sum_s tr[d_s v_emb_s]`, NOT `tr[dm v_emb]`, and it never contained a
-        # cross-channel projector term at all.
-        #
-        # Using the spin-summed operators instead is wrong twice over, because SPADE
-        # partitions each spin separately, so `span(A_alpha)` is S-orthogonal to
-        # `span(B_alpha)` but *not* to `span(B_beta)`:
-        #
-        # * The projector picks up the cross terms `tr[d_alpha P_beta]`, which the level
-        #   shift multiplies by `mu`.  Measured on data/22.inp (stretched C-N, 2.2 A):
-        #   own terms -1.2e-11 / +1.2e-10, cross terms +2.4e+04 / +5.4e+02, so the
-        #   spin-summed `leak` came out at +2.41e+04 -- a quantity documented as a
-        #   numerical zero -- and dragged the reported total to -24288 Ha on a ~-207 Ha
-        #   system.
-        # * The `v_emb` term removes something the solver never added, worth +54.0 Ha
-        #   there.
-        #
-        # Both together: `e_high_A` lands at -9.0917 against a closed-shell control on the
-        # SAME geometry at -9.1139 (totals -207.2066 vs -207.2108, a triplet ~0.1 eV above
-        # the singlet).  That two-path agreement is the evidence for this form.
-        #
-        # Two independent conditions, deliberately NOT collapsed into one:
-        #
-        # * `have_spin_operators` -- is there a per-spin `v_emb`/`P_B` at all?  Only then
-        #   can anything be contracted per channel.  It is false on every restricted run,
-        #   which is why those stay bit-identical.
+        # The two conditions below are independent and must NOT be collapsed:
+        # * `have_spin_operators` -- is there a per-spin `v_emb`/`P_B` to contract against?
+        #   False on every restricted run, which is why those stay bit-identical.
         # * `dm_a_hl`/`dm_b_hl` -- did the solver return a spin-resolved RDM?  A restricted
-        #   adapter can still get one (an unrestricted solver on a closed-shell downfold),
-        #   and that case must keep reporting the split it always did, against the
-        #   spin-summed operators, which are exact there because the two channels share one
-        #   span.
+        #   adapter can still get one (unrestricted solver, closed-shell downfold); that
+        #   case keeps the spin-summed operators, exact there since both channels share
+        #   one span.
         have_spin_operators = self._p_b_spin is not None and self._fock_spin is not None
         leak_spin: tuple[float, float] | None = None
         correction_spin: tuple[float, float] | None = None

@@ -309,12 +309,9 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
     sort_embed_mask = np.sort(embed_mask)
     atoms = atoms[idx_list]
 
-    # TODO(embasi-api): the charge is set on the PySCF Mole (which needs it to
-    # get nelec right), but ProjectionEmbedding is handed only the ASE Atoms and
-    # exposes no charge argument, so its own low-level SCF may still assume a
-    # neutral system.  ASK: accept a charge (or read it off the ASE Atoms'
-    # initial_charges).  Until that is confirmed against a live EmbASI, treat
-    # non-zero-charge embedding runs as unvalidated.
+    # TODO(embasi-api): the charge reaches the PySCF Mole but ProjectionEmbedding gets only
+    # the ASE Atoms and exposes no charge argument, so its low-level SCF may assume a neutral
+    # system.  Treat non-zero-charge embedding runs as unvalidated until confirmed.
     _check_shell_consistency(cfg.spin, cfg.unrestricted)
     mol = pyscf.M(
         atom=ase_atoms_to_pyscf(atoms),
@@ -444,10 +441,8 @@ def build_selector(
                 )
 
             return None, None, _orbital_builder
-        # concentric-cl: the shell count sets the physically-motivated k; if
-        # ``n_virtual`` is given it is a solver-budget CEILING on top of that
-        # (for small simulations), truncating the outermost shell tail -- not a
-        # replacement for the shell structure.
+        # concentric-cl: the shell count sets k; ``n_virtual`` is a solver-budget CEILING
+        # on top of it, truncating the outermost shell tail -- not a replacement.
         if cfg.n_virtual is not None and log is not None:
             log(
                 f"   [selector] concentric-cl: capping the shell-determined virtuals "
@@ -499,28 +494,18 @@ class EmbeddingWorkflow(BaseSettings):
     # solver never runs; the dissociation-energy driver overrides this per run.
     xc_hl: str = "HF"
     mu: float = 1.0e6  # level-shift parameter, paper Eq. 6
-    # WF-in-DFT only (never reached on the DFT-in-DFT path, which has no solver):
-    # converge subsystem A's own HF problem on A_HL, self-consistently, in the
-    # frozen v_emb/P_B potential run_low_level() built -- see
-    # ProjectionEmbeddingAdapter.relax_active_hf.  Without it build_orbitals()
-    # diagonalizes F_emb exactly once against A_LL's (xc_ll-level) density, so
-    # Brillouin's theorem does not hold for the orbitals FCI/SQD receives: an
-    # orbital-relaxation error a formally-exact active-space solve cannot recover.
-    # Defaults off -- it costs an extra embedded SCF and changes the reference the
-    # published numbers in this repo were produced against.
+    # WF-in-DFT only: converge subsystem A's own HF problem on A_HL in the frozen
+    # v_emb/P_B potential (see `relax_active_hf`).  Without it `build_orbitals` diagonalizes
+    # F_emb once against A_LL's density, so Brillouin's theorem does not hold for the
+    # orbitals FCI/SQD receives -- an error an exact active-space solve cannot recover.
+    # Off by default: costs an extra embedded SCF and moves the published reference.
     relax_hf: bool = False
-    # Open shell only.  Drive the genuinely spin-dependent path: diagonalize each spin
-    # channel in its OWN span(A) and downfold to an (h1a, h1b) + (aa, ab, bb) Hamiltonian
-    # (ProjectionEmbeddingAdapter.build_orbitals_spin / embedded_hamiltonian_spin).
-    # Requires `unrestricted=True` and an EmbASI that reports a spin axis.
-    #
-    # Why this is not automatic: a spin-RESTRICTED downfold is *ill-defined* on an open
-    # shell (EmbASI's SPADE partitions each channel independently, so a spin-summed P_B
-    # annihilates neither channel's A orbitals -- the projector leak is ~4e-02), so on an
-    # open shell this is the only correct path. It is a flag rather than a silent switch
-    # because selectors are not supported on it (an independent cut per channel could keep
-    # different orbital counts, and the downfold needs a common dimension) and only the
-    # FCI solver can consume the pair.
+    # Open shell only: diagonalize each channel in its OWN span(A) and downfold to an
+    # (h1a, h1b) + (aa, ab, bb) Hamiltonian.  Needs `unrestricted=True` and an EmbASI that
+    # reports a spin axis.  A spin-RESTRICTED downfold is ill-defined on an open shell (SPADE
+    # partitions each channel independently, so a spin-summed P_B annihilates neither), but
+    # this stays a flag rather than a silent switch: index selectors are unsupported here and
+    # only the FCI solver consumes the pair.
     spin_downfold: bool = False
 
     a_nmos: int | None = None  # Fixes the number of electrons selected by SPADE
@@ -528,52 +513,35 @@ class EmbeddingWorkflow(BaseSettings):
     # --- active space: solver budget only, not embedding physics --- #
     n_frozen_occ: int = 0
     n_virtual: int | None = None  # solver-budget cap; None -> the selector's own count
-    #   (``mulliken``: per-fragment cap; ``spade``: cap after the σ² gap; ``concentric-cl``:
-    #   ceiling on the shell-determined k, truncating the outermost shell tail for small
-    #   simulations; ``none``: the fixed energy-ordered cut).
-    #   With ``spin_downfold=True`` it caps the COMMON active-orbital count instead,
-    #   counted above the widest channel's active occupied block: the two spin channels
-    #   have different occupied counts, so one per-channel virtual count cannot give them
-    #   the same ``norb`` (see ``build_orbitals_spin``).
-    # ``concentric-cl`` by default: the full iterative Concentric Localization of
-    # Claudino 2019 (JCTC 15, 6085), the paper-faithful cut.  It keeps a nested,
-    # size-consistent active-virtual space (an energy-ordered "none" cut is non-nested
-    # across legs) and grows it by ``n_shells`` Fock-coupled shells (the accuracy knob;
-    # ``n_shells=0`` is the single-shell case).  ``mulliken`` is the single-shell
-    # Mulliken-population cut (ranks canonical F_emb virtuals, cuts on the largest gap;
-    # honours ``active_fragment_sizes`` per-fragment); ``spade`` ROTATES the virtual
-    # block (Claudino & Mayhall, doi:10.1021/acs.jctc.9b00682) so each rotated virtual
-    # carries a definite fragment weight σ², then cuts on the σ² gap -- basis invariant,
-    # robust when the canonical virtuals delocalise.  ``none`` disables.
-    # ``apc-concentric``: concentric localization (locality pre-filter) followed by
-    # APC (King & Gagliardi, doi:10.1021/acs.jctc.1c00037) ranking + truncation of
-    # BOTH occupied and virtual candidates -- the only selector that can freeze
-    # occupied orbitals itself, so it supersedes ``n_frozen_occ``.  See
-    # ``ProjectionEmbeddingAdapter.build_orbitals_apc_concentric``.
+    #   (``mulliken``: per-fragment cap; ``spade``: after the σ² gap; ``concentric-cl``:
+    #   a ceiling on the shell-determined k; ``none``: the energy-ordered cut).  With
+    #   ``spin_downfold=True`` it caps the COMMON active-orbital count instead, since the
+    #   channels' differing occupied counts make one per-channel count meaningless.
+    # ``concentric-cl`` (default) keeps a nested, size-consistent active-virtual space and
+    # grows it by ``n_shells`` Fock-coupled shells.  ``mulliken`` cuts on the largest gap in
+    # the canonical virtuals' fragment population (honours ``active_fragment_sizes``);
+    # ``spade`` rotates the virtual block so each virtual carries a definite weight σ² and
+    # cuts on the σ² gap -- basis invariant, robust when the canonicals delocalise.
+    # ``apc-concentric`` adds APC ranking over BOTH occupied and virtual candidates, so it
+    # supersedes ``n_frozen_occ``.  ``none`` disables.  See ``selectors`` for the papers.
     selector: Literal["none", "mulliken", "spade", "concentric-cl", "apc-concentric"] = (
         "concentric-cl"
     )
-    # ``concentric-cl``/``apc-concentric`` only: number of Fock shell expansions
-    # after shell 0.  0 keeps just the fragment-spanned shell (single-shell
-    # equivalent); higher values grow the active-virtual candidate space (and the
-    # qubit/determinant count) for accuracy.
+    # ``concentric-cl``/``apc-concentric`` only: Fock shell expansions after shell 0.
+    # 0 keeps just the fragment-spanned shell; higher values grow the candidate space
+    # (and the qubit count) for accuracy.
     n_shells: int = 0
     # ``apc-concentric`` only: APC's active-space budget, as (nelec, norb).  Required
     # when selector="apc-concentric"; inert otherwise.
     apc_max_size: tuple[int, int] | None = None
-    # ``apc-concentric`` only: pin the selection to exactly apc_max_size every outer-
-    # loop cycle (recommended -- see build_orbitals_apc_concentric's stability note)
-    # rather than dynamically dropping to an N_CSF budget, which can change the
-    # active-space size cycle to cycle as F_emb drifts under density feedback.
+    # ``apc-concentric`` only: pin the selection to exactly apc_max_size every cycle
+    # (recommended) rather than dropping to an N_CSF budget, which can change the
+    # active-space size as F_emb drifts under density feedback.
     apc_fixed: bool = True
-    # How the active atoms partition into PHYSICAL fragments, as consecutive
-    # counts in the order they appear in ``active_atoms`` (which the reorder keeps
-    # leading, ascending).  ``None`` (default) -> one fragment (current behaviour).
-    # e.g. both-OH dimer active_atoms=[1,5,7,11] -> [2, 2] (OH-A | OH-B): the
-    # ``mulliken`` selector then cuts each OH shell independently and unions them, so
-    # the dimer active-virtual span contains BOTH monomer shells (additivity).  Used
-    # ONLY by ``mulliken``; the rotating ``spade``/``concentric-cl`` cuts anchor on the
-    # fragment union and ignore the partition.
+    # How the active atoms split into PHYSICAL fragments, as consecutive counts in
+    # ``active_atoms`` order.  ``None`` -> one fragment.  e.g. an OH dimer [1,5,7,11] ->
+    # [2, 2], so ``mulliken`` cuts each shell independently and unions them (additivity).
+    # Used ONLY by ``mulliken``; the rotating cuts anchor on the fragment union.
     active_fragment_sizes: list[int] | None = None
 
     # --- integral backend --- #
@@ -588,14 +556,9 @@ class EmbeddingWorkflow(BaseSettings):
     rho_tol: float = 1.0e-5  # max |Δγ^A| convergence threshold
     converge_on: Literal["energy_and_density", "energy"] = "energy"
     mix_alpha: float = 0.5  # linear density mixing (1.0 -> undamped)
-    # Pulay/DIIS acceleration of the density feedback, in place of plain linear
-    # mixing.  Off by default (``mix_alpha`` is the historical behaviour); once
-    # enough history has accumulated (>= 2 cycles) each new trial density is the
-    # DIIS-extrapolated combination of past outputs rather than a linear blend of
-    # the last two -- see ``_diis_extrapolate`` and the note in
-    # ``_run_outer_loop``.  ``mix_alpha`` still governs the bootstrap cycle before
-    # DIIS has two vectors to work with, and any cycle where the DIIS subspace
-    # matrix is singular.
+    # Pulay/DIIS acceleration of the density feedback instead of plain linear mixing.  Off
+    # by default.  ``mix_alpha`` still governs the bootstrap cycle (before DIIS has two
+    # vectors) and any cycle where the subspace matrix is singular.
     diis: bool = False
     diis_size: int = 8  # max (input, output) pairs kept in the DIIS subspace
     reseed_sqd: bool = True  # re-sample the SQD subspace each cycle
@@ -604,14 +567,9 @@ class EmbeddingWorkflow(BaseSettings):
     solver: Literal["sqd", "fci"] = "sqd"
     handoff: Literal["in-process", "two-process"] = "in-process"
     sampler: SamplerKind = "aer"
-    # Aer is a *family* of simulators, not one: statevector (exact), density_matrix,
-    # stabilizer, matrix_product_state, ... `--sampler aer` alone does not say which,
-    # so name it here and it lands in the SQD diagnostics too.  Validated against the
-    # installed Aer, so a typo fails at construction rather than silently simulating
-    # with whatever Aer would have defaulted to.
-    #
-    # NOTE seeds do NOT reproduce across methods -- each consumes randomness
-    # differently -- so switching method changes the sampled counts for a fixed seed.
+    # Aer is a *family* (statevector, density_matrix, stabilizer, matrix_product_state,
+    # ...) and `--sampler aer` alone does not pin one.  Validated against the installed Aer,
+    # so a typo fails at construction.  Seeds do NOT reproduce across methods.
     aer_method: str = "statevector"
     # MPS only.  Uncapped MPS converges toward the exact state and is often *slower*
     # than statevector on the entangling circuits SqDRIFT produces; the cap is what
@@ -659,22 +617,14 @@ class EmbeddingWorkflow(BaseSettings):
             f"active atoms {self.active_atoms}, projection=level-shift"
         )
 
-        # Route on the high-level METHOD, not the solver.  A density functional
-        # (pure or hybrid: PBE, PBE0, B3LYP, ...) is DFT-in-DFT (paper Eq. 2): the
-        # high-level energy is a Kohn-Sham energy at the embedded density, with no
-        # active space, no solver, and no correlated wavefunction.  A wavefunction
-        # method (HF as a mean field, or a correlated solver on top) is WF-in-DFT
-        # (Eq. 8): downfold subsystem A to an active space and hand a bare
-        # electronic Hamiltonian to FCI/SQD.  Routing a hybrid xc through the WF
-        # path is a category error (its signature is a large, non-monotonic
-        # dependence of Δ_HL on the virtual budget), so it goes down its own path.
+        # Route on the high-level METHOD, not the solver: a density functional is
+        # DFT-in-DFT (Eq. 2, no active space or solver), a wavefunction method is WF-in-DFT
+        # (Eq. 8, downfold and hand a bare Hamiltonian to FCI/SQD).
         #
-        # The two paths drive DIFFERENT collective EmbASI entry points and must
-        # branch BEFORE the low-level call, so exactly one fires per rank: the
-        # DFT-in-DFT path runs EmbASI's native ``run()`` (which itself runs the
-        # supersystem SCF), while the WF path runs ``run_low_level()``.  Calling
-        # both would double the supersystem SCF (``run()`` re-invokes
-        # ``construct_embedding_potential`` internally).
+        # The two drive DIFFERENT collective EmbASI entry points and must branch BEFORE the
+        # low-level call so exactly one fires per rank: DFT-in-DFT runs EmbASI's native
+        # ``run()`` (which runs the supersystem SCF itself), WF runs ``run_low_level()``.
+        # Calling both would double the supersystem SCF.
         if self._is_dft_in_dft():
             return self._dft_in_dft(emb, log=log)
 
@@ -746,47 +696,29 @@ class EmbeddingWorkflow(BaseSettings):
     ):
         """Steps 2-5, iterated until self-consistent (or ``max_cycles``).
 
-        ``max_cycles == 1`` reproduces the single-pass flow exactly.  With more
-        cycles, each iteration builds orbitals, downfolds, solves, assembles the
-        PbE energy, and feeds the correlated density back; it stops early once
-        the ``converge_on`` criterion is met (``max_cycles`` is the safety cap).
+        ``max_cycles == 1`` reproduces the single-pass flow exactly.  Otherwise each cycle
+        builds orbitals, downfolds, solves, assembles the PbE energy and feeds the
+        correlated density back, stopping once ``converge_on`` is met.
 
-        MPI-safe: the solve goes through ``self._solve`` (rank 0 solves, result
-        broadcast), and ``emb.feedback`` runs on every rank (its collective
-        ``construct_embedded_fock`` must), so all ranks stay in lock-step.
+        MPI-safe: the solve goes through ``self._solve`` (rank 0 solves, result broadcast)
+        and ``emb.feedback`` runs on every rank, since its ``construct_embedded_fock`` is
+        collective.
 
-        A stochastic solver (SQD) makes the fixed point noisy in a way the
-        deterministic PbE literature does not address, so convergence is judged
-        on running tolerances, not bitwise.  ``--reseed_sqd`` chooses whether the
-        sampled subspace is redrawn each cycle (default, honest resampling) or
-        carried over (cheaper, but the subspace is frozen at cycle 0's density).
+        A stochastic solver (SQD) makes the fixed point noisy, so convergence is judged on
+        running tolerances rather than bitwise.  ``--reseed_sqd`` chooses whether the sampled
+        subspace is redrawn each cycle or frozen at cycle 0's density.
 
-        The undamped map ``γ -> F(γ)`` oscillates and diverges for this problem
-        (verified: max|Δγ^A| grows back and E swings ±0.03 Ha), so the fed-back
-        density is linearly mixed with the previous one -- ``--mix_alpha`` ∈ (0, 1],
-        the fraction of the new density (``1.0`` is undamped).  ``0.5`` converges
-        max|Δγ^A| monotonically to ~1e-7 here; smaller is safer but slower.
+        The undamped map ``γ -> F(γ)`` oscillates and diverges here, so the fed-back density
+        is linearly mixed with the previous one (``--mix_alpha`` ∈ (0, 1], the fraction of
+        the new density).  Near a vanishing HOMO-LUMO gap -- bond dissociation -- mixing can
+        fail outright, the iterates settling into a limit cycle no practical ``mix_alpha``
+        escapes.  ``--diis`` replaces the blend with Pulay extrapolation over past outputs,
+        whose coefficients adapt to the residual history; ``mix_alpha`` still governs the
+        bootstrap cycle and any singular subspace.
 
-        Near a vanishing HOMO-LUMO gap in the embedded fragment (e.g. bond
-        dissociation), linear mixing can fail outright: the map picks up a
-        large-magnitude oscillatory eigenvalue that no practical ``mix_alpha``
-        rescales below 1, and the iterates settle into a stable limit cycle
-        (period-2 in practice) rather than converging.  ``--diis`` replaces the
-        linear blend with Pulay/DIIS extrapolation (see ``_diis_extrapolate``):
-        once >= 2 (input, output) pairs are on hand it solves for the
-        minimum-residual combination of past *outputs* directly, which damps
-        exactly this kind of oscillation far better than any fixed ``mix_alpha``
-        because the mixing coefficients adapt to the observed residual history
-        instead of being fixed in advance.  ``mix_alpha`` still governs the
-        first feedback cycle (only one vector on hand -- nothing to extrapolate)
-        and any cycle where the DIIS subspace is singular.
-
-        ``orbital_builder`` (set only for ``selector="apc-concentric"``) bypasses
-        ``emb.build_orbitals(selector=..., virtual_localizer=...)`` entirely: APC's
-        two-stage construction (CL locality pre-filter, then APC ranks and
-        truncates occupied + virtual together) calls ``build_orbitals`` itself and
-        returns the finished ``EmbeddedOrbitals``, so ``selector``/
-        ``virtual_localizer`` are both ``None`` whenever this is set.
+        ``orbital_builder`` (only for ``selector="apc-concentric"``) bypasses
+        ``emb.build_orbitals`` entirely: APC calls it internally and returns the finished
+        ``EmbeddedOrbitals``, so ``selector``/``virtual_localizer`` are ``None`` with it.
         """
         prev_total: float | None = None
         prev_dm_a = None
@@ -804,18 +736,12 @@ class EmbeddingWorkflow(BaseSettings):
             # else keeps the restricted lift bit-identical.
             orbitals_b = None
             if self.spin_downfold:
-                # Genuinely spin-dependent path: two orbital sets, each diagonalized in
-                # its own span(A), downfolded to an (h1a, h1b) pair.  Selectors do not
-                # apply here (see the `spin_downfold` field comment).
-                # A *localiser* (spade, concentric-cl) is supported: it is applied per
-                # channel, and `build_orbitals_spin` then reconciles the two channels to a
-                # common active-ORBITAL count (deriving each one's virtual count from its
-                # own occupied count, since an open shell has n_occ_alpha != n_occ_beta).
-                # An index `selector` (mulliken) and the APC `orbital_builder` are not:
-                # both pick/rank columns against a single spin-summed Fock and neither has
-                # a per-channel form, so they would silently mix the channels the per-spin
-                # path exists to separate.  `--n_virtual` IS usable here -- it caps the
-                # common active space rather than each channel's virtuals.
+                # Two orbital sets, each diagonalized in its own span(A), downfolded to an
+                # (h1a, h1b) pair.  A *localiser* (spade, concentric-cl) is applied per
+                # channel and reconciled to a common active-orbital count; an index
+                # `selector` (mulliken) and the APC `orbital_builder` are refused, since
+                # both rank against one spin-summed Fock and would mix the channels this
+                # path exists to separate.  `--n_virtual` caps the common active space.
                 if selector is not None or orbital_builder is not None:
                     raise ValueError(
                         f"spin_downfold=True does not support selector={self.selector!r}: "
@@ -833,13 +759,10 @@ class EmbeddingWorkflow(BaseSettings):
                 log(f"   alpha: {spin_orbitals[0]}")
                 log(f"   beta : {spin_orbitals[1]}")
                 ham = emb.embedded_hamiltonian_spin(spin_orbitals)
-                # Alpha is the representative wherever a single set is enough (logging,
-                # the restricted `rdm1_ao` fallback).  `orbitals_b` carries beta's own
-                # set, which the energy assembly and the spin-resolved feedback both
-                # need: the two channels are diagonalized in DIFFERENT spans, so lifting
-                # beta's active RDM through alpha's columns silently reads a beta-basis
-                # matrix as alpha-basis (right trace and sector, wrong matrix -- 0.0779 Ha
-                # on the OH radical's total).
+                # Alpha represents the pair wherever one set suffices (logging, the
+                # restricted `rdm1_ao` fallback).  `orbitals_b` carries beta's own set: the
+                # channels are diagonalized in DIFFERENT spans, so lifting beta's active RDM
+                # through alpha's columns gives the right trace and the wrong matrix.
                 orbitals, orbitals_b = spin_orbitals
                 leaks = ham.meta["p_b_leak_per_spin"]
                 log(
@@ -912,17 +835,14 @@ class EmbeddingWorkflow(BaseSettings):
             )
             log(f"     = {energy.total:.6f} Ha")
             log(f"   tr[γ̃^A P_B] = {energy.projector_leak:.2e} Ha (should be ~0)")
-            # E_high(A) is rebased onto E_low(A)'s (ghosted subsystem-A) nuclear
-            # frame before the subtraction; without it the two A-terms would be
-            # ~4 Ha apart on incompatible frames.  Surface the shift so it is not
-            # a silent adjustment.
+            # E_high(A) is rebased onto E_low(A)'s (ghosted subsystem-A) nuclear frame
+            # before the subtraction, or the two A-terms sit on incompatible frames.
+            # Surfaced so the shift is not a silent adjustment.
             log(f"   footing shift applied to E_high(A): {energy.footing_shift:.6f} Ha")
 
-            # Convergence check (only meaningful once we have a previous cycle).
-            # `converge_on` selects the criterion: "energy" stops as soon as the
-            # PbE total energy stops moving (|ΔE| < e_tol), which is the robust
-            # choice under a stochastic solver where the density has sampling
-            # noise; "energy_and_density" additionally requires max|Δγ^A| < rho_tol.
+            # `converge_on` picks the criterion: "energy" stops once |ΔE| < e_tol, the
+            # robust choice under a stochastic solver whose density carries sampling noise;
+            # "energy_and_density" also requires max|Δγ^A| < rho_tol.
             dm_a_now = np.asarray(emb._dm_a)
             if prev_total is not None:
                 de = abs(energy.total - prev_total)
@@ -944,13 +864,10 @@ class EmbeddingWorkflow(BaseSettings):
 
             log(f"== Step 5: feed the correlated 1-RDM back into the embedding =={tag}")
 
-            # An unrestricted result keeps its spin resolution: `fed` stays the
-            # spin-summed total (DIIS, the linear mixing and the max|Δγ| diagnostic below
-            # all operate on one matrix, and the *total* is the right convergence
-            # vector), while `fed_split` carries the alpha/beta pair that is actually fed
-            # back.  Summing the pair here -- as this did -- discarded the polarisation
-            # one line after computing it, making the loop a spin-summed fixed point even
-            # when the solver had resolved the channels.
+            # An unrestricted result keeps its spin resolution: `fed` stays the spin-summed
+            # total (what the |Δγ| diagnostic reads) while `fed_split` carries the pair
+            # actually fed back.  Summing the pair here would discard the polarisation and
+            # make the loop a spin-summed fixed point.
             fed_split: tuple[np.ndarray, np.ndarray] | None = None
             if getattr(emb, "unrestricted", False) and result.is_spin_resolved:
                 fed_a, fed_b = emb.rdm1_ao_spin(result.rdm1a, result.rdm1b, orbitals, orbitals_b)
@@ -958,15 +875,11 @@ class EmbeddingWorkflow(BaseSettings):
                 fed_split = (fed_a, fed_b)
             else:
                 fed = emb.rdm1_ao(result.rdm1, orbitals)
-            # When the feedback is spin-resolved, DIIS and the linear mixing act on the
-            # STACKED pair `(alpha, beta)` rather than on the spin-summed total.  One
-            # coefficient set still applies to both channels -- they share a single fixed
-            # point, so extrapolating them with different coefficients would be
-            # inconsistent -- but the residual now measures each channel's own error, so a
-            # channel that is converging badly is damped on its own terms instead of
-            # having its error masked by cancellation in the sum.  (Measured on an OH
-            # radical: the per-channel corrections are +0.62 / -0.63 while their sum is
-            # -0.014, so the total genuinely hides the per-channel behaviour.)
+            # Spin-resolved feedback: DIIS and the linear mixing act on the STACKED pair
+            # rather than the total.  One coefficient set still covers both channels (they
+            # share a fixed point), but the residual now measures each channel's own error,
+            # so a badly-converging channel is damped on its own terms instead of having its
+            # error masked by cancellation in the sum.
             spin_mixed = fed_split is not None
             vec_now = np.stack(emb._dm_a_spin) if (spin_mixed and emb._dm_a_spin) else dm_a_now
             vec_fed = np.stack(fed_split) if spin_mixed else fed
@@ -978,16 +891,12 @@ class EmbeddingWorkflow(BaseSettings):
             mixing_desc = f"mix_alpha={self.mix_alpha}"
             extrapolated = None
             if self.diis:
-                # The convergence vector's SHAPE can change between cycles: `spin_mixed`
-                # is demoted whenever the solver resolved the channels but the adapter has
-                # no per-spin `gamma^A` to form a residual against, so a run can append a
-                # spin-summed `(nao, nao)` residual on one cycle and a stacked
-                # `(2, nao, nao)` one on the next.  A DIIS subspace spanning both is not a
-                # subspace at all -- `np.vdot` flattens the two to different lengths and
-                # raises `ValueError` (not the `LinAlgError` `diis_extrapolate` guards),
-                # which aborts the whole outer loop.  Dropping the stale-shape history is
-                # the standard response to a changed convergence vector: the subspace
-                # restarts from this cycle rather than mixing incommensurable errors.
+                # The convergence vector's SHAPE can change between cycles, since
+                # `spin_mixed` is demoted whenever the adapter has no per-spin `gamma^A` to
+                # form a residual against.  A subspace spanning both shapes is not a
+                # subspace: `np.vdot` raises `ValueError` -- NOT the `LinAlgError`
+                # `_diis_extrapolate` guards -- so it escapes and aborts the whole loop.
+                # Drop the stale history and restart the subspace from this cycle.
                 if (
                     diis_residuals
                     and np.asarray(diis_residuals[-1]).shape != np.asarray(vec_fed - vec_now).shape
@@ -1015,10 +924,9 @@ class EmbeddingWorkflow(BaseSettings):
                 else:
                     mixing_desc = f"mix_alpha={self.mix_alpha} (DIIS bootstrap/fallback)"
             if extrapolated is None and prev_fed is not None and self.mix_alpha != 1.0:
-                # Linear mixing: DIIS's bootstrap cycle (< 2 vectors) and its
-                # fallback when the subspace matrix is singular (as well as the
-                # historical --diis=False default).  `prev_fed` carries whichever vector
-                # shape the previous cycle used, so only mix when they agree.
+                # Linear mixing: DIIS's bootstrap cycle (< 2 vectors), its singular-subspace
+                # fallback, and --diis=False.  `prev_fed` carries the previous cycle's vector
+                # shape, so only mix when the two agree.
                 if np.asarray(prev_fed).shape == np.asarray(vec_fed).shape:
                     vec_fed = self.mix_alpha * vec_fed + (1.0 - self.mix_alpha) * prev_fed
             prev_fed = vec_fed

@@ -27,56 +27,29 @@ import pytest
 
 pytestmark = [pytest.mark.embasi, pytest.mark.slow]
 
-# Reference values, measured 2026-09-20 against EmbASI 2973169 / scalapack4py
-# v1.0_release. They are regression anchors, not independently-derived physics: the
-# *independent* check is test_downfold_matches_an_independently_rebuilt_hamiltonian.
+# Reference values measured against a live EmbASI.  They are regression anchors, not
+# independently-derived physics: the *independent* check is
+# test_downfold_matches_an_independently_rebuilt_hamiltonian.
+#
+# The bracket that makes REF_TOTAL credible: this is an OH radical 4 A from a water
+# molecule, so the supersystem is very nearly non-interacting there.
+#
+#     E(OH, UHF/sto-3g)    = -74.362669
+#     E(H2O, RHF/sto-3g)   = -74.960573   ->  sum = -149.323242
+#     E(supersystem, UHF)  = -149.322412
+#     E(supersystem, UPBE) = -149.793506
+#
+# The run is HF-in-PBE, so the total must land between the UHF and UPBE supersystem
+# numbers and near PBE, since only fragment A is HF.  REF_TOTAL sits 0.18 Ha from UPBE
+# and 0.29 Ha from UHF, inside the bracket, with a projector leak at numerical zero.
 REF_NELEC = (5, 4)
 REF_NORB = 8
 REF_E_CORE = 25.2020184581
-# Re-measured 2026-09-22, after the `veff_ll` SPIN-PAIR INPUT fix.  `h_emb` (and every
-# `h_emb_s`) subtracts the low-level mean field, and that mean field was being evaluated at
-# a *depolarised* density: an unrestricted `get_veff` handed the spin-summed `_dm_a_arr`
-# silently substitutes `d/2` for both channels, and at `xc_ll=PBE` the xc functional is
-# nonlinear in the spin densities, so this is a real error (not the identity it is for an HF
-# low level).  `E_solver` moves 0.0283 Ha; `e_core` does not move at all, because it is
-# built from the same `h_emb_s` on both sides of the change at n_frozen_occ=0.
 REF_E_SOLVER = -53.5507789338
-# Re-measured 2026-09-21, after the PER-CHANNEL CONTRACTION fix, and this time checked
-# against physics rather than only re-pinned.  Every previous `REF_TOTAL` in this file was
-# wrong by ~39 Ha: the assembly contracted the spin-summed density against the spin-summed
-# `v_emb`/`P_B`, which on a per-spin downfold picks up cross-channel terms (SPADE makes
-# `span(A_alpha)` S-orthogonal to `span(B_alpha)`, NOT to `span(B_beta)`) and removes a
-# `v_emb` term the solver never added.
-#
-# Why -149.61 is right and -110.51 was not.  This system is an OH radical 4 A from a
-# water molecule, so at that separation the supersystem is very nearly non-interacting:
-#
-#     E(OH, UHF/sto-3g)        = -74.362669
-#     E(H2O, RHF/sto-3g)       = -74.960573   ->  sum = -149.323242
-#     E(supersystem, UHF)      = -149.322412
-#     E(supersystem, UPBE)     = -149.793506
-#
-# The run is HF-in-PBE, so the total must land between the UHF and UPBE supersystem
-# numbers, near PBE (only fragment A is HF).  NEW = -149.6094 sits 0.18 Ha from UPBE and
-# 0.29 Ha from UHF -- in the bracket.  OLD = -110.5119 was 39.3 Ha outside it, i.e. not a
-# physically possible total for this system at all.  The projector leak tells the same
-# story: -3.6e-16 now, against +7.99e-02 before, for a quantity that is a numerical zero
-# by construction.
-#
-# Superseded values, for the record (all wrong, each for a different reason):
-#   -110.5897439424  before the per-channel AO lift fix
-#   -110.5118889208  after it, still spin-summed in the energy assembly
-#   -149.6093681127  after the per-channel contraction, still depolarising veff_ll's input
-# `total` moves only 8.3e-05 Ha even though `E_solver` moves 0.0283 Ha: the assembly
-# subtracts the same per-channel `v_emb_s` back off, so the shift very largely cancels and
-# what remains is the genuine physical change.  Still inside the non-interacting bracket
-# above (0.18 Ha from UPBE, 0.29 Ha from UHF), and the leak tightened from -3.6e-16 to
-# -1.1e-15 -- both numerical zeros.
 REF_TOTAL = -149.6092847931
 REF_CORRECTION = -0.0020832881
 # Each channel referenced to its own round-0 density AND contracted against its own
-# `v_emb_spin`.  Superseded values: (0.6160922018, -0.5928344203) with a halved reference,
-# then (0.0117289574, 0.0115288241) with the polarised reference but spin-summed operators.
+# `v_emb_spin`.
 REF_CORRECTION_SPIN = (0.0001734614, -0.0022567495)
 
 
@@ -360,11 +333,8 @@ def test_frozen_core_e_core_charges_each_channel_to_its_own_fock(open_shell_froz
 
     dm_core_a, dm_core_b = c_in_a @ c_in_a.T, c_in_b @ c_in_b.T
     dm_core = dm_core_a + dm_core_b
-    # The PAIR, not the spin-summed `_dm_a_arr`: at `xc_ll=PBE` the xc functional is
-    # nonlinear in the spin densities, so a summed input has PySCF substitute `d/2` for
-    # both channels and silently depolarise the low-level mean field (worth ~0.065 Ha on
-    # triplet CH2).  Passing `_dm_a_arr` here would restate the old bug and make this
-    # rebuild agree with a downfold that was wrong.
+    # The PAIR, not the spin-summed `_dm_a_arr` -- see the note in
+    # test_downfold_matches_an_independently_rebuilt_hamiltonian.
     veff_ll = adapter.ints.veff_ll(adapter._dm_a_for_veff)
     h_emb_a = adapter._fock_spin[0] - veff_ll
     h_emb_b = adapter._fock_spin[1] - veff_ll
@@ -442,11 +412,8 @@ def test_frozen_core_downfold_matches_an_independent_rebuild(open_shell_frozen):
         np.einsum("ij,ji->", dm_core_a, _k(dm_core_a))
         + np.einsum("ij,ji->", dm_core_b, _k(dm_core_b))
     )
-    # The PAIR, not the spin-summed `_dm_a_arr`: at `xc_ll=PBE` the xc functional is
-    # nonlinear in the spin densities, so a summed input has PySCF substitute `d/2` for
-    # both channels and silently depolarise the low-level mean field (worth ~0.065 Ha on
-    # triplet CH2).  Passing `_dm_a_arr` here would restate the old bug and make this
-    # rebuild agree with a downfold that was wrong.
+    # The PAIR, not the spin-summed `_dm_a_arr` -- see the note in
+    # test_downfold_matches_an_independently_rebuilt_hamiltonian.
     veff_ll = adapter.ints.veff_ll(adapter._dm_a_for_veff)
     h_emb_a = adapter._fock_spin[0] - veff_ll
     h_emb_b = adapter._fock_spin[1] - veff_ll
