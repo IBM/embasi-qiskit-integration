@@ -243,6 +243,12 @@ _IMAG_TOL = 1.0e-9
 _FROZEN_OVERLAP_TOL = 0.9
 
 
+# A density argument to the `veff_*` accessors: either the spin-summed AO matrix or a
+# genuine `(alpha, beta)` pair.  The pair matters for a KS low level, whose xc is
+# nonlinear in the spin densities -- see `ProjectionEmbeddingAdapter._dm_a_for_veff`.
+DensityArg = np.ndarray | tuple[np.ndarray, np.ndarray]
+
+
 # --------------------------------------------------------------------------- #
 # AO integrals: the quantities EmbASI/ASI does not (yet) hand you
 # --------------------------------------------------------------------------- #
@@ -252,15 +258,18 @@ class AOIntegrals(Protocol):
     def overlap(self) -> np.ndarray: ...
     def hcore(self) -> np.ndarray: ...
 
-    def veff_hl(self, dm: np.ndarray) -> np.ndarray:
+    def veff_hl(self, dm: DensityArg) -> np.ndarray:
         """Effective potential of the *high-level* calculator, at a 2-occupancy dm.
 
         Must match ``calc_base_hl``.  Retained for callers that want the
         high-level mean field explicitly; the :attr:`h_emb` inverse uses
         :meth:`veff_ll` instead -- see that method.
+
+        ``dm`` may be an ``(alpha, beta)`` pair; see :meth:`veff_ll` for why that
+        matters and what the return must be in that case.
         """
 
-    def veff_ll(self, dm: np.ndarray) -> np.ndarray:
+    def veff_ll(self, dm: DensityArg) -> np.ndarray:
         """Effective potential of the *low-level* calculator, at a 2-occupancy dm.
 
         Must match ``calc_base_ll``: it exists only to undo the mean-field
@@ -269,6 +278,14 @@ class AOIntegrals(Protocol):
         :meth:`ProjectionEmbeddingAdapter._assemble_fock_a_only`), so the mean
         field baked into it is the *low-level* one, and that is what
         :attr:`ProjectionEmbeddingAdapter.h_emb` must subtract back off.
+
+        ``dm`` is either a spin-summed ``(nao, nao)`` matrix or an
+        ``(alpha, beta)`` pair -- the adapter passes the pair whenever it has one
+        (:attr:`ProjectionEmbeddingAdapter._dm_a_for_veff`), because an
+        unrestricted KS ``get_veff`` handed a summed matrix silently substitutes
+        ``d/2`` for both channels and loses the spin polarisation.  The **return**
+        is always a single ``(nao, nao)`` operator: a spin-resolved backend must
+        average its two channels, not sum them (a potential is per-electron).
         """
 
     def veff_hf(self, dm: np.ndarray) -> np.ndarray:
@@ -382,11 +399,30 @@ class PySCFIntegrals:
             return 0.5 * (v[0] + v[1])
         return v
 
-    def veff_hl(self, dm) -> np.ndarray:
-        return self._spin_average(self.mf.get_veff(self.mol, np.asarray(dm)))
+    @staticmethod
+    def _as_veff_arg(mf, dm: DensityArg) -> np.ndarray:
+        """Shape a density argument for ``mf.get_veff``, collapsing a pair if ``mf`` is restricted.
 
-    def veff_ll(self, dm) -> np.ndarray:
-        return self._spin_average(self.mf_ll.get_veff(self.mol, np.asarray(dm)))
+        An unrestricted ``get_veff`` wants ``(2, nao, nao)`` and reads the two channels
+        as genuine alpha/beta; a *restricted* one wants ``(nao, nao)`` and would read a
+        3-D array as a batch of densities.  So the pair is only passed through when the
+        mean field can interpret it, and summed otherwise -- which is exactly right,
+        since a restricted functional depends on the total density alone.
+        """
+        d = np.asarray(dm[0]) + np.asarray(dm[1]) if isinstance(dm, tuple) else np.asarray(dm)
+        if not isinstance(dm, tuple):
+            return d
+        from pyscf import scf as _scf
+
+        if isinstance(mf, (_scf.uhf.UHF, _scf.rohf.ROHF)):
+            return np.stack([np.asarray(dm[0]), np.asarray(dm[1])])
+        return d
+
+    def veff_hl(self, dm: DensityArg) -> np.ndarray:
+        return self._spin_average(self.mf.get_veff(self.mol, self._as_veff_arg(self.mf, dm)))
+
+    def veff_ll(self, dm: DensityArg) -> np.ndarray:
+        return self._spin_average(self.mf_ll.get_veff(self.mol, self._as_veff_arg(self.mf_ll, dm)))
 
     def veff_hf(self, dm) -> np.ndarray:
         # `_hf` is the restricted engine (see __init__), so this is normally already
@@ -1384,6 +1420,44 @@ class ProjectionEmbeddingAdapter:
         return self._require(self._dm_a, "the subsystem-A density")
 
     @property
+    def _dm_a_for_veff(self) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+        """gamma^A as the argument to ``veff_ll``/``veff_hl``: the PAIR when there is one.
+
+        The reduction of a ``(2, nao, nao)`` veff *return* is the mean
+        (:meth:`PySCFIntegrals._spin_average`); this is the separate question of what
+        goes **in**.  Handing an unrestricted ``get_veff`` the spin-summed
+        ``_dm_a_arr`` is not a harmless simplification: PySCF sees a 2-D array, warns
+        "Incompatible dm dimension. Treat dm as RHF density matrix.", and silently
+        substitutes ``d/2`` for *both* channels -- i.e. it throws the spin
+        polarisation away and reconstructs a fictitious unpolarised density.
+
+        For an **HF/HFhybrid-exchange** low level that substitution is exactly
+        harmless, which is why it went unnoticed: ``veff_s = J[d_a + d_b] - K[d_s]``
+        is linear in the densities, so the mean is
+        ``J[d_tot] - 0.5(K[d_a] + K[d_b]) == J[d_tot] - 0.5 K[d_tot]`` either way
+        (verified to 3e-14 on a quintet Fe and triplet CH2).
+
+        For a **KS** low level it is not, because the xc functional is nonlinear in
+        the spin densities: ``e_xc[d_a, d_b] != e_xc[d/2, d/2]`` whenever the channels
+        differ.  Measured on triplet CH2 at ``xc_ll=PBE`` -- this repo's default --
+        ``max|veff_ll| `` differs by 0.0219 Ha and ``tr[gamma^A Delta veff_ll]`` by
+        0.0652 Ha (40.9 kcal/mol), entering ``h_emb``, every ``h_emb_s``, and hence
+        every downfolded Hamiltonian and ``v_emb``.
+
+        Restricted runs are bit-identical: ``_dm_a_spin`` is ``None`` there, so this
+        returns the same matrix as before.  On a closed shell the pair and the summed
+        input agree anyway (checked: both match a restricted ``RKS.get_veff`` to the
+        SCF residual), so the correction is confined to genuinely polarised channels.
+        """
+        # `getattr`: the stub adapters in the tests are built via `object.__new__` and
+        # never run `__init__`, so the attribute may not exist at all (the same reason
+        # `projection_energy` reads `_dm_a_spin_init` this way).
+        pair = getattr(self, "_dm_a_spin", None)
+        if pair is not None:
+            return pair
+        return self._dm_a_arr
+
+    @property
     def _dm_a_arr_init(self) -> np.ndarray:
         """The localized subsystem-A density γ^A (requires :meth:`run_low_level`)."""
         return self._require(self._dm_a_init, "the subsystem-A density")
@@ -1827,7 +1901,7 @@ class ProjectionEmbeddingAdapter:
         coincide) and so survives any test that does not vary the two levels
         independently.
         """
-        return self._fock_arr - self.ints.veff_ll(self._dm_a_arr)
+        return self._fock_arr - self.ints.veff_ll(self._dm_a_for_veff)
 
     @property
     def v_emb(self) -> np.ndarray:
@@ -1879,7 +1953,7 @@ class ProjectionEmbeddingAdapter:
             None if self._p_b_spin is None else self._p_b_spin[ispin],
             f"the spin-{ispin} projector P_B",
         )
-        h_emb_s = fock - self.ints.veff_ll(self._dm_a_arr)
+        h_emb_s = fock - self.ints.veff_ll(self._dm_a_for_veff)
         return h_emb_s - self.ints.hcore() - p_b_s
 
     # ---------------- orbital construction ---------------- #
@@ -2628,7 +2702,7 @@ class ProjectionEmbeddingAdapter:
             fock = self._fock_spin[ispin]  # type: ignore[index]
             # h_emb per channel: strip the low-level mean field, exactly as `h_emb` does
             # for the spin-summed Fock (see that property for why it is veff_ll).
-            h_emb_s = fock - self.ints.veff_ll(self._dm_a_arr)
+            h_emb_s = fock - self.ints.veff_ll(self._dm_a_for_veff)
             # Kept for `e_core` below, which must charge each channel's frozen core to
             # its OWN one-body operator -- the same one its h1 is built from.
             h_emb_pair.append(h_emb_s)

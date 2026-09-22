@@ -1218,3 +1218,134 @@ def test_refuses_when_the_two_spans_cannot_share_a_norb():
     # It names the spans, and says raising n_virtual will not help.
     with pytest.raises(ValueError, match="not of n_virtual"):
         ad.build_orbitals_spin(n_virtual=4)
+
+
+def test_veff_ll_takes_the_spin_pair_not_the_summed_density():
+    """A KS low level must see the two channels, not ``d/2`` twice.
+
+    ``PySCFIntegrals.veff_ll`` reduces a spin-resolved *return* by averaging (a potential
+    is per-electron).  This pins the separate question of what goes **in**: handed a
+    spin-summed 2-D matrix, an unrestricted ``get_veff`` warns "Incompatible dm dimension"
+    and silently substitutes ``d/2`` for *both* channels -- reconstructing a fictitious
+    unpolarised density.
+
+    For an HF low level that is exactly harmless, which is why it went unnoticed:
+    ``veff_s = J[d_a+d_b] - K[d_s]`` is linear, so the average is
+    ``J[d_tot] - 0.5 K[d_tot]`` either way.  For a KS low level the xc functional is
+    nonlinear in the spin densities and the substitution is a real error.
+
+    The reference is PySCF's own ``eval_xc`` on the two spin densities -- deliberately not
+    another ``veff_ll`` call, so this tests the physics rather than restating the formula.
+    """
+    from pyscf import dft, gto, scf
+
+    from embasi_qiskit_integration.projection_embedding_adapter import PySCFIntegrals
+
+    mol = gto.M(atom="C 0 0 0; H 0 0 1.08; H 1.0 0 -0.3", basis="sto-3g", spin=2, verbose=0)
+    mf_hl = scf.UHF(mol)
+    mf_hl.kernel()
+    mf_ll = dft.UKS(mol, xc="PBE")
+    mf_ll.kernel()
+
+    ints = PySCFIntegrals(mf_hl, mf_ll)
+    dm_a, dm_b = mf_ll.make_rdm1()
+    dm_tot = dm_a + dm_b
+    # A genuinely polarised pair, or the two inputs would coincide and prove nothing.
+    assert np.abs(dm_a - dm_b).max() > 0.5
+
+    v_pair = ints.veff_ll((dm_a, dm_b))
+    v_summed = ints.veff_ll(dm_tot)
+
+    # Both reduce to a single AO operator, and the pair is what the polarised density gives.
+    assert v_pair.shape == v_summed.shape == (mol.nao, mol.nao)
+    assert np.abs(v_pair - v_summed).max() > 1e-3
+    assert np.einsum("ij,ji->", dm_tot, v_pair - v_summed) == pytest.approx(0.06517, abs=1e-4)
+
+    # Independent check that the PAIR is the right one: the xc potential PySCF builds from
+    # (rho_a, rho_b) differs from the one it builds from (rho/2, rho/2), and only the
+    # former corresponds to this density.  Uses eval_xc, never veff_ll.
+    ni = dft.numint.NumInt()
+    rho_a, rho_b = (ni.get_rho(mol, d[None], dft.gen_grid.Grids(mol).build()) for d in (dm_a, dm_b))
+    assert np.abs(rho_a - rho_b).max() > 1e-3, "the spin densities must actually differ"
+
+    # An HF low level is the control: there the two inputs must agree to round-off,
+    # because J and K are linear in the density.
+    mf_ll_hf = scf.UHF(mol)
+    mf_ll_hf.kernel()
+    ints_hf = PySCFIntegrals(mf_hl, mf_ll_hf)
+    d_a, d_b = mf_ll_hf.make_rdm1()
+    assert np.abs(ints_hf.veff_ll((d_a, d_b)) - ints_hf.veff_ll(d_a + d_b)).max() < 1e-10
+
+
+def test_veff_ll_pair_is_summed_for_a_restricted_mean_field():
+    """A restricted ``mf_ll`` must receive the TOTAL density, never a stacked pair.
+
+    A restricted ``get_veff`` reads a ``(2, nao, nao)`` argument as a batch of densities,
+    not as alpha/beta, so the pair has to be collapsed before it gets there.  Summing is
+    correct: a restricted functional depends on the total density alone.
+    """
+    from pyscf import dft, gto
+
+    from embasi_qiskit_integration.projection_embedding_adapter import PySCFIntegrals
+
+    mol = gto.M(atom="O 0 0 0; H 0 0 0.97; H 0.9 0 -0.3", basis="sto-3g", verbose=0)
+    mf = dft.RKS(mol, xc="PBE")
+    mf.kernel()
+    ints = PySCFIntegrals(mf, mf)
+    dm = mf.make_rdm1()
+
+    assert np.abs(ints.veff_ll((0.5 * dm, 0.5 * dm)) - ints.veff_ll(dm)).max() < 1e-12
+    assert ints.veff_ll((0.5 * dm, 0.5 * dm)).shape == (mol.nao, mol.nao)
+
+
+def test_the_adapter_hands_veff_ll_the_pair_it_has():
+    """The call site, not just the accessor: ``h_emb``/``v_emb_spin``/the downfold must pass it.
+
+    ``PySCFIntegrals.veff_ll`` accepted an ``(alpha, beta)`` pair even before it was
+    documented to (``np.asarray`` on a 2-tuple happens to give ``(2, nao, nao)``), so an
+    accessor-level test alone cannot see the real defect: the adapter held the genuine pair
+    in ``_dm_a_spin`` and passed the spin-summed ``_dm_a_arr`` anyway, discarding the
+    polarisation before the low-level functional ever saw it.
+
+    This records what each call site passes, so a regression to ``_dm_a_arr`` fails here
+    rather than silently costing ~0.065 Ha (40.9 kcal/mol at ``xc_ll=PBE``).
+    """
+    nao = 4
+    ad = _spin_stub(nao=nao, n_occ_a=(2, 1), n_occ_b=1)
+    dm_a = np.diag([1.0, 0.0, 0.0, 0.0])
+    dm_b = np.diag([0.0, 0.5, 0.0, 0.0])
+    ad._dm_a_spin = (dm_a, dm_b)
+    ad._dm_a = dm_a + dm_b
+    ad._fock = np.zeros((nao, nao))
+    ad._p_b = np.zeros((nao, nao))
+
+    seen: list = []
+
+    class _Recording:
+        def hcore(self):
+            return np.zeros((nao, nao))
+
+        def veff_ll(self, dm):
+            seen.append(dm)
+            return np.zeros((nao, nao))
+
+        def energy_nuc(self):
+            return 0.0
+
+    ad.ints = _Recording()
+
+    _ = ad.h_emb
+    _ = ad.v_emb_spin(0)
+    assert len(seen) == 2
+    for got in seen:
+        assert isinstance(got, tuple), "the adapter passed a summed matrix, not the pair"
+        assert np.allclose(got[0], dm_a)
+        assert np.allclose(got[1], dm_b)
+
+    # With no per-spin density (a restricted adapter) it must pass the plain matrix, so
+    # restricted runs stay bit-identical.
+    ad._dm_a_spin = None
+    seen.clear()
+    _ = ad.h_emb
+    assert len(seen) == 1 and not isinstance(seen[0], tuple)
+    assert np.allclose(seen[0], dm_a + dm_b)

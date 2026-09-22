@@ -33,7 +33,14 @@ pytestmark = [pytest.mark.embasi, pytest.mark.slow]
 REF_NELEC = (5, 4)
 REF_NORB = 8
 REF_E_CORE = 25.2020184581
-REF_E_SOLVER = -53.5224926352
+# Re-measured 2026-09-22, after the `veff_ll` SPIN-PAIR INPUT fix.  `h_emb` (and every
+# `h_emb_s`) subtracts the low-level mean field, and that mean field was being evaluated at
+# a *depolarised* density: an unrestricted `get_veff` handed the spin-summed `_dm_a_arr`
+# silently substitutes `d/2` for both channels, and at `xc_ll=PBE` the xc functional is
+# nonlinear in the spin densities, so this is a real error (not the identity it is for an HF
+# low level).  `E_solver` moves 0.0283 Ha; `e_core` does not move at all, because it is
+# built from the same `h_emb_s` on both sides of the change at n_frozen_occ=0.
+REF_E_SOLVER = -53.5507789338
 # Re-measured 2026-09-21, after the PER-CHANNEL CONTRACTION fix, and this time checked
 # against physics rather than only re-pinned.  Every previous `REF_TOTAL` in this file was
 # wrong by ~39 Ha: the assembly contracted the spin-summed density against the spin-summed
@@ -59,12 +66,18 @@ REF_E_SOLVER = -53.5224926352
 # Superseded values, for the record (all wrong, each for a different reason):
 #   -110.5897439424  before the per-channel AO lift fix
 #   -110.5118889208  after it, still spin-summed in the energy assembly
-REF_TOTAL = -149.6093681127
-REF_CORRECTION = -0.0022215722
+#   -149.6093681127  after the per-channel contraction, still depolarising veff_ll's input
+# `total` moves only 8.3e-05 Ha even though `E_solver` moves 0.0283 Ha: the assembly
+# subtracts the same per-channel `v_emb_s` back off, so the shift very largely cancels and
+# what remains is the genuine physical change.  Still inside the non-interacting bracket
+# above (0.18 Ha from UPBE, 0.29 Ha from UHF), and the leak tightened from -3.6e-16 to
+# -1.1e-15 -- both numerical zeros.
+REF_TOTAL = -149.6092847931
+REF_CORRECTION = -0.0020832881
 # Each channel referenced to its own round-0 density AND contracted against its own
 # `v_emb_spin`.  Superseded values: (0.6160922018, -0.5928344203) with a halved reference,
 # then (0.0117289574, 0.0115288241) with the polarised reference but spin-summed operators.
-REF_CORRECTION_SPIN = (0.0002066411, -0.0024282133)
+REF_CORRECTION_SPIN = (0.0001734614, -0.0022567495)
 
 
 def _build_open_shell_adapter():
@@ -188,7 +201,12 @@ def test_downfold_matches_an_independently_rebuilt_hamiltonian(open_shell):
 
     adapter, alpha, beta, ham, result = open_shell
     c_a, c_b = alpha.c_active, beta.c_active
-    veff_ll = adapter.ints.veff_ll(adapter._dm_a_arr)
+    # The PAIR, not the spin-summed `_dm_a_arr`: at `xc_ll=PBE` the xc functional is
+    # nonlinear in the spin densities, so a summed input has PySCF substitute `d/2` for
+    # both channels and silently depolarise the low-level mean field (worth ~0.065 Ha on
+    # triplet CH2).  Passing `_dm_a_arr` here would restate the old bug and make this
+    # rebuild agree with a downfold that was wrong.
+    veff_ll = adapter.ints.veff_ll(adapter._dm_a_for_veff)
 
     # Frozen-core mean field, exactly as the downfold folds it in: the sum of the two
     # channels' own inactive densities (one electron per channel), shared by both
@@ -342,7 +360,12 @@ def test_frozen_core_e_core_charges_each_channel_to_its_own_fock(open_shell_froz
 
     dm_core_a, dm_core_b = c_in_a @ c_in_a.T, c_in_b @ c_in_b.T
     dm_core = dm_core_a + dm_core_b
-    veff_ll = adapter.ints.veff_ll(adapter._dm_a_arr)
+    # The PAIR, not the spin-summed `_dm_a_arr`: at `xc_ll=PBE` the xc functional is
+    # nonlinear in the spin densities, so a summed input has PySCF substitute `d/2` for
+    # both channels and silently depolarise the low-level mean field (worth ~0.065 Ha on
+    # triplet CH2).  Passing `_dm_a_arr` here would restate the old bug and make this
+    # rebuild agree with a downfold that was wrong.
+    veff_ll = adapter.ints.veff_ll(adapter._dm_a_for_veff)
     h_emb_a = adapter._fock_spin[0] - veff_ll
     h_emb_b = adapter._fock_spin[1] - veff_ll
 
@@ -419,7 +442,12 @@ def test_frozen_core_downfold_matches_an_independent_rebuild(open_shell_frozen):
         np.einsum("ij,ji->", dm_core_a, _k(dm_core_a))
         + np.einsum("ij,ji->", dm_core_b, _k(dm_core_b))
     )
-    veff_ll = adapter.ints.veff_ll(adapter._dm_a_arr)
+    # The PAIR, not the spin-summed `_dm_a_arr`: at `xc_ll=PBE` the xc functional is
+    # nonlinear in the spin densities, so a summed input has PySCF substitute `d/2` for
+    # both channels and silently depolarise the low-level mean field (worth ~0.065 Ha on
+    # triplet CH2).  Passing `_dm_a_arr` here would restate the old bug and make this
+    # rebuild agree with a downfold that was wrong.
+    veff_ll = adapter.ints.veff_ll(adapter._dm_a_for_veff)
     h_emb_a = adapter._fock_spin[0] - veff_ll
     h_emb_b = adapter._fock_spin[1] - veff_ll
 
