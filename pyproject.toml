@@ -18,7 +18,10 @@ dependencies = [
 
 [project.optional-dependencies]
 quantum  = ["qiskit>=1.0", "qiskit-aer", "qiskit-addon-sqd", "ffsim"]
-fermions = ["qiskit-fermions>=0.1.0"]
+# Pinned: 0.2.0's evolution operator carries complex coefficients, which qiskit's
+# PauliEvolutionGate rejects ("Operator contains complex coefficients"), failing the
+# SqDRIFT circuit tests.  Unpin once the generator is updated for that change.
+fermions = ["qiskit-fermions>=0.1.0,<0.2.0"]
 relabel  = ["pyomo>=6.7", "highspy>=1.7"]
 hardware = ["qiskit-ibm-runtime", "samplomatic"]
 # EmbASI (from source); pulls ase + asi4py.  scalapack4py/asi4py are pinned to the
