@@ -4,11 +4,14 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.20
     hooks:
-      # Lint (and auto-fix what it safely can).
+      # Lint (and auto-fix what it safely can).  `scripts/` is excluded to match CI:
+      # they are throwaway drivers, not shipped code.
       - id: ruff
         args: [--fix]
+        exclude: ^scripts/
       # Formatting — same as `ruff format --check` in CI.
       - id: ruff-format
+        exclude: ^scripts/
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0

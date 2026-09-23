@@ -24,10 +24,10 @@ jobs:
         run: uv pip install -e ".[dev,quantum,fermions,relabel,hardware,embed]"
 
       - name: Check formatting (ruff)
-        run: uv run ruff format --check src scripts tests
+        run: uv run ruff format --check src tests
 
       - name: Lint (ruff)
-        run: uv run ruff check src scripts tests
+        run: uv run ruff check src tests
 
       # EMBASI_AVAILABLE=1 un-skips the `embasi`-marked tests, which need the `embed`
       # extra installed above.  They are PySCF-backed, so they need no FHI-aims binary.
