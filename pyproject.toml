@@ -43,7 +43,11 @@ all      = ["embasi-qiskit-integration[quantum,fermions,relabel,hardware,embed]"
 embasi-qiskit-integration = "embasi_qiskit_integration.cli:main"
 
 [tool.pytest.ini_options]
-markers = ["embasi: requires EmbASI + FHI-aims", "slow: heavy simulation"]
+markers = [
+    "embasi: requires EmbASI + FHI-aims",
+    "slow: heavy simulation",
+    "shipped_aer_default: see the real Aer default, not the suite's statevector pin",
+]
 addopts = "-m 'not embasi'"
 testpaths = ["tests"]
 # The vendored EmbASI/ checkout ships its own FHI-aims tests; keep them out.

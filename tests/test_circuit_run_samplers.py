@@ -346,6 +346,7 @@ def test_mps_with_a_bond_cap_still_samples_correctly():
     assert sum(counts.values()) == 2000
 
 
+@pytest.mark.shipped_aer_default
 def test_build_sampler_threads_the_method_through():
     from embasi_qiskit_integration.circuit_run import build_sampler
 
@@ -357,6 +358,7 @@ def test_build_sampler_threads_the_method_through():
     assert build_sampler("aer").method == "matrix_product_state"
 
 
+@pytest.mark.shipped_aer_default
 def test_aer_options_are_refused_on_non_aer_samplers(tmp_path):
     """Same contract as `options`: silently ignoring a simulation knob is worse."""
     import json
@@ -372,6 +374,7 @@ def test_aer_options_are_refused_on_non_aer_samplers(tmp_path):
         build_sampler("mock", counts=str(counts_file), mps_max_bond_dimension=4)
 
 
+@pytest.mark.shipped_aer_default
 def test_sampler_method_lands_in_the_diagnostics():
     """A result must say which simulator produced it, not just "AerSampler"."""
     from types import SimpleNamespace

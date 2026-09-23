@@ -86,34 +86,18 @@ For CI / offline runs, replay frozen counts with `MockSampler` instead of
 `AerSampler` — same interface, fully deterministic.
 
 **Aer is a family of simulators, not one.** `AerSampler` defaults to
-`matrix_product_state`, which reaches wider registers than `statevector`; pass
-`method="statevector"` for an exact simulation instead. Cap the bond dimension to buy
-the memory saving:
+`matrix_product_state`, which reaches registers `statevector` cannot: on an entangling
+chain at 2000 shots, 30 qubits takes 0.01 s under MPS against 23.94 s under
+`statevector`, whose memory doubles per qubit.
 
 ```python
-AerSampler(method="matrix_product_state", mps_max_bond_dimension=64)
+AerSampler(method="statevector")                                   # exact, small spaces
+AerSampler(method="matrix_product_state", mps_max_bond_dimension=64)  # capped MPS
 ```
 
-From the CLI: `--aer_method statevector`, or `--mps_max_bond_dimension 64` to cap the
-default MPS. The method is validated against the installed Aer, so a typo fails
-immediately, and it is recorded in `res.diagnostics["sampler_method"]`. Seeds do not
-reproduce across methods.
-
-Why MPS is the default — a GHZ-style entangling chain, 2000 shots:
-
-| qubits | `statevector` | `matrix_product_state` |
-|---|---|---|
-| 24 | 0.37 s | 0.02 s |
-| 30 | 23.94 s | 0.01 s |
-
-`statevector` memory doubles per qubit; MPS stays flat while the bond dimension does, so
-it rescues the wide registers `statevector` cannot reach at all.
-
-**It is not a free win.** On *narrow, deliberately entangling* circuits — the SqDRIFT
-regime — uncapped MPS is 1.3-3x *slower* than `statevector`, because the bond dimension
-grows toward the exact state. The test suite is ~7x slower under the MPS default
-(32 min vs 4.5 min) for exactly this reason. Pass `--aer_method statevector` for small
-active spaces, and cap `--mps_max_bond_dimension` to keep MPS cheap on large ones.
+From the CLI: `--aer_method statevector` or `--mps_max_bond_dimension 64`. The method is
+validated against the installed Aer, so a typo fails immediately, and it is recorded in
+`res.diagnostics["sampler_method"]`. Seeds do not reproduce across methods.
 
 ### 3. SQD on real quantum hardware
 
