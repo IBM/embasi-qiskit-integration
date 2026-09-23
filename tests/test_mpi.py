@@ -35,38 +35,45 @@ def _find_launcher() -> str | None:
     return None
 
 
-def _mpi_available() -> bool:
-    """``mpirun`` present, ``mpi4py`` importable, and the two from the same MPI.
+def _multirank_launch_works() -> bool:
+    """Can this environment actually run a 2-rank job that shares one COMM_WORLD?
 
-    The vendor check is the one that matters in CI: the PyPI ``mpi4py`` wheels are built
-    against MPICH, and launching an MPICH-linked extension under OpenMPI's ``mpirun``
-    aborts before the payload runs -- with empty stdout and stderr, so the failure says
-    nothing about its cause.  Skipping with a vendor mismatch named is far better than
-    two blank assertion failures.
+    Probed by launching one, rather than inferred from version strings.  A launcher and
+    an ``mpi4py`` from different MPI installs -- the PyPI wheels bundle their own runtime
+    -- initialise a SINGLETON communicator per process instead of failing: the job
+    degrades to N independent 1-rank runs, every process reporting rank 0 of size 1.
+
+    That is an environment fault, not a defect in the code under test, and no source
+    change fixes it, so the tests skip rather than fail.  The probe is the same question
+    they ask, which is why it cannot drift away from them the way a vendor comparison did.
     """
-    if _find_launcher() is None:
+    launcher = _find_launcher()
+    if launcher is None:
         return False
     try:
-        from mpi4py import MPI
+        import mpi4py  # noqa: F401
     except ImportError:
         return False
-    vendor = MPI.get_vendor()[0]
+    probe = "from mpi4py import MPI; print(MPI.COMM_WORLD.Get_size())"
     try:
-        banner = subprocess.run(
-            [_find_launcher() or "mpirun", "--version"],
+        proc = subprocess.run(
+            [launcher, "-n", "2", sys.executable, "-c", probe],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=120,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):  # pragma: no cover - probed once
-        return True
-    text = banner.stdout + banner.stderr
-    launcher = "Open MPI" if "Open MPI" in text else "MPICH" if "MPICH" in text else vendor
-    return launcher.split()[0].upper() in vendor.upper() or vendor.upper() in launcher.upper()
+        return False
+    # Two ranks in one communicator print "2" twice; a singleton launch prints "1" twice.
+    return proc.returncode == 0 and [ln.strip() for ln in proc.stdout.split()] == ["2", "2"]
 
 
-requires_mpi = pytest.mark.skipif(not _mpi_available(), reason="needs mpirun + mpi4py")
+requires_mpi = pytest.mark.skipif(
+    not _multirank_launch_works(),
+    reason="needs an MPI that launches 2 ranks in one COMM_WORLD (launcher and mpi4py "
+    "from the same install)",
+)
 
 
 def _mpirun_argv(nranks: int) -> list[str]:
