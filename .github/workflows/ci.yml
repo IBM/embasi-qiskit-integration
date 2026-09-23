@@ -17,8 +17,11 @@ jobs:
       - name: Set up Python
         run: uv venv --python 3.12
 
+      # MPICH, not OpenMPI: the mpi4py wheels on PyPI are built against MPICH, and
+      # launching an MPICH-linked extension with OpenMPI's `mpirun` fails before the
+      # payload runs -- an empty-stdout/stderr abort that says nothing about why.
       - name: Install MPI (EmbASI needs mpi4py)
-        run: sudo apt-get update && sudo apt-get install -y libopenmpi-dev openmpi-bin
+        run: sudo apt-get update && sudo apt-get install -y libmpich-dev mpich
 
       - name: Install project
         run: uv pip install -e ".[dev,quantum,fermions,relabel,hardware,embed]"

@@ -22,28 +22,89 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _find_launcher() -> str | None:
+    """The MPI launcher on PATH.
+
+    Debian/Ubuntu's ``mpich`` ships ``mpirun.mpich``/``mpiexec.mpich`` and provides the
+    bare ``mpirun`` only through update-alternatives, which is not always configured, so
+    take the first name that exists rather than assuming ``mpirun``.
+    """
+    for name in ("mpirun", "mpiexec", "mpirun.mpich", "mpiexec.mpich"):
+        if shutil.which(name):
+            return name
+    return None
+
+
 def _mpi_available() -> bool:
-    if shutil.which("mpirun") is None:
+    """``mpirun`` present, ``mpi4py`` importable, and the two from the same MPI.
+
+    The vendor check is the one that matters in CI: the PyPI ``mpi4py`` wheels are built
+    against MPICH, and launching an MPICH-linked extension under OpenMPI's ``mpirun``
+    aborts before the payload runs -- with empty stdout and stderr, so the failure says
+    nothing about its cause.  Skipping with a vendor mismatch named is far better than
+    two blank assertion failures.
+    """
+    if _find_launcher() is None:
         return False
     try:
-        import mpi4py  # noqa: F401
+        from mpi4py import MPI
     except ImportError:
         return False
-    return True
+    vendor = MPI.get_vendor()[0]
+    try:
+        banner = subprocess.run(
+            [_find_launcher() or "mpirun", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - probed once
+        return True
+    text = banner.stdout + banner.stderr
+    launcher = "Open MPI" if "Open MPI" in text else "MPICH" if "MPICH" in text else vendor
+    return launcher.split()[0].upper() in vendor.upper() or vendor.upper() in launcher.upper()
 
 
 requires_mpi = pytest.mark.skipif(not _mpi_available(), reason="needs mpirun + mpi4py")
 
 
+def _mpirun_argv(nranks: int) -> list[str]:
+    """``mpirun`` plus the flags a containerised OpenMPI needs to launch at all.
+
+    A CI runner often has fewer cores than ranks, and OpenMPI refuses to
+    oversubscribe by default; it also probes transports that are unavailable in a
+    container, and aborts as root without an explicit opt-in.  Each of those kills
+    the launcher *before* the payload runs, so the failure arrives with empty
+    stdout AND stderr.  The flags are OpenMPI-specific, so they are only added when
+    ``mpirun --version`` says OpenMPI -- MPICH's Hydra rejects unknown flags.
+    """
+    argv = [_find_launcher() or "mpirun", "-n", str(nranks)]
+    try:
+        banner = subprocess.run(
+            [argv[0], "--version"], capture_output=True, text=True, timeout=30, check=False
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - probed once
+        return argv
+    if "Open MPI" in (banner.stdout + banner.stderr):
+        argv += ["--oversubscribe", "--allow-run-as-root"]
+    return argv
+
+
 def _run_mpi(code: str, nranks: int = 2) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["mpirun", "-n", str(nranks), sys.executable, "-c", textwrap.dedent(code)],
+        [*_mpirun_argv(nranks), sys.executable, "-c", textwrap.dedent(code)],
         capture_output=True,
         text=True,
         timeout=300,
         check=False,
         cwd=REPO_ROOT,
     )
+
+
+def _mpi_failure(proc: subprocess.CompletedProcess) -> str:
+    """Both streams, since a launcher-level failure leaves stderr empty."""
+    return f"returncode={proc.returncode}\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
 
 
 @requires_mpi
@@ -64,7 +125,7 @@ def test_rank0_solve_broadcasts_result():
         print(f"RANK {rank} ENERGY {res.energy:.10f}")
     """
     proc = _run_mpi(code)
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode == 0, _mpi_failure(proc)
 
     energies = [
         float(line.split()[-1]) for line in proc.stdout.splitlines() if line.startswith("RANK ")
@@ -97,14 +158,14 @@ def test_embedding_workflow_mpi_orchestration():
     """
     driver = REPO_ROOT / "tests" / "_mpi_workflow_mock.py"
     proc = subprocess.run(
-        ["mpirun", "-n", "2", sys.executable, str(driver)],
+        [*_mpirun_argv(2), sys.executable, str(driver)],
         capture_output=True,
         text=True,
         timeout=300,
         check=False,
         cwd=REPO_ROOT,
     )
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode == 0, _mpi_failure(proc)
 
     # Rank-0-only banner appears exactly once (rank guarding works).
     assert proc.stdout.count("running under MPI with 2 ranks") == 1
