@@ -85,6 +85,20 @@ print(res.energy)            # within 2e-3 Ha of FCI; res.diagnostics carries pr
 For CI / offline runs, replay frozen counts with `MockSampler` instead of
 `AerSampler` — same interface, fully deterministic.
 
+**Aer is a family of simulators, not one.** `AerSampler` defaults to
+`matrix_product_state`, which reaches registers `statevector` cannot: on an entangling
+chain at 2000 shots, 30 qubits takes 0.01 s under MPS against 23.94 s under
+`statevector`, whose memory doubles per qubit.
+
+```python
+AerSampler(method="statevector")                                   # exact, small spaces
+AerSampler(method="matrix_product_state", mps_max_bond_dimension=64)  # capped MPS
+```
+
+From the CLI: `--aer_method statevector` or `--mps_max_bond_dimension 64`. The method is
+validated against the installed Aer, so a typo fails immediately, and it is recorded in
+`res.diagnostics["sampler_method"]`. Seeds do not reproduce across methods.
+
 ### 3. SQD on real quantum hardware
 
 The sampler is the only thing that changes.

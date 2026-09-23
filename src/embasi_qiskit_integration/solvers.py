@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from typing import Any
+
 import numpy as np
 
 from embasi_qiskit_integration._versions import collect_versions
@@ -29,6 +31,27 @@ class ActiveSpaceSolver(ABC):
     def solve(self, ham: EmbeddedHamiltonian) -> SolverResult: ...
 
 
+def _sampler_backend_diagnostics(sampler) -> dict:
+    """Simulation-method provenance for whichever sampler ran, if it has any.
+
+    Duck-typed rather than isinstance-checked so a custom sampler exposing the same
+    attributes is reported too, and a sampler with none (``MockSampler``,
+    ``RuntimeSampler``) contributes nothing rather than ``None`` entries.
+    """
+    out: dict = {}
+    method = getattr(sampler, "method", None)
+    if method is not None:
+        out["sampler_method"] = method
+    for attr, key in (
+        ("mps_max_bond_dimension", "mps_max_bond_dimension"),
+        ("mps_truncation_threshold", "mps_truncation_threshold"),
+    ):
+        value = getattr(sampler, attr, None)
+        if value is not None:
+            out[key] = value
+    return out
+
+
 class FCISolver(ActiveSpaceSolver):
     """Exact full configuration interaction via PySCF — the numerical oracle."""
 
@@ -36,16 +59,48 @@ class FCISolver(ActiveSpaceSolver):
         from pyscf import fci
 
         norb = ham.norb
-        e, ci = fci.direct_spin1.kernel(ham.h1, ham.h2, norb, ham.nelec)
-        rdm1, rdm2 = fci.direct_spin1.make_rdm12(ci, norb, ham.nelec)
-        rdm1a, rdm1b = fci.direct_spin1.make_rdm1s(ci, norb, ham.nelec)
+        if ham.is_spin_dependent:
+            # A genuine spin-dependent downfold: the two channels see different
+            # one-body operators, which `direct_spin1` cannot express (it takes a
+            # single h1e and distinguishes spin only through `nelec`).
+            # `direct_uhf` takes the (h1a, h1b) pair, and (eri_aa, eri_ab, eri_bb)
+            # for the two-body part -- the same spatial-orbital ERIs in all three
+            # slots here, since h2 is spin-free by construction.
+            solver = fci.direct_uhf
+            h1e: Any = (ham.h1a, ham.h1b)
+            if ham.has_spin_dependent_eri:
+                # (aa, ab, bb) over the two different orbital sets -- what direct_uhf
+                # actually wants (see its absorb_h1e, which unpacks exactly this order).
+                eri: Any = ham.h2_spin
+                tag = "pyscf-fci-uhf"
+            else:
+                # Spin-free h2 in all three slots: correct only when both channels share
+                # an orbital set, which a per-spin downfold does not.
+                eri = (ham.h2, ham.h2, ham.h2)
+                tag = "pyscf-fci-uhf-spinfree-eri"
+        else:
+            solver = fci.direct_spin1
+            h1e, eri, tag = ham.h1, ham.h2, "pyscf-fci"
+
+        e, ci = solver.kernel(h1e, eri, norb, ham.nelec)
+        rdm1a, rdm1b = solver.make_rdm1s(ci, norb, ham.nelec)
+        if ham.is_spin_dependent:
+            # `direct_uhf` returns spin-resolved blocks, so combine them here: rdm1 is the
+            # sum, and rdm2 is `aa + bb + ab + ab^T` since the alpha-beta block appears
+            # once in each ordering.
+            _, rdm2s = solver.make_rdm12s(ci, norb, ham.nelec)
+            aa, ab, bb = (np.asarray(x) for x in rdm2s)
+            rdm2 = aa + bb + ab + ab.transpose(2, 3, 0, 1)
+            rdm1 = np.asarray(rdm1a) + np.asarray(rdm1b)
+        else:
+            rdm1, rdm2 = solver.make_rdm12(ci, norb, ham.nelec)
         return SolverResult(
             energy=e + ham.e_core,
             rdm1=np.asarray(rdm1),
             rdm2=np.asarray(rdm2),
             rdm1a=np.asarray(rdm1a),
             rdm1b=np.asarray(rdm1b),
-            diagnostics={"solver": "pyscf-fci"},
+            diagnostics={"solver": tag},
         )
 
 
@@ -203,6 +258,7 @@ class SQDSolver(ActiveSpaceSolver):
             method=self.method,
             n_circuits=len(circuits),
             sampler=type(self.sampler).__name__,
+            **_sampler_backend_diagnostics(self.sampler),
             versions=collect_versions(),
             seed=self.seed,
             fcidump_sha=ham.meta.get("sha"),

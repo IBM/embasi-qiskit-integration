@@ -39,6 +39,11 @@ class SolveCommand(BaseSettings):
     directory: CliPositionalArg[str]
     solver: Literal["sqd", "fci"] = "sqd"
     sampler: Literal["aer", "mock", "runtime"] = "runtime"
+    # Which Aer simulator, when --sampler aer; None takes the package default (MPS).
+    aer_method: str | None = None
+    # MPS only; the cap is what buys the memory saving.
+    mps_max_bond_dimension: int | None = None
+    mps_truncation_threshold: float | None = None
     counts: str | None = None
     backend: str | None = None  # runtime backend name; else least-busy
     optimization_level: int = 1  # runtime ISA-transpile level (0-3)
@@ -161,6 +166,9 @@ class SolveCommand(BaseSettings):
                 backend=self.backend,
                 optimization_level=self.optimization_level,
                 default_shots=self.shots,
+                aer_method=self.aer_method,
+                mps_max_bond_dimension=self.mps_max_bond_dimension,
+                mps_truncation_threshold=self.mps_truncation_threshold,
                 options=self._sampler_options(),
                 enable_readout_characterisation=self.enable_readout_characterisation,
                 readout_error_threshold=self.readout_error_threshold,

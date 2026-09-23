@@ -18,13 +18,16 @@ jobs:
         run: uv venv --python 3.12
 
       - name: Install project
-        run: uv pip install -e ".[dev,quantum,fermions]"
+        run: uv pip install -e ".[dev,quantum,fermions,relabel,hardware,embed]"
 
       - name: Check formatting (ruff)
-        run: uv run ruff format --check src scripts tests
+        run: uv run ruff format --check src tests
 
       - name: Lint (ruff)
-        run: uv run ruff check src scripts tests
+        run: uv run ruff check src tests
 
       - name: Run unit tests
-        run: uv run pytest -q
+        timeout-minutes: 30
+        run: uv run pytest -q -ra
+        env:
+          EMBASI_AVAILABLE: "1"

@@ -14,6 +14,8 @@ collected via the addon's ``callback`` hook and stored in ``diagnostics``.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 from embasi_qiskit_integration.circuit_run.spin_layout import (
@@ -122,6 +124,25 @@ def run_sqd(
     if include_configurations is not None:
         extra["include_configurations"] = include_configurations
 
+    if ham.is_spin_dependent:
+        # The addon takes a single `one_body_tensor`, so fall back to the spin-averaged
+        # `h1` and say so: the result is ROHF-like, not UHF-quality.  The warning names
+        # the TWO-BODY loss as well, deliberately -- `ham.h2` is alpha-only, so this also
+        # drops `h2_spin`'s (aa, ab, bb) triple, the larger of the two approximations.
+        h2_note = (
+            " The two-body tensor is alpha-only as well (h2_spin's (aa, ab, bb) triple "
+            "cannot be passed either), which is typically the LARGER error of the two."
+            if ham.has_spin_dependent_eri
+            else ""
+        )
+        warnings.warn(
+            "this Hamiltonian carries a spin-dependent (h1a, h1b) pair, but SQD's "
+            "diagonalize_fermionic_hamiltonian accepts only one one-body tensor; "
+            "using the spin-averaged h1. The result is spin-restricted (ROHF-like) "
+            f"even though the downfold was not.{h2_note} Use the FCI solver for a "
+            "genuine unrestricted solve.",
+            stacklevel=2,
+        )
     result = diagonalize_fermionic_hamiltonian(
         ham.h1,
         ham.h2,

@@ -142,3 +142,74 @@ def test_check_particle_number_rejects_a_non_square_rdm():
     result = SolverResult(energy=-1.0, rdm1=np.zeros((2, 3)))
     with pytest.raises(ValueError, match="square"):
         result.check_particle_number(2)
+
+
+# --------------------------------------------------------------------------- #
+# spin-dependent one-body pair  (Stage 2)
+# --------------------------------------------------------------------------- #
+def _spin_pair(norb=3):
+    """A Hermitian (h1a, h1b) pair whose channels genuinely differ."""
+    h1a = np.diag([-1.2, -0.4, 0.3]) + np.eye(norb, k=1) * 0.1
+    h1a = h1a + h1a.T
+    h1b = np.diag([-1.0, -0.3, 0.35]) + np.eye(norb, k=1) * 0.05
+    h1b = h1b + h1b.T
+    return h1a, h1b
+
+
+def test_spin_dependent_pair_is_accepted_and_flagged():
+    norb = 3
+    h1a, h1b = _spin_pair(norb)
+    h2 = np.zeros((norb,) * 4)
+    ham = EmbeddedHamiltonian(
+        h1=0.5 * (h1a + h1b), h2=h2, e_core=0.0, nelec=(2, 1), h1a=h1a, h1b=h1b
+    )
+    assert ham.is_spin_dependent
+    np.testing.assert_allclose(ham.h1a, h1a)
+    np.testing.assert_allclose(ham.h1b, h1b)
+
+
+def test_absent_pair_reports_spin_restricted():
+    """``h1`` alone must keep behaving exactly as before -- the pair is additive."""
+    norb = 3
+    h2 = np.zeros((norb,) * 4)
+    ham = EmbeddedHamiltonian(h1=np.eye(norb), h2=h2, e_core=0.0, nelec=(2, 1))
+    assert not ham.is_spin_dependent
+    assert ham.h1a is None and ham.h1b is None
+
+
+def test_half_a_one_body_pair_is_rejected():
+    """Same all-or-nothing rule as ``SolverResult``'s rdm1a/rdm1b.
+
+    A solver that found only one half would use one spin's operator for both
+    channels -- a silent, plausible, wrong answer.
+    """
+    norb = 3
+    h1a, _ = _spin_pair(norb)
+    h2 = np.zeros((norb,) * 4)
+    with pytest.raises(ValueError, match="together"):
+        EmbeddedHamiltonian(h1=np.eye(norb), h2=h2, e_core=0.0, nelec=(2, 1), h1a=h1a)
+
+
+def test_non_hermitian_channel_is_rejected():
+    norb = 3
+    h1a, h1b = _spin_pair(norb)
+    h1b = h1b.copy()
+    h1b[0, 1] += 0.5  # break symmetry
+    h2 = np.zeros((norb,) * 4)
+    with pytest.raises(ValueError, match="h1b is not Hermitian"):
+        EmbeddedHamiltonian(h1=np.eye(norb), h2=h2, e_core=0.0, nelec=(2, 1), h1a=h1a, h1b=h1b)
+
+
+def test_mismatched_channel_shape_is_rejected():
+    norb = 3
+    h1a, _ = _spin_pair(norb)
+    h2 = np.zeros((norb,) * 4)
+    with pytest.raises(ValueError, match="to match h1"):
+        EmbeddedHamiltonian(
+            h1=np.eye(norb),
+            h2=h2,
+            e_core=0.0,
+            nelec=(2, 1),
+            h1a=h1a,
+            h1b=np.eye(norb + 1),
+        )

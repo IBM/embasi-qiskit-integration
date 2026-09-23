@@ -45,3 +45,53 @@ def rng(rng_seed: int) -> np.random.Generator:
 @pytest.fixture
 def data_dir() -> Path:
     return Path(__file__).parent / "data"
+
+
+# The shipped default is `matrix_product_state`, but uncapped MPS is slower on the narrow
+# entangling circuits the suite builds (~32 min vs ~4.5 min for the full run).  Tests
+# exercise circuit and solver logic, not simulator scaling, so pin them to `statevector`.
+TEST_AER_METHOD = "statevector"
+
+
+@pytest.fixture(autouse=True)
+def _statevector_aer_in_tests(request, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default the Aer sampler to ``statevector`` for the suite only.
+
+    Opt out with ``@pytest.mark.shipped_aer_default`` -- the tests that assert what the
+    *shipped* default is must see the real one, or they would pin this fixture instead.
+    """
+    if request.node.get_closest_marker("shipped_aer_default"):
+        return
+    try:
+        from embasi_qiskit_integration.circuit_run import aer as _aer
+    except ImportError:  # qiskit-aer absent: the classical/replay paths do not need it
+        return
+
+    monkeypatch.setattr(
+        _aer.AerSampler.__init__,
+        "__kwdefaults__",
+        {**(_aer.AerSampler.__init__.__kwdefaults__ or {}), "method": TEST_AER_METHOD},
+    )
+    # Patching the resolved default covers `build_sampler` and the pydantic settings
+    # classes too, since all of them end up constructing an `AerSampler`.
+    import embasi_qiskit_integration.circuit_run as _cr
+
+    monkeypatch.setattr(_cr, "_DEFAULT_AER_METHOD", TEST_AER_METHOD)
+
+
+def require_module(name: str, reason: str) -> object:
+    """``pytest.importorskip`` that also skips when the module imports but is unusable.
+
+    ``importorskip`` only catches ``ImportError``.  ``ase`` imports ``mpi4py`` at module
+    scope, and ``mpi4py`` raises ``RuntimeError("cannot load MPI library")`` when it is
+    installed without a system ``libmpi`` -- so the dependency is effectively absent while
+    presenting as a hard error.  Skip on that too.
+    """
+    import importlib
+
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        pytest.skip(reason)
+    except (RuntimeError, OSError) as exc:
+        pytest.skip(f"{reason} ({name} imports but is unusable: {exc})")

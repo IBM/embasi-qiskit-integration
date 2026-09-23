@@ -147,8 +147,10 @@ def main() -> None:
     mol = pyscf.M(atom="H 0 0 0; H 0 0 0.74; H 0 0 1.48; H 0 0 2.22", basis="sto-3g")
     mf_hl = mol.RHF()
 
-    if size > 1:
-        log("running under MPI with 2 ranks")
+    # Unconditional and with the real size: a launch that failed to form a
+    # multi-rank communicator degrades to N independent 1-rank jobs, and printing
+    # the size is what makes that visible instead of silently plausible.
+    log(f"running under MPI with {size} ranks")
 
     mock = _MockProjectionEmbedding(mol, mu=1.0e6, n_occ_a=1)
     adapter = ProjectionEmbeddingAdapter(mock, PySCFIntegrals(mf_hl), mu=1.0e6)

@@ -38,7 +38,15 @@ pyscf = pytest.importorskip("pyscf")
 
 from embasi_qiskit_integration.embedding import seed_for_cycle  # noqa:E402
 
-from test_outer_loop import _build_adapter  # noqa:E402
+from test_outer_loop import (  # noqa:E402
+    _build_adapter,
+    _FeedbackMockEmbedding,
+)
+
+from embasi_qiskit_integration.projection_embedding_adapter import (  # noqa:E402
+    ProjectionEmbeddingAdapter,
+    PySCFIntegrals,
+)
 
 
 def _ran_adapter(**kwargs):
@@ -243,3 +251,81 @@ def test_maybe_reseed_matches_seed_for_cycle(base, reseed):
         workflow._maybe_reseed(solver, cycle)
         observed.append(solver.seed)
     assert observed == [seed_for_cycle(base, c, reseed=reseed) for c in range(6)]
+
+
+def test_restore_state_rejects_a_different_a_b_partition():
+    """The real hazard the fingerprint exists for: same shapes, different subsystem A.
+
+    ``a_nmos`` (CLI ``--a_nmos``, forwarded as ``a_nspade_mos``) moves the SPADE cut, so
+    two runs on an *identical* molecule, basis, ``mu``, projection and xc partition
+    differently.  Every other guard passes on such a cross-restore: ``nao`` matches, every
+    array keeps its shape, ``tr(gamma^A S)`` and ``tr(gamma^B S)`` are both integral so
+    ``_validate_densities`` is satisfied, and the projector leak comes out at ~2e-11 --
+    a clean numerical zero.  Only the energy is wrong, by ~1.4 Ha (859 kcal/mol) here.
+
+    ``test_restore_state_rejects_a_mismatched_fingerprint`` above names exactly this case
+    and then substitutes ``mu``, so before ``a_nelec`` joined the fingerprint nothing in
+    the suite actually varied the partition across an export/restore.
+    """
+
+    # H6 (3 occupied) so both A=2 and A=1 are valid partitions of the same molecule;
+    # the H4 default only admits n_occ_a=1.
+    def _h6(n_occ_a):
+        mol = pyscf.M(atom="; ".join(f"H 0 0 {0.74 * i:.2f}" for i in range(6)), basis="sto-3g")
+        mock = _FeedbackMockEmbedding(mol, mu=1.0e6, n_occ_a=n_occ_a)
+        ad = ProjectionEmbeddingAdapter(mock, PySCFIntegrals(mol.RHF()), mu=1.0e6)
+        ad.run_low_level()
+        return ad
+
+    sender = _h6(2)
+    receiver = _h6(1)
+
+    # Same basis, same mu, same shapes -- the fields that previously made up the whole
+    # fingerprint all agree.
+    fa, fb = sender.state_fingerprint(), receiver.state_fingerprint()
+    for shared in ("nao", "mu", "projection", "unrestricted", "basis", "geometry_hash"):
+        assert fa[shared] == fb[shared], f"{shared} should match; this test needs it to"
+    assert np.asarray(sender._dm_a).shape == np.asarray(receiver._dm_a).shape
+
+    # ...and the partition is what differs, so the fingerprint must catch it.
+    assert fa["a_nelec"] != fb["a_nelec"], "the partition observable must distinguish them"
+    with pytest.raises(ValueError, match="does not match this adapter"):
+        receiver.restore_state(sender.export_state())
+
+    # A matching partition still round-trips, so the new field is not over-strict.
+    twin = _h6(2)
+    twin.restore_state(sender.export_state())
+    np.testing.assert_allclose(np.asarray(twin._dm_a), np.asarray(sender._dm_a), atol=1e-12)
+
+
+def test_restore_state_clears_a_stale_relaxed_fock():
+    """``relax_active_hf``'s reference must not survive a restore into another potential.
+
+    ``relax_active_hf`` converges the embedded-HF Fock *in the frozen ``v_emb``/``P_B``
+    potential ``run_low_level`` built*.  ``restore_state`` then replaces ``v_emb``,
+    ``P_B``, ``F_emb`` and the densities with the **sender's** -- so a surviving
+    ``_fock_relaxed`` was converged against a potential the adapter no longer holds, and
+    ``build_orbitals(use_relaxed=True)`` consumes it without complaint (measured
+    ``max|_fock_relaxed - _fock| = 0.137``, orbital energies 0.982 Ha apart).
+
+    It is not in ``_STATE_ARRAYS``, so it cannot be restored; clearing it is the same rule
+    the per-spin arrays already follow, and it fails loudly (``_require``) instead of
+    silently diagonalizing a stale operator.
+    """
+    receiver = _ran_adapter()
+    # Stand in for relax_active_hf() without needing a live embedded SCF: what matters is
+    # that a non-None relaxed Fock is present before the restore.
+    receiver._fock_relaxed = np.asarray(receiver._fock, dtype=float) + 0.1 * np.eye(
+        np.asarray(receiver._fock).shape[0]
+    )
+    receiver._dm_a_relaxed = np.asarray(receiver._dm_a, dtype=float).copy()
+    assert receiver._fock_relaxed is not None
+
+    receiver.restore_state(_ran_adapter().export_state())
+
+    assert receiver._fock_relaxed is None, "a stale relaxed Fock survived the restore"
+    assert receiver._dm_a_relaxed is None
+    assert receiver._fock_relaxed_spin is None
+    # And the failure is loud, not a silent fallback to the unrelaxed Fock.
+    with pytest.raises(RuntimeError, match="relax_active_hf"):
+        _ = receiver._fock_relaxed_arr

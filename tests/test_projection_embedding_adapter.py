@@ -324,42 +324,28 @@ def test_low_level_diagnostics_do_not_swap_the_two_energies(adapter):
 def test_pbe_in_pbe_null_case_A_terms_reduce_to_fragment_hf_minus_pbe(adapter, orbitals_full):
     """Full A space, γ̃^A = γ^A: the A-level terms cancel down to HF - PBE.
 
-    This is the decisive physics check the plumbing tests miss.  With the *full*
-    subsystem-A space active and the fed-back correlated density set equal to the
-    reference γ^A, the Eq. 8 correction ``tr[(γ̃^A - γ^A) v_emb]`` is exactly zero,
-    so the assembled total reduces to::
+    The decisive physics check the plumbing tests miss.  With the full subsystem-A space
+    active and the fed-back density equal to the reference γ^A, the Eq. 8 correction
+    ``tr[(γ̃^A - γ^A) v_emb]`` is exactly zero, so the total reduces to::
 
         E_PbE = E_low(AB) - E_low(A) + E_high(A)
 
-    and the *only* thing separating this from E_low(AB) is the A-term difference
-    ``E_high(A) - E_low(A)``.  We build the "solver result" from γ^A itself -- the
-    energy of the *embedded* Hamiltonian evaluated at γ^A -- so no sampling or
-    correlation noise enters.
+    leaving only the A-term difference ``E_high(A) - E_low(A)``.  The "solver result" is
+    built from γ^A itself, so no sampling or correlation noise enters.
 
-    What that A-term difference must equal is the subtle part, and it is what a
-    ~4 Ha bookkeeping bug once hid.  Two footings had to be reconciled first:
-    ``E_high(A)`` carries the *full-supersystem* nuclear frame
-    (from the downfold's ``e_core``), while EmbASI's ``E_low(A)`` is computed on a
-    *ghosted subsystem-A* ``mol`` (only A's nuclei).  ``projection_energy`` now
-    rebases ``E_high(A)`` onto E_low(A)'s footing (``ProjectionEnergy.footing_shift``);
-    before that rebasing the two sat ~4 Ha apart and the loop still "converged" on
-    the density while the energy was wrong.
+    Two footings must be reconciled first: ``E_high(A)`` carries the full-supersystem
+    nuclear frame while EmbASI's ``E_low(A)`` is computed on a ghosted subsystem-A ``mol``.
+    ``projection_energy`` rebases the former onto the latter (``footing_shift``).
 
-    Once the frames match, the residual is *not* zero and *not* the paper's
-    1e-6 kJ/mol PBE-in-PBE cancellation: the embedded Hamiltonian we hand the
-    solver uses **bare ERIs with HF exchange** (``j - 0.5 k``), so ``E_high(A)`` is
-    the *HF-flavour* energy of γ^A, whereas ``E_low(A)`` is *PBE*.  The two
-    therefore differ by exactly the fragment HF-minus-PBE energy on the ghosted A
-    footing -- genuine exchange-correlation physics, ~0.29 Ha here, not a
-    bookkeeping artefact.  We compute that reference difference independently
-    (RHF J-K/2 vs the DFT ``energy_tot`` on the same ghosted ``mol`` at the same
-    γ^A) and assert the A-terms reproduce it.
+    The residual is then neither zero nor the paper's 1e-6 kJ/mol PBE-in-PBE cancellation:
+    the embedded Hamiltonian uses bare ERIs with HF exchange (``j - 0.5 k``), so
+    ``E_high(A)`` is HF-flavour while ``E_low(A)`` is PBE.  They differ by exactly the
+    fragment HF-minus-PBE energy on the ghosted footing -- genuine xc physics.  That
+    reference is computed independently (RHF J-K/2 vs the DFT ``energy_tot`` on the same
+    ghosted ``mol`` at the same γ^A).
 
-    Tolerance 1e-6 Ha: both sides are closed-form contractions of the *same* γ^A
-    against operators on the *same* ghosted mol, so agreement is limited only by
-    the AO-integral / ao2mo round-off, not by any physical approximation.  A
-    reappearance of the footing bug would blow the A-term difference back out to
-    ~4 Ha and fail this by six orders of magnitude.
+    Tolerance 1e-6 Ha: both sides are closed-form contractions of the same γ^A against
+    operators on the same ghosted mol, so only AO-integral round-off separates them.
     """
     from pyscf import scf
 
@@ -388,10 +374,13 @@ def test_pbe_in_pbe_null_case_A_terms_reduce_to_fragment_hf_minus_pbe(adapter, o
     )
     # Correction must vanish (γ̃ == γ), isolating the A-term difference.
     assert abs(energy.correction) < 1e-8
-    # The footing rebasing must have fired (the frames genuinely differ here).
-    assert energy.footing_shift > 1.0  # ~3.8 Ha for this fragment
+    # Since EmbASI's 9c21cac (ghosts=0) A_LL shares e_core's frame, so the rebase is an
+    # identity here.  Pinned tight: a NON-zero shift now means the frames have diverged
+    # again, which is what the ~4 Ha bug looked like.
+    assert energy.footing_shift == pytest.approx(0.0, abs=1e-9)
 
-    # Independent reference: fragment HF - PBE at γ^A on EmbASI's ghosted A mol.
+    # Independent reference: fragment HF - PBE at γ^A on EmbASI's A_LL mol (no longer
+    # ghosted since 9c21cac -- it is the supersystem mol with an adjusted charge).
     dm_a = adapter._dm_a
     mol_a = adapter.p.A_LL.atoms.calc.mol
     hcore_a = np.asarray(mol_a.intor("int1e_kin") + mol_a.intor("int1e_nuc"))
@@ -615,10 +604,15 @@ def test_projection_energy_from_state_matches_the_live_assembly():
     # Round-trip the snapshot through an .npz, which is how it actually travels (and
     # without allow_pickle, as a consumer reading another process's file should).
     state = {k: v for k, v in adapter.export_state().items() if k != "fingerprint"}
+    # Pass the spin-resolved density too: `result` carries one even on a closed shell, so
+    # the live path contracts per channel.  Withholding it makes the two agree only to
+    # ~1e-10, since `mu` amplifies a 1e-13 difference between the two lifts in the
+    # projector.  This test is about the paths being one implementation, hence 1e-12.
     from_state = projection_energy_from_state(
         state,
         solver_energy=result.energy,
         rdm1_ao=adapter.rdm1_ao(result.rdm1, orbitals),
+        rdm1_ao_spin=adapter.rdm1_ao_spin(result.rdm1a, result.rdm1b, orbitals, None),
     )
 
     for term in (
@@ -631,8 +625,11 @@ def test_projection_energy_from_state_matches_the_live_assembly():
         "total",
     ):
         assert getattr(from_state, term) == pytest.approx(getattr(live, term), abs=1e-12), term
-    # The shift is genuinely large here, so the agreement above is a real test of it.
-    assert abs(live.footing_shift) > 1.0
+    # The shift is an identity since EmbASI's 9c21cac (ghosts=0) -- see
+    # test_pbe_in_pbe_null_case_A_terms_reduce_to_fragment_hf_minus_pbe.  The
+    # term-by-term agreement above is still the real test: it covers e_high_A, the
+    # Eq. 8 correction and the projector leak, none of which are trivial.
+    assert live.footing_shift == pytest.approx(0.0, abs=1e-9)
 
 
 def test_projection_energy_from_state_reports_a_missing_key_by_name():

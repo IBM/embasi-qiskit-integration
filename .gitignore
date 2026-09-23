@@ -36,5 +36,4 @@ coverage.xml
 .DS_Store
 
 # Local scratch notes and generated docs, deliberately untracked.
-/EMBEDDING_WORKFLOW_NOTES.md
 /docs/

@@ -11,6 +11,7 @@ here we verify the multi-rank broadcast actually works end to end.
 
 from __future__ import annotations
 
+import functools
 import shutil
 import subprocess
 import sys
@@ -22,28 +23,109 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _mpi_available() -> bool:
-    if shutil.which("mpirun") is None:
+def _find_launcher() -> str | None:
+    """The MPI launcher on PATH.
+
+    Debian/Ubuntu's ``mpich`` ships ``mpirun.mpich``/``mpiexec.mpich`` and provides the
+    bare ``mpirun`` only through update-alternatives, which is not always configured, so
+    take the first name that exists rather than assuming ``mpirun``.
+    """
+    for name in ("mpirun", "mpiexec", "mpirun.mpich", "mpiexec.mpich"):
+        if shutil.which(name):
+            return name
+    return None
+
+
+def _multirank_launch_works() -> bool:
+    """Can this environment actually run a 2-rank job that shares one COMM_WORLD?
+
+    Probed by launching one, rather than inferred from version strings.  A launcher and
+    an ``mpi4py`` from different MPI installs -- the PyPI wheels bundle their own runtime
+    -- initialise a SINGLETON communicator per process instead of failing: the job
+    degrades to N independent 1-rank runs, every process reporting rank 0 of size 1.
+
+    That is an environment fault, not a defect in the code under test, and no source
+    change fixes it, so the tests skip rather than fail.  The probe is the same question
+    they ask, which is why it cannot drift away from them the way a vendor comparison did.
+    """
+    launcher = _find_launcher()
+    if launcher is None:
         return False
     try:
         import mpi4py  # noqa: F401
     except ImportError:
         return False
-    return True
+    probe = "from mpi4py import MPI; print(MPI.COMM_WORLD.Get_size())"
+    try:
+        proc = subprocess.run(
+            [launcher, "-n", "2", sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception:  # pragma: no cover - any launcher failure means "unavailable"
+        return False
+    # Two ranks in one communicator print "2" twice; a singleton launch prints "1" twice.
+    return proc.returncode == 0 and [ln.strip() for ln in proc.stdout.split()] == ["2", "2"]
 
 
-requires_mpi = pytest.mark.skipif(not _mpi_available(), reason="needs mpirun + mpi4py")
+@functools.cache
+def _mpi_usable() -> bool:
+    """:func:`_multirank_launch_works`, evaluated at most once and never at import.
+
+    Spawning a launcher while pytest is still collecting puts an unrelated subprocess in
+    the path of the whole session -- a launcher that hangs or takes the process group down
+    with it kills collection, and the run dies with no summary and no traceback.  Deferring
+    it to the first test that asks, and caching the answer, keeps the blast radius inside
+    these two tests.
+    """
+    return _multirank_launch_works()
+
+
+requires_mpi = pytest.mark.skipif(
+    "not _mpi_usable()",
+    reason="needs an MPI that launches 2 ranks in one COMM_WORLD (launcher and mpi4py "
+    "from the same install)",
+)
+
+
+def _mpirun_argv(nranks: int) -> list[str]:
+    """``mpirun`` plus the flags a containerised OpenMPI needs to launch at all.
+
+    A CI runner often has fewer cores than ranks, and OpenMPI refuses to
+    oversubscribe by default; it also probes transports that are unavailable in a
+    container, and aborts as root without an explicit opt-in.  Each of those kills
+    the launcher *before* the payload runs, so the failure arrives with empty
+    stdout AND stderr.  The flags are OpenMPI-specific, so they are only added when
+    ``mpirun --version`` says OpenMPI -- MPICH's Hydra rejects unknown flags.
+    """
+    argv = [_find_launcher() or "mpirun", "-n", str(nranks)]
+    try:
+        banner = subprocess.run(
+            [argv[0], "--version"], capture_output=True, text=True, timeout=30, check=False
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - probed once
+        return argv
+    if "Open MPI" in (banner.stdout + banner.stderr):
+        argv += ["--oversubscribe", "--allow-run-as-root"]
+    return argv
 
 
 def _run_mpi(code: str, nranks: int = 2) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["mpirun", "-n", str(nranks), sys.executable, "-c", textwrap.dedent(code)],
+        [*_mpirun_argv(nranks), sys.executable, "-c", textwrap.dedent(code)],
         capture_output=True,
         text=True,
         timeout=300,
         check=False,
         cwd=REPO_ROOT,
     )
+
+
+def _mpi_failure(proc: subprocess.CompletedProcess) -> str:
+    """Both streams, since a launcher-level failure leaves stderr empty."""
+    return f"returncode={proc.returncode}\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
 
 
 @requires_mpi
@@ -64,8 +146,13 @@ def test_rank0_solve_broadcasts_result():
         print(f"RANK {rank} ENERGY {res.energy:.10f}")
     """
     proc = _run_mpi(code)
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode == 0, _mpi_failure(proc)
 
+    ranks = {line.split()[1] for line in proc.stdout.splitlines() if line.startswith("RANK ")}
+    assert ranks == {"0", "1"}, (
+        f"expected ranks 0 and 1, saw {sorted(ranks)} -- a singleton launch reports every "
+        f"process as rank 0.\n{_mpi_failure(proc)}"
+    )
     energies = [
         float(line.split()[-1]) for line in proc.stdout.splitlines() if line.startswith("RANK ")
     ]
@@ -97,16 +184,24 @@ def test_embedding_workflow_mpi_orchestration():
     """
     driver = REPO_ROOT / "tests" / "_mpi_workflow_mock.py"
     proc = subprocess.run(
-        ["mpirun", "-n", "2", sys.executable, str(driver)],
+        [*_mpirun_argv(2), sys.executable, str(driver)],
         capture_output=True,
         text=True,
         timeout=300,
         check=False,
         cwd=REPO_ROOT,
     )
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode == 0, _mpi_failure(proc)
 
-    # Rank-0-only banner appears exactly once (rank guarding works).
+    # A launcher that cannot form a multi-rank communicator runs N independent 1-rank
+    # jobs -- every rank reports itself as rank 0 of size 1.  Name that outright: it is an
+    # environment fault, and diagnosing it from a bare count mismatch is guesswork.
+    assert "running under MPI with 2 ranks" in proc.stdout, (
+        "ranks did not share one COMM_WORLD (mpi4py's bundled MPI runtime not matching "
+        f"the launcher will do this).\n{_mpi_failure(proc)}"
+    )
+
+    # Rank-0-only lines appear exactly once, i.e. rank guarding works.
     assert proc.stdout.count("running under MPI with 2 ranks") == 1
     assert proc.stdout.count("Step done: solve broadcast to all ranks") == 1
 

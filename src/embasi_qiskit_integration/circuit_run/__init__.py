@@ -89,6 +89,12 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+# `None` means "caller did not ask for a method", which is what the non-Aer guard below
+# tests.  Equality with the default cannot: callers that forward a settings field (the
+# CLI) always pass a concrete value, default or not.
+_DEFAULT_AER_METHOD = "matrix_product_state"
+
+
 def build_sampler(
     kind: SamplerKind,
     *,
@@ -96,6 +102,9 @@ def build_sampler(
     backend: str | None = None,
     optimization_level: int = 3,
     default_shots: int = 100_000,
+    aer_method: str | None = None,
+    mps_max_bond_dimension: int | None = None,
+    mps_truncation_threshold: float | None = None,
     options=None,
     enable_readout_characterisation: bool = False,
     readout_error_threshold: float = 0.03,
@@ -112,6 +121,11 @@ def build_sampler(
         backend: backend name for ``"runtime"``; ``None`` picks the least-busy.
         optimization_level: ISA-transpile level for ``"runtime"``.
         default_shots: shot budget used when a caller does not pass ``shots``.
+        aer_method: Aer simulation method for ``"aer"``; ``None`` takes
+            ``"matrix_product_state"`` (memory-frugal), ``"statevector"`` is exact.
+            Validated against the installed Aer; seeds do not reproduce across methods.
+        mps_max_bond_dimension: bond-dimension cap for MPS; ``None`` leaves it uncapped.
+        mps_truncation_threshold: singular-value truncation threshold for MPS.
         options: ``SamplerOptions`` (or dict) forwarded to ``SamplerV2``; see
             :class:`~embasi_qiskit_integration.circuit_run.runtime.RuntimeSampler`
             for why hardware runs want ``{"twirling": {"enable_measure": True}}``.
@@ -134,6 +148,17 @@ def build_sampler(
         ValueError: for an unknown ``kind``, ``"mock"`` without ``counts``, or
             ``options``/characterisation with a sampler that cannot use them.
     """
+    if kind != "aer" and (
+        aer_method is not None
+        or mps_max_bond_dimension is not None
+        or mps_truncation_threshold is not None
+    ):
+        raise ValueError(
+            f"sampler {kind!r} takes no Aer simulation options: aer_method / "
+            "mps_max_bond_dimension / mps_truncation_threshold configure the local "
+            "simulator only. Drop them, or use --sampler aer."
+        )
+
     if kind != "runtime":
         if options is not None:
             raise ValueError(
@@ -154,7 +179,12 @@ def build_sampler(
     if kind == "aer":
         from embasi_qiskit_integration.circuit_run.aer import AerSampler
 
-        return AerSampler(default_shots=default_shots)
+        return AerSampler(
+            default_shots=default_shots,
+            method=_DEFAULT_AER_METHOD if aer_method is None else aer_method,
+            mps_max_bond_dimension=mps_max_bond_dimension,
+            mps_truncation_threshold=mps_truncation_threshold,
+        )
 
     if kind == "runtime":
         from embasi_qiskit_integration.circuit_run.runtime import RuntimeSampler
