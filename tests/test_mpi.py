@@ -11,6 +11,7 @@ here we verify the multi-rank broadcast actually works end to end.
 
 from __future__ import annotations
 
+import functools
 import shutil
 import subprocess
 import sys
@@ -60,17 +61,30 @@ def _multirank_launch_works() -> bool:
             [launcher, "-n", "2", sys.executable, "-c", probe],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=60,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):  # pragma: no cover - probed once
+    except Exception:  # pragma: no cover - any launcher failure means "unavailable"
         return False
     # Two ranks in one communicator print "2" twice; a singleton launch prints "1" twice.
     return proc.returncode == 0 and [ln.strip() for ln in proc.stdout.split()] == ["2", "2"]
 
 
+@functools.cache
+def _mpi_usable() -> bool:
+    """:func:`_multirank_launch_works`, evaluated at most once and never at import.
+
+    Spawning a launcher while pytest is still collecting puts an unrelated subprocess in
+    the path of the whole session -- a launcher that hangs or takes the process group down
+    with it kills collection, and the run dies with no summary and no traceback.  Deferring
+    it to the first test that asks, and caching the answer, keeps the blast radius inside
+    these two tests.
+    """
+    return _multirank_launch_works()
+
+
 requires_mpi = pytest.mark.skipif(
-    not _multirank_launch_works(),
+    "not _mpi_usable()",
     reason="needs an MPI that launches 2 ranks in one COMM_WORLD (launcher and mpi4py "
     "from the same install)",
 )

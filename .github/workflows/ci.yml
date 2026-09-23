@@ -35,14 +35,21 @@ jobs:
 
       # EMBASI_AVAILABLE=1 un-skips the `embasi`-marked tests, which need the `embed`
       # extra installed above.  They are PySCF-backed, so they need no FHI-aims binary.
+      #
+      # `timeout-minutes` bounds the step explicitly: the suite runs in ~5 min, so 30 is
+      # generous, and a hang is then reported as a timeout rather than the job's 6-hour
+      # default.  `-ra` makes the short summary list every non-pass outcome, so a run that
+      # dies mid-way still says which tests had started.
       - name: Run unit tests
-        run: uv run pytest -q
+        timeout-minutes: 30
+        run: uv run pytest -q -ra
         env:
           EMBASI_AVAILABLE: "1"
 
       # The `embasi` marker is deselected by the addopts in pyproject.toml, so the run
       # above never collects it; -m embasi selects exactly that set.
       - name: Run EmbASI-backed tests
-        run: uv run pytest -q -m embasi
+        timeout-minutes: 15
+        run: uv run pytest -q -ra -m embasi
         env:
           EMBASI_AVAILABLE: "1"
