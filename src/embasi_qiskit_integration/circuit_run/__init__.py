@@ -89,8 +89,9 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-# The default Aer method, named so the "did the caller pass an Aer option?" guard in
-# `build_sampler` tracks it instead of hardcoding a second copy.
+# `None` means "caller did not ask for a method", which is what the non-Aer guard below
+# tests.  Equality with the default cannot: callers that forward a settings field (the
+# CLI) always pass a concrete value, default or not.
 _DEFAULT_AER_METHOD = "matrix_product_state"
 
 
@@ -101,7 +102,7 @@ def build_sampler(
     backend: str | None = None,
     optimization_level: int = 3,
     default_shots: int = 100_000,
-    aer_method: str = _DEFAULT_AER_METHOD,
+    aer_method: str | None = None,
     mps_max_bond_dimension: int | None = None,
     mps_truncation_threshold: float | None = None,
     options=None,
@@ -120,9 +121,9 @@ def build_sampler(
         backend: backend name for ``"runtime"``; ``None`` picks the least-busy.
         optimization_level: ISA-transpile level for ``"runtime"``.
         default_shots: shot budget used when a caller does not pass ``shots``.
-        aer_method: Aer simulation method for ``"aer"`` -- ``"matrix_product_state"``
-            (default, memory-frugal) or ``"statevector"`` (exact). Validated against the
-            installed Aer; seeds do not reproduce across methods.
+        aer_method: Aer simulation method for ``"aer"``; ``None`` takes
+            ``"matrix_product_state"`` (memory-frugal), ``"statevector"`` is exact.
+            Validated against the installed Aer; seeds do not reproduce across methods.
         mps_max_bond_dimension: bond-dimension cap for MPS; ``None`` leaves it uncapped.
         mps_truncation_threshold: singular-value truncation threshold for MPS.
         options: ``SamplerOptions`` (or dict) forwarded to ``SamplerV2``; see
@@ -148,7 +149,7 @@ def build_sampler(
             ``options``/characterisation with a sampler that cannot use them.
     """
     if kind != "aer" and (
-        aer_method != _DEFAULT_AER_METHOD
+        aer_method is not None
         or mps_max_bond_dimension is not None
         or mps_truncation_threshold is not None
     ):
@@ -180,7 +181,7 @@ def build_sampler(
 
         return AerSampler(
             default_shots=default_shots,
-            method=aer_method,
+            method=_DEFAULT_AER_METHOD if aer_method is None else aer_method,
             mps_max_bond_dimension=mps_max_bond_dimension,
             mps_truncation_threshold=mps_truncation_threshold,
         )

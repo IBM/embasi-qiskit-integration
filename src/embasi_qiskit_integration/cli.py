@@ -39,8 +39,8 @@ class SolveCommand(BaseSettings):
     directory: CliPositionalArg[str]
     solver: Literal["sqd", "fci"] = "sqd"
     sampler: Literal["aer", "mock", "runtime"] = "runtime"
-    # Which Aer simulator, when --sampler aer.
-    aer_method: str = "matrix_product_state"
+    # Which Aer simulator, when --sampler aer; None takes the package default (MPS).
+    aer_method: str | None = None
     # MPS only; the cap is what buys the memory saving.
     mps_max_bond_dimension: int | None = None
     mps_truncation_threshold: float | None = None

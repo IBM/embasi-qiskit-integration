@@ -72,13 +72,8 @@ def _statevector_aer_in_tests(request, monkeypatch: pytest.MonkeyPatch) -> None:
         "__kwdefaults__",
         {**(_aer.AerSampler.__init__.__kwdefaults__ or {}), "method": TEST_AER_METHOD},
     )
+    # Patching the resolved default covers `build_sampler` and the pydantic settings
+    # classes too, since all of them end up constructing an `AerSampler`.
     import embasi_qiskit_integration.circuit_run as _cr
 
-    monkeypatch.setattr(
-        _cr.build_sampler,
-        "__kwdefaults__",
-        {**(_cr.build_sampler.__kwdefaults__ or {}), "aer_method": TEST_AER_METHOD},
-    )
-    # build_sampler's "did the caller pass an Aer option?" guard compares against this, so
-    # it must follow the patched default or every mock/runtime call raises.
     monkeypatch.setattr(_cr, "_DEFAULT_AER_METHOD", TEST_AER_METHOD)

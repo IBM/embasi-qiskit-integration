@@ -567,9 +567,10 @@ class EmbeddingWorkflow(BaseSettings):
     solver: Literal["sqd", "fci"] = "sqd"
     handoff: Literal["in-process", "two-process"] = "in-process"
     sampler: SamplerKind = "aer"
-    # Which Aer simulator: `--sampler aer` alone does not pin one.  Validated against the
-    # installed Aer, so a typo fails at construction.  Seeds do NOT reproduce across methods.
-    aer_method: str = "matrix_product_state"
+    # Which Aer simulator: `--sampler aer` alone does not pin one, and None takes the
+    # package default (MPS).  Validated against the installed Aer, so a typo fails at
+    # construction.  Seeds do NOT reproduce across methods.
+    aer_method: str | None = None
     # MPS only; the cap is what buys the memory saving, at the cost of an approximation.
     mps_max_bond_dimension: int | None = None
     mps_truncation_threshold: float | None = None
