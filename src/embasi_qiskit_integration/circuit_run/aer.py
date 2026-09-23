@@ -25,28 +25,21 @@ class AerSampler(SamplerMixin):
     Seeds the simulator per-call so runs are reproducible. Returns the counts of
     each circuit's measurement register.
 
-    The simulation ``method`` is pinned (default ``"statevector"``) rather than
-    left at Aer's ``"automatic"``: automatic picks a method from circuit structure,
-    so the RNG consumption pattern -- and hence what a given ``seed`` reproduces --
-    could drift as circuits or Aer's heuristics change.  **Seeds do not reproduce
-    across methods**: each consumes randomness differently, so the same ``seed``
-    gives statistically equivalent but not identical counts under
-    ``statevector`` and ``matrix_product_state``.
+    The simulation ``method`` is pinned (default ``"matrix_product_state"``) rather than
+    left at Aer's ``"automatic"``, which picks from circuit structure so what a given
+    ``seed`` reproduces could drift.  **Seeds do not reproduce across methods.**
 
-    ``matrix_product_state`` trades exactness for memory and is the reason this is
-    selectable: it can reach wider registers than ``statevector``, but only while the
-    bond dimension stays small.  Cap it with ``mps_max_bond_dimension`` -- uncapped,
-    MPS grows toward the exact state and can be *slower* than ``statevector`` on the
-    deliberately-entangling circuits SqDRIFT produces.  Benchmark before assuming a
-    win; a truncated bond dimension is an approximation, and Aer reports the
-    truncation it applied rather than failing.
+    MPS trades exactness for memory and reaches wider registers than ``statevector``,
+    but only while the bond dimension stays small; ``mps_max_bond_dimension`` caps it,
+    at the cost of an approximation.  Uncapped it grows toward the exact state and can
+    be slower than ``statevector`` on entangling circuits.
     """
 
     def __init__(
         self,
         *,
         default_shots: int = 100_000,
-        method: str = "statevector",
+        method: str = "matrix_product_state",
         mps_max_bond_dimension: int | None = None,
         mps_truncation_threshold: float | None = None,
     ):

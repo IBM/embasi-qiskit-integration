@@ -604,14 +604,10 @@ def test_projection_energy_from_state_matches_the_live_assembly():
     # Round-trip the snapshot through an .npz, which is how it actually travels (and
     # without allow_pickle, as a consumer reading another process's file should).
     state = {k: v for k, v in adapter.export_state().items() if k != "fingerprint"}
-    # Pass the spin-resolved density too, because `result` carries one (PySCF's FCI
-    # returns rdm1a/rdm1b even on a closed shell) and the live path therefore contracts
-    # per channel.  Withholding it here leaves the two implementations agreeing only to
-    # ~1e-10 rather than bit-for-bit: `tr[d_a P] + tr[d_b P]` and `tr[(d_a + d_b) P]` are
-    # equal in exact arithmetic, but the two densities differ at 1e-13 (they are built by
-    # different lifts) and `mu = 1e6` amplifies that in the projector. Both values are
-    # numerical zeros; the point of this test is that the two code paths are the same
-    # implementation, so it asserts at 1e-12.
+    # Pass the spin-resolved density too: `result` carries one even on a closed shell, so
+    # the live path contracts per channel.  Withholding it makes the two agree only to
+    # ~1e-10, since `mu` amplifies a 1e-13 difference between the two lifts in the
+    # projector.  This test is about the paths being one implementation, hence 1e-12.
     from_state = projection_energy_from_state(
         state,
         solver_energy=result.energy,

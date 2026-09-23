@@ -8,16 +8,6 @@ default (``addopts = "-m 'not embasi'"``) and skipped unless ``EMBASI_AVAILABLE=
 Run them with BOTH::
 
     EMBASI_AVAILABLE=1 pytest -m embasi tests/test_open_shell_embedding_live.py
-
-Everything else in the open-shell suite tests *plumbing* against stubs -- that the
-energy split is additive, that the pair reaches ``direct_uhf``, that shapes are checked.
-None of that says the open-shell **energy** is right. This file does: it pins the
-numbers a real doublet produces, and cross-checks the downfold against an
-independently rebuilt Hamiltonian so a bookkeeping error in the adapter cannot hide.
-
-System: an OH radical (doublet, subsystem A) 4 A from a water molecule (closed-shell
-environment), sto-3g, PBE low level, HF high level. Small enough to run in seconds,
-and the same system the EmbASI open-shell example uses.
 """
 
 from __future__ import annotations

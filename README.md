@@ -85,38 +85,35 @@ print(res.energy)            # within 2e-3 Ha of FCI; res.diagnostics carries pr
 For CI / offline runs, replay frozen counts with `MockSampler` instead of
 `AerSampler` — same interface, fully deterministic.
 
-**Aer is a family of simulators, not one.** `AerSampler` defaults to `statevector`
-(exact), and the method is selectable — `matrix_product_state` is the interesting
-alternative, reaching wider registers than statevector allows:
+**Aer is a family of simulators, not one.** `AerSampler` defaults to
+`matrix_product_state`, which reaches wider registers than `statevector`; pass
+`method="statevector"` for an exact simulation instead. Cap the bond dimension to buy
+the memory saving:
 
 ```python
 AerSampler(method="matrix_product_state", mps_max_bond_dimension=64)
 ```
 
-From the CLI: `--aer_method matrix_product_state --mps_max_bond_dimension 64`. The
-method is validated against the installed Aer, so a typo fails immediately instead of
-silently simulating with something else, and it is recorded in
-`res.diagnostics["sampler_method"]` so a result says which simulator produced it.
+From the CLI: `--aer_method statevector`, or `--mps_max_bond_dimension 64` to cap the
+default MPS. The method is validated against the installed Aer, so a typo fails
+immediately, and it is recorded in `res.diagnostics["sampler_method"]`. Seeds do not
+reproduce across methods.
 
-Two caveats worth knowing before reaching for MPS:
+Why MPS is the default — a GHZ-style entangling chain, 2000 shots:
 
-- **Seeds do not reproduce across methods.** Each consumes randomness differently, so
-  the same `seed` gives statistically equivalent but not identical counts.
-- **MPS is not automatically faster.** Uncapped, it converges toward the exact state and
-  can be *slower* than `statevector` on the deliberately-entangling SqDRIFT circuits;
-  the bond-dimension cap is what buys the memory saving, at the cost of an
-  approximation. Benchmark on your own circuits rather than assuming a win.
-
-Both methods agree on the physics, as they should. N2 8o10e, 5000 shots, seed 11:
-
-| method | energy (Ha) | vs FCI |
+| qubits | `statevector` | `matrix_product_state` |
 |---|---|---|
-| `statevector` | -108.9582199205 | 2.9e-4 |
-| `matrix_product_state` | -108.9583430226 | 1.7e-4 |
-| FCI reference | -108.9585095430 | — |
+| 24 | 0.37 s | 0.02 s |
+| 30 | 23.94 s | 0.01 s |
 
-The 1.2e-4 Ha between them is sampling noise at this shot count, not a method error —
-and MPS landing marginally closer is luck of the draw, not evidence it is better.
+`statevector` memory doubles per qubit; MPS stays flat while the bond dimension does, so
+it rescues the wide registers `statevector` cannot reach at all.
+
+**It is not a free win.** On *narrow, deliberately entangling* circuits — the SqDRIFT
+regime — uncapped MPS is 1.3-3x *slower* than `statevector`, because the bond dimension
+grows toward the exact state. The test suite is ~7x slower under the MPS default
+(32 min vs 4.5 min) for exactly this reason. Pass `--aer_method statevector` for small
+active spaces, and cap `--mps_max_bond_dimension` to keep MPS cheap on large ones.
 
 ### 3. SQD on real quantum hardware
 

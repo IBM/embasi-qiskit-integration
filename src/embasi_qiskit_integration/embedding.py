@@ -567,13 +567,10 @@ class EmbeddingWorkflow(BaseSettings):
     solver: Literal["sqd", "fci"] = "sqd"
     handoff: Literal["in-process", "two-process"] = "in-process"
     sampler: SamplerKind = "aer"
-    # Aer is a *family* (statevector, density_matrix, stabilizer, matrix_product_state,
-    # ...) and `--sampler aer` alone does not pin one.  Validated against the installed Aer,
-    # so a typo fails at construction.  Seeds do NOT reproduce across methods.
-    aer_method: str = "statevector"
-    # MPS only.  Uncapped MPS converges toward the exact state and is often *slower*
-    # than statevector on the entangling circuits SqDRIFT produces; the cap is what
-    # buys the memory saving, at the cost of an approximation.
+    # Which Aer simulator: `--sampler aer` alone does not pin one.  Validated against the
+    # installed Aer, so a typo fails at construction.  Seeds do NOT reproduce across methods.
+    aer_method: str = "matrix_product_state"
+    # MPS only; the cap is what buys the memory saving, at the cost of an approximation.
     mps_max_bond_dimension: int | None = None
     mps_truncation_threshold: float | None = None
     backend: str | None = None  # runtime backend name; else least-busy
@@ -617,14 +614,10 @@ class EmbeddingWorkflow(BaseSettings):
             f"active atoms {self.active_atoms}, projection=level-shift"
         )
 
-        # Route on the high-level METHOD, not the solver: a density functional is
-        # DFT-in-DFT (Eq. 2, no active space or solver), a wavefunction method is WF-in-DFT
-        # (Eq. 8, downfold and hand a bare Hamiltonian to FCI/SQD).
-        #
-        # The two drive DIFFERENT collective EmbASI entry points and must branch BEFORE the
-        # low-level call so exactly one fires per rank: DFT-in-DFT runs EmbASI's native
-        # ``run()`` (which runs the supersystem SCF itself), WF runs ``run_low_level()``.
-        # Calling both would double the supersystem SCF.
+        # Route on the high-level METHOD, not the solver: a functional is DFT-in-DFT
+        # (Eq. 2), a wavefunction method is WF-in-DFT (Eq. 8).  They drive DIFFERENT
+        # collective EmbASI entry points and must branch BEFORE the low-level call so
+        # exactly one fires per rank, or the supersystem SCF runs twice.
         if self._is_dft_in_dft():
             return self._dft_in_dft(emb, log=log)
 

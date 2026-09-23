@@ -125,20 +125,10 @@ def run_sqd(
         extra["include_configurations"] = include_configurations
 
     if ham.is_spin_dependent:
-        # qiskit-addon-sqd takes a single `one_body_tensor`, so there is nowhere to put
-        # the second channel.  Fall back to the spin-averaged `h1` rather than picking
-        # one channel arbitrarily, and say so: the result is then ROHF-like on an
-        # open shell, not UHF-quality, and comparing it against an unrestricted
-        # reference without knowing that would be misleading.
-        #
-        # The warning names the TWO-BODY loss as well, deliberately.  `ham.h2` is the
-        # *alpha-only* tensor (see `EmbeddedHamiltonian.h2`), so on a per-spin downfold
-        # this call drops `h2_spin`'s genuine `(aa, ab, bb)` triple too -- a second,
-        # independent approximation on top of the `h1` averaging, and the larger of the
-        # two.  Measured ~2.96 Ha on the OH radical (the repo's own open-shell fixture),
-        # and on a synthetic polarised (3, 1) sector the ERI loss was 6.5 Ha against
-        # 1.0 Ha for the `h1` averaging.  A warning that mentioned only `h1` would leave
-        # a reader believing the ERIs were exact.
+        # The addon takes a single `one_body_tensor`, so fall back to the spin-averaged
+        # `h1` and say so: the result is ROHF-like, not UHF-quality.  The warning names
+        # the TWO-BODY loss as well, deliberately -- `ham.h2` is alpha-only, so this also
+        # drops `h2_spin`'s (aa, ab, bb) triple, the larger of the two approximations.
         h2_note = (
             " The two-body tensor is alpha-only as well (h2_spin's (aa, ab, bb) triple "
             "cannot be passed either), which is typically the LARGER error of the two."

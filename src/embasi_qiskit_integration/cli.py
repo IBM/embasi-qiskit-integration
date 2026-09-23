@@ -39,13 +39,9 @@ class SolveCommand(BaseSettings):
     directory: CliPositionalArg[str]
     solver: Literal["sqd", "fci"] = "sqd"
     sampler: Literal["aer", "mock", "runtime"] = "runtime"
-    # Which Aer simulator, when --sampler aer: Aer is a family (statevector,
-    # density_matrix, stabilizer, matrix_product_state, ...), and `--sampler aer`
-    # alone does not pin one.  Validated against the installed Aer.  Seeds do NOT
-    # reproduce across methods.
-    aer_method: str = "statevector"
-    # MPS only; the cap is what buys the memory saving (uncapped MPS tends toward the
-    # exact state and is often slower than statevector on entangling circuits).
+    # Which Aer simulator, when --sampler aer.
+    aer_method: str = "matrix_product_state"
+    # MPS only; the cap is what buys the memory saving.
     mps_max_bond_dimension: int | None = None
     mps_truncation_threshold: float | None = None
     counts: str | None = None

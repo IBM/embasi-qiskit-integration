@@ -349,11 +349,12 @@ def test_mps_with_a_bond_cap_still_samples_correctly():
 def test_build_sampler_threads_the_method_through():
     from embasi_qiskit_integration.circuit_run import build_sampler
 
+    sampler = build_sampler("aer", aer_method="statevector")
+    assert sampler.method == "statevector"
     sampler = build_sampler("aer", aer_method="matrix_product_state", mps_max_bond_dimension=8)
-    assert sampler.method == "matrix_product_state"
     assert sampler.backend_options["matrix_product_state_max_bond_dimension"] == 8
-    # Default stays statevector: this feature must not change existing runs.
-    assert build_sampler("aer").method == "statevector"
+    # MPS is the default, so an explicit statevector above is the one that must thread.
+    assert build_sampler("aer").method == "matrix_product_state"
 
 
 def test_aer_options_are_refused_on_non_aer_samplers(tmp_path):
@@ -366,7 +367,7 @@ def test_aer_options_are_refused_on_non_aer_samplers(tmp_path):
     counts_file.write_text(json.dumps({"0000": 10}))
 
     with pytest.raises(ValueError, match="takes no Aer simulation options"):
-        build_sampler("mock", counts=str(counts_file), aer_method="matrix_product_state")
+        build_sampler("mock", counts=str(counts_file), aer_method="statevector")
     with pytest.raises(ValueError, match="takes no Aer simulation options"):
         build_sampler("mock", counts=str(counts_file), mps_max_bond_dimension=4)
 
@@ -378,8 +379,11 @@ def test_sampler_method_lands_in_the_diagnostics():
     from embasi_qiskit_integration.circuit_run.aer import AerSampler
     from embasi_qiskit_integration.solvers import _sampler_backend_diagnostics
 
-    plain = _sampler_backend_diagnostics(AerSampler())
+    plain = _sampler_backend_diagnostics(AerSampler(method="statevector"))
     assert plain == {"sampler_method": "statevector"}
+
+    # MPS is the default; an uncapped one reports the method and no bond dimension.
+    assert _sampler_backend_diagnostics(AerSampler()) == {"sampler_method": "matrix_product_state"}
 
     mps = _sampler_backend_diagnostics(
         AerSampler(method="matrix_product_state", mps_max_bond_dimension=64)

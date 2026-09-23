@@ -85,12 +85,9 @@ class FCISolver(ActiveSpaceSolver):
         e, ci = solver.kernel(h1e, eri, norb, ham.nelec)
         rdm1a, rdm1b = solver.make_rdm1s(ci, norb, ham.nelec)
         if ham.is_spin_dependent:
-            # `direct_uhf` exposes no spin-summed `make_rdm12`; it returns the
-            # spin-resolved blocks, which we combine ourselves.  For rdm1 that is just
-            # the sum; for rdm2 the alpha-beta block appears once in each ordering, so
-            # the spin-summed tensor is `aa + bb + ab + ab^T` (transposing the first
-            # and second index pairs).  Verified against the trace identity
-            # `sum_pq rdm2[p,p,q,q] == N(N-1)`.
+            # `direct_uhf` returns spin-resolved blocks, so combine them here: rdm1 is the
+            # sum, and rdm2 is `aa + bb + ab + ab^T` since the alpha-beta block appears
+            # once in each ordering.
             _, rdm2s = solver.make_rdm12s(ci, norb, ham.nelec)
             aa, ab, bb = (np.asarray(x) for x in rdm2s)
             rdm2 = aa + bb + ab + ab.transpose(2, 3, 0, 1)
@@ -261,10 +258,6 @@ class SQDSolver(ActiveSpaceSolver):
             method=self.method,
             n_circuits=len(circuits),
             sampler=type(self.sampler).__name__,
-            # `AerSampler` alone does not say WHICH Aer simulator ran -- Aer is a family
-            # (statevector, matrix_product_state, ...) and the choice changes both cost
-            # and exactness.  Record it so a result answers "which solver did you use?"
-            # by itself.  Absent for samplers with no simulation method (mock, runtime).
             **_sampler_backend_diagnostics(self.sampler),
             versions=collect_versions(),
             seed=self.seed,

@@ -89,6 +89,11 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+# The default Aer method, named so the "did the caller pass an Aer option?" guard in
+# `build_sampler` tracks it instead of hardcoding a second copy.
+_DEFAULT_AER_METHOD = "matrix_product_state"
+
+
 def build_sampler(
     kind: SamplerKind,
     *,
@@ -96,7 +101,7 @@ def build_sampler(
     backend: str | None = None,
     optimization_level: int = 3,
     default_shots: int = 100_000,
-    aer_method: str = "statevector",
+    aer_method: str = _DEFAULT_AER_METHOD,
     mps_max_bond_dimension: int | None = None,
     mps_truncation_threshold: float | None = None,
     options=None,
@@ -115,13 +120,10 @@ def build_sampler(
         backend: backend name for ``"runtime"``; ``None`` picks the least-busy.
         optimization_level: ISA-transpile level for ``"runtime"``.
         default_shots: shot budget used when a caller does not pass ``shots``.
-        aer_method: Aer simulation method for ``"aer"`` -- ``"statevector"`` (default,
-            exact) through ``"matrix_product_state"`` (approximate, memory-frugal). See
-            :class:`~embasi_qiskit_integration.circuit_run.aer.AerSampler`; note seeds
-            do not reproduce across methods. Validated against the installed Aer.
-        mps_max_bond_dimension: bond-dimension cap for
-            ``aer_method="matrix_product_state"``; ``None`` leaves MPS uncapped (exact,
-            and often slower than statevector on entangling circuits).
+        aer_method: Aer simulation method for ``"aer"`` -- ``"matrix_product_state"``
+            (default, memory-frugal) or ``"statevector"`` (exact). Validated against the
+            installed Aer; seeds do not reproduce across methods.
+        mps_max_bond_dimension: bond-dimension cap for MPS; ``None`` leaves it uncapped.
         mps_truncation_threshold: singular-value truncation threshold for MPS.
         options: ``SamplerOptions`` (or dict) forwarded to ``SamplerV2``; see
             :class:`~embasi_qiskit_integration.circuit_run.runtime.RuntimeSampler`
@@ -146,7 +148,7 @@ def build_sampler(
             ``options``/characterisation with a sampler that cannot use them.
     """
     if kind != "aer" and (
-        aer_method != "statevector"
+        aer_method != _DEFAULT_AER_METHOD
         or mps_max_bond_dimension is not None
         or mps_truncation_threshold is not None
     ):
