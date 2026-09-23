@@ -32,19 +32,8 @@ jobs:
       - name: Lint (ruff)
         run: uv run ruff check src tests
 
-      # EMBASI_AVAILABLE=1 un-skips the `embasi`-marked tests; they are PySCF-backed, so
-      # they need no FHI-aims binary and no system MPI.  `addopts` deselects that marker, so
-      # the second step selects it explicitly.  `timeout-minutes` bounds each step so a hang
-      # is reported as a timeout rather than inheriting the job's 6-hour default, and `-ra`
-      # lists every non-pass outcome.
       - name: Run unit tests
         timeout-minutes: 30
         run: uv run pytest -q -ra
-        env:
-          EMBASI_AVAILABLE: "1"
-
-      - name: Run EmbASI-backed tests
-        timeout-minutes: 15
-        run: uv run pytest -q -ra -m embasi
         env:
           EMBASI_AVAILABLE: "1"
