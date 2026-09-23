@@ -127,6 +127,11 @@ def test_rank0_solve_broadcasts_result():
     proc = _run_mpi(code)
     assert proc.returncode == 0, _mpi_failure(proc)
 
+    ranks = {line.split()[1] for line in proc.stdout.splitlines() if line.startswith("RANK ")}
+    assert ranks == {"0", "1"}, (
+        f"expected ranks 0 and 1, saw {sorted(ranks)} -- a singleton launch reports every "
+        f"process as rank 0.\n{_mpi_failure(proc)}"
+    )
     energies = [
         float(line.split()[-1]) for line in proc.stdout.splitlines() if line.startswith("RANK ")
     ]
@@ -167,7 +172,15 @@ def test_embedding_workflow_mpi_orchestration():
     )
     assert proc.returncode == 0, _mpi_failure(proc)
 
-    # Rank-0-only banner appears exactly once (rank guarding works).
+    # A launcher that cannot form a multi-rank communicator runs N independent 1-rank
+    # jobs -- every rank reports itself as rank 0 of size 1.  Name that outright: it is an
+    # environment fault, and diagnosing it from a bare count mismatch is guesswork.
+    assert "running under MPI with 2 ranks" in proc.stdout, (
+        "ranks did not share one COMM_WORLD (mpi4py's bundled MPI runtime not matching "
+        f"the launcher will do this).\n{_mpi_failure(proc)}"
+    )
+
+    # Rank-0-only lines appear exactly once, i.e. rank guarding works.
     assert proc.stdout.count("running under MPI with 2 ranks") == 1
     assert proc.stdout.count("Step done: solve broadcast to all ranks") == 1
 

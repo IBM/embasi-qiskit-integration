@@ -26,6 +26,14 @@ jobs:
       - name: Install project
         run: uv pip install -e ".[dev,quantum,fermions,relabel,hardware,embed]"
 
+      # The PyPI mpi4py wheels bundle their own MPI runtime, so an imported mpi4py does
+      # not necessarily talk to the `mpirun` on PATH: each rank then initialises a
+      # singleton COMM_WORLD and the job silently degrades to N independent 1-rank runs
+      # (visible as two "RANK 0" lines and size == 1).  Rebuild it from source against
+      # the system MPICH installed above so launcher and library are the same MPI.
+      - name: Rebuild mpi4py against the system MPI
+        run: uv pip install --no-binary=mpi4py --force-reinstall --no-deps mpi4py
+
       - name: Check formatting (ruff)
         run: uv run ruff format --check src tests
 
