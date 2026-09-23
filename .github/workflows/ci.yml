@@ -17,13 +17,13 @@ jobs:
       - name: Set up Python
         run: uv venv --python 3.12
 
-      # MPICH, not OpenMPI: `mpi4py`'s wheel is built against MPICH, and launching it
-      # with OpenMPI's `mpirun` aborts before the payload runs.  This makes the launch
-      # work; whether the ranks then share one COMM_WORLD is probed by the MPI tests
-      # themselves, which skip if they cannot (see tests/test_mpi.py).
-      - name: Install MPI (EmbASI needs mpi4py)
-        run: sudo apt-get update && sudo apt-get install -y libmpich-dev mpich
-
+      # No system MPI is installed deliberately.  `mpi4py` comes from the `embed` extra
+      # as a self-contained wheel, which imports and runs single-rank without one, and
+      # `ipc.rank0_solve` degrades to a plain solve when mpi4py is absent or unused.  The
+      # two tests in tests/test_mpi.py need an `mpirun`, so without one they skip -- which
+      # is what we want here: this runner cannot form a multi-rank COMM_WORLD (see the MPI
+      # note in PR_SUMMARY.md), so installing a launcher only buys a red build no source
+      # change can fix.  Run them locally, where MPI works.
       - name: Install project
         run: uv pip install -e ".[dev,quantum,fermions,relabel,hardware,embed]"
 
