@@ -667,7 +667,7 @@ def test_frozen_core_on_the_spin_path_sums_both_channels():
     e_core_alpha_only = np.einsum("ij,ji->", dm_true, h_emb_a + 0.5 * veff_true)
     assert abs(ham.e_core - float(e_core_alpha_only)) > 1e-8
     assert float(e_core_alpha_only) - float(e_core_true) == pytest.approx(
-        float(np.einsum("ij,ji->", c_in_b @ c_in_b.T, h_emb_a - h_emb_b)), abs=1e-10
+        float(np.einsum("ij,ji->", c_in_b @ c_in_b.T, h_emb_a - h_emb_b)), rel=1e-13
     )
 
 

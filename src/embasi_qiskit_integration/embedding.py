@@ -887,6 +887,7 @@ class EmbeddingWorkflow(BaseSettings):
                 # No per-spin input to form a residual against (first cycle after a
                 # restricted start): fall back to the spin-summed vector this round.
                 vec_now, vec_fed, spin_mixed = dm_a_now, fed, False
+                fed_split = None
 
             mixing_desc = f"mix_alpha={self.mix_alpha}"
             extrapolated = None

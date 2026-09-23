@@ -866,6 +866,7 @@ class ProjectionEmbeddingAdapter:
             self._dm_a = self._dm_a_spin[0] + self._dm_a_spin[1]
         else:
             self._dm_a = dma_in
+            self._dm_a_spin = None
         if isinstance(dmb_in, tuple):
             self._dm_b_spin = (np.asarray(dmb_in[0]), np.asarray(dmb_in[1]))
             self._dm_b = self._dm_b_spin[0] + self._dm_b_spin[1]
