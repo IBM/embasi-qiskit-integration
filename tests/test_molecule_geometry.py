@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import require_module
+
 from embasi_qiskit_integration.molecule import geometry
 
 # Methanol from standard internal coordinates: r(C-O)=1.427, r(O-H)=0.956,
@@ -242,7 +244,7 @@ def test_read_xyz_override(tmp_path: Path):
 
 def test_readers_agree_on_charge(tmp_path: Path):
     """The Mole and Atoms readers cannot disagree, since both delegate to read_xyz."""
-    pytest.importorskip("ase", reason="needs the 'embed' extra")
+    require_module("ase", "needs the 'embed' extra")
     text = METHANOL.replace("smiles=CO; charge=0", "charge=-1")
     path = _write(tmp_path, "anion.xyz", text)
 
@@ -253,7 +255,7 @@ def test_readers_agree_on_charge(tmp_path: Path):
 
 def test_read_atoms_from_xyz(tmp_path: Path):
     """The ASE bridge returns Atoms in Angstrom plus the derived charge."""
-    pytest.importorskip("ase", reason="needs the 'embed' extra")
+    require_module("ase", "needs the 'embed' extra")
     atoms, charge, smiles = geometry.read_atoms_from_xyz(_write(tmp_path, "meoh.xyz", METHANOL))
 
     assert list(atoms.symbols) == ["C", "O", "H", "H", "H", "H"]

@@ -102,20 +102,26 @@ DATA_DIR = Path(__file__).resolve().parents[2] / "tests" / "data"
 
 
 def _rank_size() -> tuple[int, int]:
-    """(rank, size) under MPI; (0, 1) when mpi4py is absent (single process)."""
+    """(rank, size) under MPI; (0, 1) when MPI is unusable (single process).
+
+    Catches more than ``ImportError``: ``mpi4py`` resolves its MPI runtime on import and
+    raises ``RuntimeError("cannot load MPI library")`` when the package is installed but no
+    ``libmpi`` is present -- an environment without a system MPI, which is single-process
+    by definition.
+    """
     try:
         from mpi4py import MPI
-    except ImportError:
+    except (ImportError, RuntimeError, OSError):
         return 0, 1
     comm = MPI.COMM_WORLD
     return comm.Get_rank(), comm.Get_size()
 
 
 def _broadcast(obj):
-    """Broadcast ``obj`` from rank 0 to all ranks; identity without mpi4py."""
+    """Broadcast ``obj`` from rank 0 to all ranks; identity when MPI is unusable."""
     try:
         from mpi4py import MPI
-    except ImportError:
+    except (ImportError, RuntimeError, OSError):
         return obj
     return MPI.COMM_WORLD.bcast(obj, root=0)
 

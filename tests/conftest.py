@@ -77,3 +77,21 @@ def _statevector_aer_in_tests(request, monkeypatch: pytest.MonkeyPatch) -> None:
     import embasi_qiskit_integration.circuit_run as _cr
 
     monkeypatch.setattr(_cr, "_DEFAULT_AER_METHOD", TEST_AER_METHOD)
+
+
+def require_module(name: str, reason: str) -> object:
+    """``pytest.importorskip`` that also skips when the module imports but is unusable.
+
+    ``importorskip`` only catches ``ImportError``.  ``ase`` imports ``mpi4py`` at module
+    scope, and ``mpi4py`` raises ``RuntimeError("cannot load MPI library")`` when it is
+    installed without a system ``libmpi`` -- so the dependency is effectively absent while
+    presenting as a hard error.  Skip on that too.
+    """
+    import importlib
+
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        pytest.skip(reason)
+    except (RuntimeError, OSError) as exc:
+        pytest.skip(f"{reason} ({name} imports but is unusable: {exc})")

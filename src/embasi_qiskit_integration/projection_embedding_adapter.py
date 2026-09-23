@@ -1638,7 +1638,9 @@ class ProjectionEmbeddingAdapter:
         block = np.ascontiguousarray(np.asarray(m))
         try:
             from embasi.ks_array import SpinKpointArray
-        except ImportError:
+        # Wider than ImportError: `embasi` imports mpi4py, which raises RuntimeError when
+        # installed without a system libmpi.  Either way there is no SpinKpointArray to use.
+        except (ImportError, RuntimeError, OSError):
             return block[np.newaxis, np.newaxis, :, :]
         # Restricted wrapper: one channel at key (0, 0).  The per-spin counterpart is
         # `_as_spin_kpoint_pair`, which EmbASI reads as a genuine pair.
@@ -1666,7 +1668,9 @@ class ProjectionEmbeddingAdapter:
             )
         try:
             from embasi.ks_array import SpinKpointArray
-        except ImportError:
+        # Wider than ImportError: `embasi` imports mpi4py, which raises RuntimeError when
+        # installed without a system libmpi.  Either way there is no SpinKpointArray to use.
+        except (ImportError, RuntimeError, OSError):
             return np.stack([a, b])[:, np.newaxis, :, :]
         return SpinKpointArray({(0, 0): a, (1, 0): b}, n_spin=2, n_kpoints=1)
 

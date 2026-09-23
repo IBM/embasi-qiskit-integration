@@ -33,13 +33,17 @@ ERROR_NAME = "result.ERROR"
 def rank0_solve(solver, ham: EmbeddedHamiltonian) -> SolverResult:
     """Run ``solver.solve(ham)`` on rank 0 and broadcast the result.
 
-    With mpi4py absent this is just ``solver.solve(ham)``. With mpi4py present,
-    only rank 0 solves (quantum sampling/hardware calls must be serialized) and
-    the :class:`SolverResult` is broadcast to all ranks.
+    With MPI unusable this is just ``solver.solve(ham)``. With mpi4py present, only rank 0
+    solves (quantum sampling/hardware calls must be serialized) and the
+    :class:`SolverResult` is broadcast to all ranks.
+
+    "Unusable" is wider than "not installed": ``mpi4py`` resolves its MPI runtime on import
+    and raises ``RuntimeError("cannot load MPI library")`` when installed without a system
+    ``libmpi``, which is a single-process environment either way.
     """
     try:
         from mpi4py import MPI
-    except ImportError:
+    except (ImportError, RuntimeError, OSError):
         return solver.solve(ham)
 
     comm = MPI.COMM_WORLD

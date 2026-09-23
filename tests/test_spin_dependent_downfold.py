@@ -18,6 +18,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from conftest import require_module
+
 from embasi_qiskit_integration.contract import EmbeddedHamiltonian
 from embasi_qiskit_integration.selectors import somo_occupation_pattern
 from embasi_qiskit_integration.solvers import FCISolver
@@ -400,6 +402,8 @@ def test_mixed_spin_eri_has_only_fourfold_symmetry():
 # --------------------------------------------------------------------------- #
 def test_density_pair_is_wrapped_at_n_spin_two():
     """EmbASI reads ``[0,0]`` and ``[1,0]`` when ``n_spins == 2``; a pair must use that."""
+    require_module("embasi.ks_array", "needs a usable EmbASI (SpinKpointArray)")
+
     from embasi_qiskit_integration.projection_embedding_adapter import (
         ProjectionEmbeddingAdapter,
     )
@@ -421,6 +425,8 @@ def test_density_pair_shapes_must_match():
 
 
 def test_wrap_density_dispatches_on_tuple_vs_matrix():
+    require_module("embasi.ks_array", "needs a usable EmbASI (SpinKpointArray)")
+
     from embasi_qiskit_integration.projection_embedding_adapter import (
         ProjectionEmbeddingAdapter,
     )
