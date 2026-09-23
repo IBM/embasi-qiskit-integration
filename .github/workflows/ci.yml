@@ -17,13 +17,12 @@ jobs:
       - name: Set up Python
         run: uv venv --python 3.12
 
-      # No system MPI is installed deliberately.  `mpi4py` comes from the `embed` extra
-      # as a self-contained wheel, which imports and runs single-rank without one, and
-      # `ipc.rank0_solve` degrades to a plain solve when mpi4py is absent or unused.  The
-      # two tests in tests/test_mpi.py need an `mpirun`, so without one they skip -- which
-      # is what we want here: this runner cannot form a multi-rank COMM_WORLD (see the MPI
-      # note in PR_SUMMARY.md), so installing a launcher only buys a red build no source
-      # change can fix.  Run them locally, where MPI works.
+      # No system MPI (no apt libmpich/openmpi): `mpi4py` arrives with the `embed` extra as
+      # a self-contained wheel and works single-rank without one, which is all EmbASI needs
+      # -- it imports mpi4py at module scope, so the extra cannot be had without it.  What a
+      # system MPI would add is a `mpirun` launcher, and this runner could not form a
+      # multi-rank COMM_WORLD however it was provided; tests/test_mpi.py therefore skips
+      # (no launcher) while everything EmbASI-backed runs.
       - name: Install project
         run: uv pip install -e ".[dev,quantum,fermions,relabel,hardware,embed]"
 
@@ -33,21 +32,17 @@ jobs:
       - name: Lint (ruff)
         run: uv run ruff check src tests
 
-      # EMBASI_AVAILABLE=1 un-skips the `embasi`-marked tests, which need the `embed`
-      # extra installed above.  They are PySCF-backed, so they need no FHI-aims binary.
-      #
-      # `timeout-minutes` bounds the step explicitly: the suite runs in ~5 min, so 30 is
-      # generous, and a hang is then reported as a timeout rather than the job's 6-hour
-      # default.  `-ra` makes the short summary list every non-pass outcome, so a run that
-      # dies mid-way still says which tests had started.
+      # EMBASI_AVAILABLE=1 un-skips the `embasi`-marked tests; they are PySCF-backed, so
+      # they need no FHI-aims binary and no system MPI.  `addopts` deselects that marker, so
+      # the second step selects it explicitly.  `timeout-minutes` bounds each step so a hang
+      # is reported as a timeout rather than inheriting the job's 6-hour default, and `-ra`
+      # lists every non-pass outcome.
       - name: Run unit tests
         timeout-minutes: 30
         run: uv run pytest -q -ra
         env:
           EMBASI_AVAILABLE: "1"
 
-      # The `embasi` marker is deselected by the addopts in pyproject.toml, so the run
-      # above never collects it; -m embasi selects exactly that set.
       - name: Run EmbASI-backed tests
         timeout-minutes: 15
         run: uv run pytest -q -ra -m embasi
