@@ -47,12 +47,17 @@ class SolveCommand(BaseSettings):
     counts: str | None = None
     backend: str | None = None  # runtime backend name; else least-busy
     optimization_level: int = 1  # runtime ISA-transpile level (0-3)
-    shots: int = 10_000  # per circuit
+    shots: int = 1_000  # per circuit for SQD
     seed: int = 42
     optimize: bool | None = None
     time_limit: float = 10.0  # per-solve wall-clock limit for the relabel MILP
     # Processes used to build the circuit ensemble. 0 means one per CPU.
     workers: int = 1
+    # SQD solver parameters
+    method: Literal["exact", "qdrift"] = "qdrift"
+    evolution_time: float = 1.0
+    num_groups: int = 15
+    num_randomizations: int = 500  # for method="qdrift", number of random circuits to sample
     measure_twirling: bool = True
     # Idle-qubit decoherence suppression; off by default (it lengthens the schedule).
     dynamical_decoupling: bool = False
@@ -110,6 +115,10 @@ class SolveCommand(BaseSettings):
             optimize=self.optimize,
             time_limit=self.time_limit,
             workers=self.workers,
+            method=self.method,
+            evolution_time=self.evolution_time,
+            num_groups=self.num_groups,
+            num_randomizations=self.num_randomizations,
         )
 
     def _sampler_options(self) -> dict | None:

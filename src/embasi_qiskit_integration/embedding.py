@@ -582,10 +582,16 @@ class EmbeddingWorkflow(BaseSettings):
     mps_truncation_threshold: float | None = None
     backend: str | None = None  # runtime backend name; else least-busy
     optimization_level: int = 3  # runtime ISA-transpile level
-    shots: int = 100_000
+    shots: int = 1_000
     seed: int = 24
     job_dir: Path | None = None
     output_path: Path | None = None
+    diagnostics_csv: Path | None = None  # append per-cycle diagnostics here; None disables logging
+    # SQD solver parameters
+    method: Literal["exact", "qdrift"] = "qdrift"
+    evolution_time: float = 1.0
+    num_groups: int = 15
+    num_randomizations: int = 500  # for method="qdrift", number of random circuits to sample
 
     # ---------------- main ---------------- #
     def cli_cmd(self) -> None:
@@ -600,6 +606,8 @@ class EmbeddingWorkflow(BaseSettings):
         the returned :class:`ProjectionEnergy`.  Pass ``log`` to redirect the
         console output (default: print on rank 0).
         """
+        import uuid
+
         rank, size = _rank_size()
 
         if log is None:
@@ -611,6 +619,13 @@ class EmbeddingWorkflow(BaseSettings):
 
         if size > 1:
             log(f"[running under MPI with {size} ranks; solve is on rank 0]")
+
+        # Compute per-run identifiers for diagnostics logging (one per execution)
+        run_id = uuid.uuid4().hex
+        geometry_file = str(self.xyz) if self.xyz is not None else f"s26[{self.s26_index}]"
+        geometry_parameter = None
+        if self.xyz is not None and self.xyz.stem.isdigit():
+            geometry_parameter = int(self.xyz.stem) / 10.0
 
         log("== Step 1: EmbASI low-level projection embedding ==")
         source = f"xyz={self.xyz}" if self.xyz is not None else f"s26[{self.s26_index}]"
@@ -641,9 +656,17 @@ class EmbeddingWorkflow(BaseSettings):
             emb, log=log, use_relaxed=self.relax_hf
         )
         solver = self._build_solver()
-
         output = self._run_outer_loop(
-            emb, solver, selector, virtual_localizer, orbital_builder, rank=rank, log=log
+            emb,
+            solver,
+            selector,
+            virtual_localizer,
+            orbital_builder,
+            rank=rank,
+            log=log,
+            run_id=run_id,
+            geometry_file=geometry_file,
+            geometry_parameter=geometry_parameter,
         )
 
         if self.output_path is not None:
@@ -692,7 +715,18 @@ class EmbeddingWorkflow(BaseSettings):
 
     # ---------------- outer self-consistency loop ---------------- #
     def _run_outer_loop(
-        self, emb, solver, selector, virtual_localizer=None, orbital_builder=None, *, rank, log
+        self,
+        emb,
+        solver,
+        selector,
+        virtual_localizer=None,
+        orbital_builder=None,
+        *,
+        rank,
+        log,
+        run_id,
+        geometry_file,
+        geometry_parameter,
     ):
         """Steps 2-5, iterated until self-consistent (or ``max_cycles``).
 
@@ -844,6 +878,9 @@ class EmbeddingWorkflow(BaseSettings):
             # robust choice under a stochastic solver whose density carries sampling noise;
             # "energy_and_density" also requires max|Δγ^A| < rho_tol.
             dm_a_now = np.asarray(emb._dm_a)
+            de = None
+            drho = None
+            converged = False
             if prev_total is not None:
                 de = abs(energy.total - prev_total)
                 drho = float(np.abs(dm_a_now - prev_dm_a).max())
@@ -851,13 +888,35 @@ class EmbeddingWorkflow(BaseSettings):
                 energy_ok = de < self.e_tol
                 density_ok = drho < self.rho_tol
                 converged = energy_ok and (density_ok or self.converge_on == "energy")
-                if converged:
-                    crit = "|ΔE|" if self.converge_on == "energy" else "|ΔE| and max|Δγ^A|"
-                    log(f"   converged ({crit}) after {cycle + 1} cycles.")
-                    return energy
+
+            is_last_cycle = cycle == self.max_cycles - 1
+            total_cycles = (cycle + 1) if (converged or is_last_cycle) else None
+
+            self._log_diagnostics_cycle(
+                run_id=run_id,
+                geometry_file=geometry_file,
+                geometry_parameter=geometry_parameter,
+                cycle=cycle,
+                converged=converged,
+                total_cycles=total_cycles,
+                orbitals=orbitals,
+                ham=ham,
+                result=result,
+                energy=energy,
+                solver=solver,
+                delta_e=de,
+                max_delta_gamma_a=drho,
+                rank=rank,
+                log=log,
+            )
+
+            if converged:
+                crit = "|ΔE|" if self.converge_on == "energy" else "|ΔE| and max|Δγ^A|"
+                log(f"   converged ({crit}) after {cycle + 1} cycles.")
+                return energy
             prev_total, prev_dm_a = energy.total, dm_a_now
 
-            if cycle == self.max_cycles - 1:
+            if is_last_cycle:
                 if self.max_cycles > 1:
                     log(f"   reached max_cycles={self.max_cycles} without convergence.")
                 break
@@ -954,6 +1013,62 @@ class EmbeddingWorkflow(BaseSettings):
 
         return energy
 
+    def _log_diagnostics_cycle(
+        self,
+        *,
+        run_id: str,
+        geometry_file: str,
+        geometry_parameter: float | None,
+        cycle: int,
+        converged: bool,
+        total_cycles: int | None,
+        orbitals,
+        ham,
+        result,
+        energy,
+        solver,
+        delta_e: float | None,
+        max_delta_gamma_a: float | None,
+        rank: int,
+        log,
+    ) -> None:
+        """Log one diagnostics row for the current cycle, if logging is enabled.
+
+        Logging is strictly optional and non-fatal: if disabled (diagnostics_csv is None),
+        this is a no-op; if enabled but fails (bad path, missing data), a warning is logged
+        and execution continues. This ensures diagnostic failures never abort the outer loop.
+        """
+        if self.diagnostics_csv is None or rank != 0:
+            return
+
+        try:
+            from embasi_qiskit_integration.diagnostics_csv import (
+                build_diagnostics_row,
+                append_diagnostics_row,
+            )
+
+            row = build_diagnostics_row(
+                self,
+                run_id=run_id,
+                geometry_file=geometry_file,
+                geometry_parameter=geometry_parameter,
+                cycle=cycle,
+                converged=converged,
+                total_cycles=total_cycles,
+                orbitals=orbitals,
+                ham=ham,
+                result=result,
+                energy=energy,
+                solver=solver,
+            )
+            # Add delta_E and max_delta_gamma_A (computed in convergence check, may be None)
+            row["delta_E"] = delta_e
+            row["max_delta_gamma_A"] = max_delta_gamma_a
+
+            append_diagnostics_row(self.diagnostics_csv, row)
+        except Exception as exc:
+            log(f"   [diagnostics] skipped cycle {cycle + 1}: {type(exc).__name__}: {exc}")
+
     @staticmethod
     def _diis_extrapolate(
         residuals: list[np.ndarray], outputs: list[np.ndarray]
@@ -1019,7 +1134,15 @@ class EmbeddingWorkflow(BaseSettings):
             mps_max_bond_dimension=self.mps_max_bond_dimension,
             mps_truncation_threshold=self.mps_truncation_threshold,
         )
-        return SQDSolver(sampler, shots=self.shots, seed=self.seed)
+        return SQDSolver(
+            sampler,
+            shots=self.shots,
+            seed=self.seed,
+            method=self.method,
+            evolution_time=self.evolution_time,
+            num_groups=self.num_groups,
+            num_randomizations=self.num_randomizations,
+        )
 
     def _solve(self, ham, solver, *, rank, log) -> SolverResult:
         """Solve in-process, or via the two-process file handoff.
