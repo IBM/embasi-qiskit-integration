@@ -1,0 +1,8 @@
+for i in 08 09
+
+do
+  #uv run scripts/embedding_workflow.py --xyz data/${i}.inp --n_atoms 12 --active_atoms '[0,1]' --selector apc-concentric --n_shells 1 --apc_fixed=True --max_cycles 30 --xc_ll=HF --xc_hl=HF --a_nmos 7 --apc_max_size '[6,6]' --mix_alpha 0.08 --diis True --solver fci --output_path output/cas_6_6_EXACT_fci.csv --diagnostics_csv output/diagnotic_6_6_EXACT.csv
+  uv run scripts/embedding_workflow.py --xyz data/${i}.inp --n_atoms 12 --active_atoms '[0,1]' --selector apc-concentric --n_shells 1 --apc_fixed=True --max_cycles 30 --xc_ll=HF --xc_hl=HF --a_nmos 7 --apc_max_size '[6,6]' --mix_alpha 0.08 --diis True --method qdrift --shots 1000 --output_path output/cas_6_6_qdrift_aer.csv --diagnostics_csv output/diagnotic_6_6_qdrift.csv
+  #uv run scripts/embedding_workflow.py --xyz data/${i}.inp --n_atoms 12 --active_atoms '[0,1]' --selector apc-concentric --n_shells 1 --apc_fixed=True --max_cycles 30 --xc_ll=HF --xc_hl=HF --a_nmos 7 --apc_max_size '[6,6]' --mix_alpha 0.08 --diis True --sampler runtime --backend FakeKingston --output_path output/cas_6_6_fake_kingston_NEW.csv --diagnostics_csv output/diagnotic_6_6_NEW.csv
+  #uv run scripts/embedding_workflow.py --xyz data/${i}.inp --n_atoms 12 --active_atoms '[0,1]' --selector apc-concentric --n_shells 1 --apc_fixed=True --max_cycles 30 --xc_ll=HF --xc_hl=HF --a_nmos 7 --apc_max_size '[6,6]' --mix_alpha 0.08 --diis True --sampler runtime --backend ibm_kingston --output_path output/cas_6_6_ibm_kingston.csv --diagnostics_csv output/diagnotic_6_6.csv
+done

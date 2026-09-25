@@ -251,7 +251,16 @@ def test_single_cycle_matches_direct_calls():
     adapter2 = _build_adapter()
     adapter2.run_low_level()
     wf = _workflow(solver="fci", max_cycles=1)
-    energy = wf._run_outer_loop(adapter2, FCISolver(), None, rank=0, log=lambda *a, **k: None)
+    energy = wf._run_outer_loop(
+        adapter2,
+        FCISolver(),
+        None,
+        rank=0,
+        log=lambda *a, **k: None,
+        run_id="test",
+        geometry_file="test",
+        geometry_parameter=None,
+    )
     assert energy.total == pytest.approx(ref.total, abs=1e-9)
 
 
@@ -261,7 +270,16 @@ def test_loop_converges_and_stops_early():
     adapter.run_low_level()
     logs: list[str] = []
     wf = _workflow(solver="fci", max_cycles=8, e_tol=1e-6, rho_tol=1e-5)
-    energy = wf._run_outer_loop(adapter, FCISolver(), None, rank=0, log=logs.append)
+    energy = wf._run_outer_loop(
+        adapter,
+        FCISolver(),
+        None,
+        rank=0,
+        log=logs.append,
+        run_id="test",
+        geometry_file="test",
+        geometry_parameter=None,
+    )
     assert energy is not None
     # FCI on the full A space is a fixed point: the density fed back equals the
     # one that produced it, so cycle 2 already matches cycle 1 and the loop stops.
@@ -280,7 +298,16 @@ def test_converge_on_energy_stops_when_density_still_moving():
     wf_e = _workflow(solver="fci", max_cycles=8, e_tol=1e-6, rho_tol=1e-30, converge_on="energy")
     adapter_e = _build_adapter()
     adapter_e.run_low_level()
-    wf_e._run_outer_loop(adapter_e, FCISolver(), None, rank=0, log=logs_e.append)
+    wf_e._run_outer_loop(
+        adapter_e,
+        FCISolver(),
+        None,
+        rank=0,
+        log=logs_e.append,
+        run_id="test",
+        geometry_file="test",
+        geometry_parameter=None,
+    )
     assert any("converged (|ΔE|)" in line for line in logs_e)
 
     # Same setup but requiring density too: the impossible rho_tol prevents the
@@ -295,7 +322,16 @@ def test_converge_on_energy_stops_when_density_still_moving():
     )
     adapter_ed = _build_adapter()
     adapter_ed.run_low_level()
-    wf_ed._run_outer_loop(adapter_ed, FCISolver(), None, rank=0, log=logs_ed.append)
+    wf_ed._run_outer_loop(
+        adapter_ed,
+        FCISolver(),
+        None,
+        rank=0,
+        log=logs_ed.append,
+        run_id="test",
+        geometry_file="test",
+        geometry_parameter=None,
+    )
     assert any("reached max_cycles" in line for line in logs_ed)
     assert not any("converged" in line for line in logs_ed)
 
@@ -335,7 +371,16 @@ def test_feedback_propagates_the_two_densities_separately():
     # mix_alpha=1.0 -> the fed γ̃^A is the raw correlated density, unmixed, so it can
     # be compared against the adapter's own rdm1_ao output without damping algebra.
     wf = _workflow(solver="fci", max_cycles=2, mix_alpha=1.0, e_tol=1e-30, rho_tol=1e-30)
-    wf._run_outer_loop(adapter, FCISolver(), None, rank=0, log=lambda *a, **k: None)
+    wf._run_outer_loop(
+        adapter,
+        FCISolver(),
+        None,
+        rank=0,
+        log=lambda *a, **k: None,
+        run_id="test",
+        geometry_file="test",
+        geometry_parameter=None,
+    )
 
     assert calls, "feedback never reached run_low_level_a_only"
     for fed_a, fed_b in calls:
@@ -379,7 +424,16 @@ def test_mix_alpha_damps_the_fed_back_density():
         wf = _workflow(
             solver="fci", max_cycles=3, mix_alpha=alpha, e_tol=1e-30, rho_tol=1e-30
         )  # never stop early -> full 3 cycles
-        wf._run_outer_loop(adapter, FCISolver(), None, rank=0, log=lambda *a, **k: None)
+        wf._run_outer_loop(
+            adapter,
+            FCISolver(),
+            None,
+            rank=0,
+            log=lambda *a, **k: None,
+            run_id="test",
+            geometry_file="test",
+            geometry_parameter=None,
+        )
         return [m.copy() for m in seen]
 
     undamped = build(1.0)
@@ -587,3 +641,86 @@ def test_diis_extrapolate_refuses_a_mixed_shape_subspace_loudly():
     r_stack = np.ones((2, 4, 4))
     with pytest.raises(ValueError):
         EmbeddingWorkflow._diis_extrapolate([r_sum, r_stack], [r_sum, r_stack])
+
+
+def test_diagnostics_csv_disabled_by_default(tmp_path):
+    """With diagnostics_csv=None (the default), no file is created."""
+    adapter = _build_adapter()
+    adapter.run_low_level()
+    wf = _workflow(solver="fci", max_cycles=2, diagnostics_csv=None)
+    result1 = wf._run_outer_loop(
+        adapter,
+        FCISolver(),
+        None,
+        rank=0,
+        log=lambda x: None,
+        run_id="test1",
+        geometry_file="test",
+        geometry_parameter=None,
+    )
+
+    # Verify no file was created at all
+    csv_files = list(tmp_path.glob("*.csv"))
+    assert len(csv_files) == 0
+
+    # Verify the result is still valid (loop is unaffected by disabled logging)
+    assert result1 is not None
+    assert hasattr(result1, "total")
+
+
+def test_diagnostics_csv_logging_enabled(tmp_path):
+    """With diagnostics_csv set, one row per cycle is logged."""
+    import csv
+
+    from embasi_qiskit_integration.diagnostics_csv import DIAGNOSTICS_CSV_COLUMNS
+
+    adapter = _build_adapter()
+    adapter.run_low_level()
+    csv_path = tmp_path / "test_diag.csv"
+    # max_cycles=3 to allow enough iterations; with e_tol/rho_tol defaults convergence
+    # happens on cycle 1
+    wf = _workflow(solver="fci", max_cycles=3, e_tol=1e-6, rho_tol=1e-5, diagnostics_csv=csv_path)
+    result = wf._run_outer_loop(
+        adapter,
+        FCISolver(),
+        None,
+        rank=0,
+        log=lambda x: None,
+        run_id="test-uuid-123",
+        geometry_file="test_geom.inp",
+        geometry_parameter=1.5,
+    )
+
+    # Verify the file exists and has the right structure
+    assert csv_path.exists()
+    with csv_path.open(newline="") as fh:
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+
+    # Should have at least one row
+    assert len(rows) >= 1
+
+    # Check the final (converged or last) row
+    final_row = rows[-1]
+    # Verify required columns are populated
+    assert final_row["run_id"] == "test-uuid-123"
+    assert final_row["geometry_file"] == "test_geom.inp"
+    assert final_row["geometry_parameter"] == "1.5"
+    assert final_row["algorithm"] == "FCI"
+    assert final_row["converged"] == "True"
+    assert int(final_row["total_cycles"]) == len(rows)
+    assert float(final_row["embedding_energy"]) == pytest.approx(result.total, abs=1e-9)
+
+    # Verify FCI-comparison columns are empty
+    assert final_row.get("E_FCI_same_H", "") == ""
+    assert final_row.get("number_recovered_determinants", "") == ""
+
+    # Verify header contains all expected columns
+    assert all(col in final_row for col in DIAGNOSTICS_CSV_COLUMNS)
+
+    # If more than one cycle, check first row (not yet converged)
+    if len(rows) > 1:
+        first_row = rows[0]
+        assert first_row["cycle"] == "0"
+        assert first_row["converged"] == "False"
+        assert first_row.get("total_cycles", "") == ""  # Not yet finalized

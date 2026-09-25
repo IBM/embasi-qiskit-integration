@@ -96,6 +96,13 @@ class RuntimeSampler(SamplerMixin):
         # layout actually used. Populated by :meth:`run`.
         self.hardware_characterisation: dict | None = None
 
+    @property
+    def resolved_backend_name(self) -> str | None:
+        """The actual backend name used, once resolved (None before the first run())."""
+        if self._backend_obj is not None:
+            return getattr(self._backend_obj, "name", None)
+        return self.backend_name
+
     def resolve_backend(self, *, num_qubits: int | None = None):
         """Resolve the backend to run on (cached on this instance after the first call).
 
