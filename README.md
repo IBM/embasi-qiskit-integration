@@ -336,8 +336,7 @@ The authoritative column list is `DIAGNOSTICS_CSV_COLUMNS` in
 [`diagnostics_csv.py`](src/embasi_qiskit_integration/diagnostics_csv.py).
 
 `--diagnostics_csv` is distinct from `--output_path`, which appends one summary line per
-*run* rather than per cycle. [`execute.sh`](execute.sh) shows both driving a geometry
-sweep.
+*run* rather than per cycle.
 
 ### Starting from an `.xyz`
 
