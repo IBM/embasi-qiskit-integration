@@ -54,7 +54,7 @@ class SolveCommand(BaseSettings):
     # Processes used to build the circuit ensemble. 0 means one per CPU.
     workers: int = 1
     # SQD solver parameters
-    method: Literal["exact", "qdrift"] = "qdrift"
+    sqd_method: Literal["exact", "qdrift"] = "qdrift"
     evolution_time: float = 1.0
     num_groups: int = 15
     num_randomizations: int = 500  # for method="qdrift", number of random circuits to sample
@@ -115,7 +115,7 @@ class SolveCommand(BaseSettings):
             optimize=self.optimize,
             time_limit=self.time_limit,
             workers=self.workers,
-            method=self.method,
+            method=self.sqd_method,
             evolution_time=self.evolution_time,
             num_groups=self.num_groups,
             num_randomizations=self.num_randomizations,

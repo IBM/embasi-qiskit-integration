@@ -617,7 +617,16 @@ def test_diis_subspace_is_reset_when_the_convergence_vector_changes_shape():
     wf = _workflow(solver="fci", max_cycles=4, diis=True, e_tol=0.0, rho_tol=0.0)
 
     # Before the fix this raised ValueError out of the loop.
-    energy = wf._run_outer_loop(wrapped, _SpinResolvedFCI(), None, rank=0, log=logs.append)
+    energy = wf._run_outer_loop(
+        wrapped,
+        _SpinResolvedFCI(),
+        None,
+        rank=0,
+        log=logs.append,
+        run_id="test",
+        geometry_file="test",
+        geometry_parameter=None,
+    )
 
     assert energy is not None, "the loop must complete, not abort on the shape change"
     resets = [line for line in logs if "DIIS subspace reset" in line]

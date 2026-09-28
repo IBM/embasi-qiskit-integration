@@ -588,7 +588,7 @@ class EmbeddingWorkflow(BaseSettings):
     output_path: Path | None = None
     diagnostics_csv: Path | None = None  # append per-cycle diagnostics here; None disables logging
     # SQD solver parameters
-    method: Literal["exact", "qdrift"] = "qdrift"
+    sqd_method: Literal["exact", "qdrift"] = "qdrift"
     evolution_time: float = 1.0
     num_groups: int = 15
     num_randomizations: int = 500  # for method="qdrift", number of random circuits to sample
@@ -1138,7 +1138,7 @@ class EmbeddingWorkflow(BaseSettings):
             sampler,
             shots=self.shots,
             seed=self.seed,
-            method=self.method,
+            method=self.sqd_method,
             evolution_time=self.evolution_time,
             num_groups=self.num_groups,
             num_randomizations=self.num_randomizations,

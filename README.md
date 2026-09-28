@@ -67,7 +67,7 @@ from embasi_qiskit_integration.solvers import FCISolver
 
 ham = fcidump.read("tests/data/n2_8o10e.fcidump")
 res = FCISolver().solve(ham)
-print(res.energy)            # -108.9585095430 Ha; res.rdm1 / res.rdm2 populated
+print(res.energy)  # -108.9585095430 Ha; res.rdm1 / res.rdm2 populated
 ```
 
 ### 2. SQD with Aer (noiseless)
@@ -79,7 +79,7 @@ from embasi_qiskit_integration.solvers import SQDSolver
 # SQDSolver builds the SqDRIFT ansatz, samples it, and runs the SQD loop.
 # (AerSampler + SqDRIFT needs the `quantum` + `fermions` extras.)
 res = SQDSolver(AerSampler(), shots=100_000, seed=24).solve(ham)
-print(res.energy)            # within 2e-3 Ha of FCI; res.diagnostics carries provenance
+print(res.energy)  # within 2e-3 Ha of FCI; res.diagnostics carries provenance
 ```
 
 For CI / offline runs, replay frozen counts with `MockSampler` instead of
@@ -91,7 +91,7 @@ chain at 2000 shots, 30 qubits takes 0.01 s under MPS against 23.94 s under
 `statevector`, whose memory doubles per qubit.
 
 ```python
-AerSampler(method="statevector")                                   # exact, small spaces
+AerSampler(method="statevector")  # exact, small spaces
 AerSampler(method="matrix_product_state", mps_max_bond_dimension=64)  # capped MPS
 ```
 
@@ -108,6 +108,7 @@ The sampler is the only thing that changes.
 
 ```python
 from qiskit_ibm_runtime import QiskitRuntimeService
+
 QiskitRuntimeService.save_account(channel="ibm_quantum_platform", token="<IBM_TOKEN>")
 ```
 
@@ -117,7 +118,7 @@ or export `QISKIT_IBM_TOKEN` in your environment. Then swap in `RuntimeSampler`:
 from embasi_qiskit_integration.circuit_run.runtime import RuntimeSampler
 from embasi_qiskit_integration.solvers import SQDSolver
 
-sampler = RuntimeSampler()                          # least-busy real backend
+sampler = RuntimeSampler()  # least-busy real backend
 # sampler = RuntimeSampler(backend="ibm_kingston")  # or pick one explicitly
 # sampler = RuntimeSampler(optimization_level=2)    # ISA-transpile level (default 3)
 res = SQDSolver(sampler, shots=100_000).solve(ham)
@@ -181,8 +182,12 @@ SQD):
 
 ```python
 from qiskit import QuantumCircuit
-qc = QuantumCircuit(2); qc.h(0); qc.cx(0, 1); qc.measure_all()
-print(RuntimeSampler().sample(qc, shots=1024))   # -> counts dict from hardware
+
+qc = QuantumCircuit(2)
+qc.h(0)
+qc.cx(0, 1)
+qc.measure_all()
+print(RuntimeSampler().sample(qc, shots=1024))  # -> counts dict from hardware
 ```
 
 ### 4. Two-process CLI handoff
@@ -206,6 +211,30 @@ uv run embasi-qiskit-integration solve <jobdir> --solver fci          # classica
 ```
 
 Defaults are `--shots 10000` per circuit, `--optimization_level 1`, `--seed 42`.
+
+**`--sqd_method` picks how the SqDRIFT ansatz is built** — `qdrift` (the default) or
+`exact`. It is the CLI name for the `method=` argument in §2/[Ansatz](#ansatz), and it
+is accepted by both `solve` and `scripts/embedding_workflow.py`:
+
+```bash
+uv run embasi-qiskit-integration solve <jobdir> --sqd_method exact    # one full-evolution circuit per time
+uv run embasi-qiskit-integration solve <jobdir> --sqd_method qdrift \
+    --num_randomizations 500 --num_groups 15 --evolution_time 1.0     # randomized ensemble (default)
+```
+
+- `exact` synthesises **one** exact time-evolution circuit at `--evolution_time`. Deepest
+  circuit, no ensemble, and `--num_randomizations` / `--num_groups` are ignored.
+- `qdrift` draws an **ensemble** of `--num_randomizations` randomized circuits, samples
+  each at `--shots`, and pools the counts. The real shot budget is therefore
+  `num_randomizations * shots`, not `shots`, which at a fixed total budget is
+  substantially more accurate than a single deep circuit.
+
+The qDRIFT knobs only bite under `--sqd_method qdrift`: `--num_randomizations` (default
+**500**) is the ensemble size, `--num_groups` (default **15**) the length of the
+randomized product inside each circuit, and `--evolution_time` (default **1.0**) the
+evolution time. Since the default is `qdrift` at 500 randomizations, a bare
+`--shots 1000` run submits 500 circuits — cut `--num_randomizations` before pointing it
+at real hardware.
 
 **Error suppression (runtime sampler only).** `--measure_twirling` defaults to
 **true** here — unlike bare `SamplerV2`, because a bare `solve` targets hardware
@@ -232,6 +261,7 @@ reported through the standard `logging` module under the
 
 ```python
 import logging
+
 logging.basicConfig(level=logging.INFO)
 ```
 
@@ -264,6 +294,50 @@ uv run python scripts/embedding_workflow.py --handoff two-process  # file handof
 uv run python scripts/embedding_workflow.py --solver fci           # classical FCI reference
 uv run python scripts/embedding_workflow.py --xc_hl PBE0           # DFT-in-DFT (solver inert)
 ```
+
+### Per-cycle diagnostics to CSV (`--diagnostics_csv`)
+
+The outer loop's per-cycle log normally only goes to the console. `--diagnostics_csv
+<path>` additionally appends **one row per outer-loop cycle** to a CSV, so a sweep over
+geometries or samplers lands in something you can load with pandas instead of parsing
+stdout:
+
+```bash
+uv run python scripts/embedding_workflow.py --xyz data/12.inp --active_atoms '[0,1]' \
+    --max_cycles 30 --sqd_method qdrift --shots 1000 \
+    --diagnostics_csv output/diagnostics.csv
+```
+
+It is **off by default** (`None`). Behaviour worth knowing before you point it at a
+sweep:
+
+- **Append, not overwrite.** The header is written only when the file is missing or
+  empty, so pointing many runs at one path accumulates them — that is the intended use,
+  and `run_id` (a per-run UUID) is what separates them. To get a fresh file, delete it
+  or name a new one.
+- **Flushed every row**, so a run killed at cycle 17 still leaves 17 usable rows.
+- **Never fatal.** A bad path or missing datum is caught, reported as
+  `[diagnostics] skipped cycle N: ...`, and the embedding continues. A missing value is
+  an empty cell rather than an error.
+- **Rank 0 only**, so an `mpirun` run writes one row per cycle, not one per rank.
+- Parent directories are created for you.
+
+Each row carries the run/geometry identity (`run_id`, `geometry_file`,
+`geometry_parameter`, `algorithm`, `backend_name`), the cycle state (`cycle`,
+`converged`, `total_cycles`), the active space (`cas_norb`, `cas_nelec`,
+`active_space_indices`, `selector`, `selected_virtuals`, `frozen_occupied`, `norb`,
+`nelec_alpha`, `nelec_beta`), every term of the embedding energy (`E_solver`,
+`E_low_total`, `E_low_A`, `E_high_A`, `e_core`, `correction`, `footing_shift`,
+`projector_leak`, `p_b_leak`, `embedding_energy`), the convergence deltas (`delta_E`,
+`max_delta_gamma_A`), the density (`rdm1_trace`, `natural_occupations`, `rdm1`) and, for
+SQD runs, `number_unique_bitstrings` and `final_sqd_subspace_dimension` (both empty under
+`--solver fci`). Array-valued columns are JSON-encoded with floats rounded to 3 decimals.
+The authoritative column list is `DIAGNOSTICS_CSV_COLUMNS` in
+[`diagnostics_csv.py`](src/embasi_qiskit_integration/diagnostics_csv.py).
+
+`--diagnostics_csv` is distinct from `--output_path`, which appends one summary line per
+*run* rather than per cycle. [`execute.sh`](execute.sh) shows both driving a geometry
+sweep.
 
 ### Starting from an `.xyz`
 
@@ -346,7 +420,7 @@ from embasi_qiskit_integration.circuit_run import unpermute_counts_list
 
 result = build_sqdrift_circuits(ham, method="qdrift", num_randomizations=8)
 counts = sampler.run(result.circuits, shots)
-counts = unpermute_counts_list(counts, result.permutations)   # required!
+counts = unpermute_counts_list(counts, result.permutations)  # required!
 ```
 
 By default the permutation is whatever the MILP solver returned, applied in a
