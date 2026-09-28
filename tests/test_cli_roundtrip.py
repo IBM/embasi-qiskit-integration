@@ -32,6 +32,10 @@ def test_cli_fci_roundtrip(tmp_path, n2_ham):
 def test_cli_sqd_mock_roundtrip(tmp_path, n2_ham, data_dir):
     ipc.write_job(n2_ham, tmp_path)
     counts = str(data_dir / "mock_counts.json")
+    # mock_counts.json holds 100_000 shots, so asking for that number uses the file
+    # as it is. A smaller number shrinks every count, and the rare ones drop to zero,
+    # which makes the SQD energy worse by a few mHa. Set here so the check below tests
+    # the solver, not the CLI default.
     rc = main(
         [
             "solve",
@@ -44,6 +48,8 @@ def test_cli_sqd_mock_roundtrip(tmp_path, n2_ham, data_dir):
             counts,
             "--seed",
             "24",
+            "--shots",
+            "100000",
         ]
     )
     assert rc == 0

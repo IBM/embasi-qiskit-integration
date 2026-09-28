@@ -37,3 +37,11 @@ coverage.xml
 
 # Local scratch notes and generated docs, deliberately untracked.
 /docs/
+
+# Outputs
+/output
+/data
+
+# Logging and Experiments
+execute.sh
+plot_cas_pes.py

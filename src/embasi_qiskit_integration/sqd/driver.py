@@ -179,6 +179,21 @@ def run_sqd(
         if np.allclose(pair[0] + pair[1], rdm1, atol=1e-8):
             rdm1a, rdm1b = pair[0], pair[1]
 
+    # Extract SQD subspace dimension: the actual number of configurations diagonalized.
+    # Per qiskit-addon-sqd's docstring, "the full dimension of the SCI subspace is the
+    # product of the dimensions of the individual spin sectors", enforced as an
+    # invariant in SCIState: amplitudes.shape == (len(ci_strs_a), len(ci_strs_b)).
+    # So the total is amplitudes.size.
+    final_sqd_subspace_dimension: int | None = None
+    try:
+        final_sqd_subspace_dimension = int(result.sci_state.amplitudes.size)
+    except Exception:  # pragma: no cover - diagnostic only, never fatal
+        pass
+    # Note: there is no "number of recovered determinants" field exposed by
+    # qiskit-addon-sqd.configuration_recovery or SCIResult/SCIState (configuration
+    # recovery operates on an internal bitstring matrix each iteration that is never
+    # retained in the returned result). Leave this field unmapped in diagnostics.
+
     # Per-iteration total energies (electronic + core) for convergence checks.
     iteration_totals = [e + ham.e_core for e in iteration_energies]
 
@@ -199,6 +214,7 @@ def run_sqd(
         "spin_square_min": (abs(na - nb) / 2.0) * (abs(na - nb) / 2.0 + 1.0),
         "spin_resolved_rdm1": rdm1a is not None,
         "seed": seed,
+        "final_sqd_subspace_dimension": final_sqd_subspace_dimension,
     }
     return SolverResult(
         energy=energy,

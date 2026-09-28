@@ -15,7 +15,6 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 import numpy as np
-
 from embasi_qiskit_integration._versions import collect_versions
 
 # Only probes importability (find_spec) -- pulls in neither pyomo nor
@@ -185,18 +184,18 @@ class SQDSolver(ActiveSpaceSolver):
         self,
         sampler,
         *,
-        shots: int = 100_000,
+        shots: int = 1_000,
         ansatz: str = "sqdrift",
-        method: str = "exact",
+        method: str = "qdrift",
         evolution_time: float = 1.0,
-        num_groups: int = 200,
-        num_randomizations: int = 1,
+        num_groups: int = 15,
+        num_randomizations: int = 500,
         initial_state_bitstring: str | None = None,
         samples_per_batch: int = 300,
         num_batches: int = 5,
         max_iterations: int = 5,
         seed: int | None = None,
-        optimize: bool | None = None,
+        optimize: bool | None = True,
         time_limit: float = 10.0,
         canonical_permutation: bool = False,
         workers: int = 1,

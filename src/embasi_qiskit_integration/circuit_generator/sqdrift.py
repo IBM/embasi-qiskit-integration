@@ -124,7 +124,7 @@ def _hf_occupation(norb: int, nelec: tuple[int, int]) -> list[bool]:
 def build_sqdrift_circuits(
     ham: EmbeddedHamiltonian,
     *,
-    method: str = "exact",
+    method: str = "qdrift",
     num_groups: int | Sequence[int] = 15,
     num_randomizations: int = 500,
     time: float | Sequence[float] = (1.0, 2.0, 3.0),
