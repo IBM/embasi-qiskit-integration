@@ -2305,6 +2305,406 @@ class ProjectionEmbeddingAdapter:
             n_occ_b=orbitals.n_occ_b,
         )
 
+    def build_orbitals_avas(
+        self,
+        *,
+        ao_projector: np.ndarray,
+        threshold: float = 0.2,
+        max_size: tuple[int, int] | None = None,
+        n_frozen_occ: int = 0,
+        restrict_to_a: bool = True,
+        use_relaxed: bool = False,
+    ) -> EmbeddedOrbitals:
+        """AVAS active space: the subsystem-A orbitals that project onto target valence AOs.
+
+        Atomic Valence Active Space (Sayfutyarova, Sun, Chan & Knizia, *J. Chem. Theory
+        Comput.* **2017**, 13, 4063, doi:10.1021/acs.jctc.7b00128), following PySCF's
+        ``mcscf.avas`` (without IAOs, ``openshell_option=3``):
+
+        1. Diagonalize F_emb in span(A) (:meth:`build_orbitals`, no selection).
+        2. Rotate the doubly occupied block (after the ``n_frozen_occ`` core) and the
+           virtual block *separately* to the eigenvectors of their AVAS projection
+           ``C^T M C`` (``ao_projector``, from
+           :func:`~embasi_qiskit_integration.selectors.avas_ao_projector`).  Rotating
+           within a block keeps the determinant, S-orthonormality and span(A), so
+           ``P_B`` stays invisible to the active space.
+        3. Keep every orbital whose projected weight exceeds ``threshold``: active
+           doubly occupied and virtual orbitals, plus every singly occupied orbital of
+           an open shell (never projected).  The remaining doubly occupied orbitals are
+           frozen into ``e_core``; the remaining virtuals are discarded.
+        4. Semi-canonicalize the core, inactive, active-occupied, active-virtual and
+           discarded-virtual groups separately against the same Fock, as PySCF does
+           (``canonicalize=True``), so ``energy`` holds real Fock eigenvalues.
+
+        By default the size follows from the chemistry of the targets and ``threshold``:
+        pick labels matching the orbitals the problem needs correlated (e.g.
+        ``["C 2p", "O 2p"]`` for pi bonds, ``["Fe 3d"]`` for a metal centre).  The
+        selection is recomputed every cycle from the current Fock, so a weight near
+        ``threshold`` can change the active-space size between cycles.  ``max_size``
+        replaces the threshold with a fixed budget: the highest-weight doubly occupied
+        and virtual orbitals are kept to exactly ``(nelec, norb)`` every cycle, the
+        singly occupied orbitals counting towards both.
+
+        Columns are ordered ``[core | inactive occupied | active occupied | singly
+        occupied | active virtual | discarded virtual]``, keeping every occupied column
+        ahead of every virtual one as :class:`EmbeddedOrbitals` assumes.  The projected
+        weights are kept in ``self._avas_info`` for reporting.
+
+        Args:
+            ao_projector: ``(nao, nao)`` AO-basis AVAS projector ``M``.
+            threshold: projected-weight cutoff (PySCF's default, 0.2).  Unused with
+                ``max_size``.
+            max_size: fixed ``(nelec, norb)`` active space, filled by projected weight
+                instead of cut at ``threshold``.  ``None`` (default) -> threshold cut.
+            n_frozen_occ: lowest doubly occupied orbitals excluded from the projection
+                and always frozen (PySCF's ``ncore``).
+            restrict_to_a: forwarded to :meth:`build_orbitals` -- a pure performance
+                knob, ``False`` only needed against a stub adapter without live EmbASI.
+            use_relaxed: diagonalize the relaxed embedded-HF Fock from
+                :meth:`relax_active_hf` instead of the one-shot low-level F_emb.
+
+        Returns:
+            The AVAS-selected :class:`EmbeddedOrbitals`.
+
+        Raises:
+            ValueError: if ``n_frozen_occ`` is out of range, no orbital passes the
+                threshold, or ``max_size`` cannot be filled from subsystem A.
+        """
+        orbitals = self.build_orbitals(
+            n_frozen_occ=0, restrict_to_a=restrict_to_a, use_relaxed=use_relaxed
+        )
+        fock = self._fock_relaxed_arr if use_relaxed else self._fock_arr
+        n_occ = orbitals.n_occ
+        # Restricted open shell: the first n_occ_b columns are doubly occupied and the
+        # next n_occ - n_occ_b singly occupied (canonical energy order from build_orbitals).
+        n_docc = n_occ if orbitals.n_occ_b is None else orbitals.n_occ_b
+        n_somo = n_occ - n_docc
+
+        def choose(w_occ, w_virt):
+            if max_size is None:
+                return int((w_occ > threshold).sum()), int((w_virt > threshold).sum())
+            return self._avas_budget(
+                max_size, n_somo, n_avail_occ=w_occ.size, n_avail_virt=w_virt.size
+            )
+
+        sel = self._avas_select(
+            orbitals.coeff,
+            orbitals.energy,
+            fock,
+            ao_projector,
+            n_occ=n_occ,
+            n_docc=n_docc,
+            n_frozen_occ=n_frozen_occ,
+            choose=choose,
+        )
+        if sel["active"].size == 0:
+            raise ValueError(
+                f"no orbital of subsystem A has an AVAS weight above threshold={threshold} "
+                f"(largest occupied {sel['occ_weights'].max(initial=0.0):.3f}, virtual "
+                f"{sel['virt_weights'].max(initial=0.0):.3f}); lower the threshold or check "
+                "the AO labels"
+            )
+        self._avas_info = {
+            "threshold": threshold,
+            "max_size": max_size,
+            "occ_weights": sel["occ_weights"],
+            "virt_weights": sel["virt_weights"],
+            "n_active_occ": sel["n_active_occ"],
+            "n_active_virt": sel["n_active_virt"],
+            "n_somo": n_somo,
+        }
+        return EmbeddedOrbitals(
+            coeff=sel["coeff"],
+            energy=sel["energy"],
+            n_occ=n_occ,
+            inactive=sel["inactive"],
+            active=sel["active"],
+            n_occ_b=orbitals.n_occ_b,
+        )
+
+    @staticmethod
+    def _avas_select(
+        coeff: np.ndarray,
+        energy: np.ndarray,
+        fock: np.ndarray,
+        ao_projector: np.ndarray,
+        *,
+        n_occ: int,
+        n_docc: int,
+        n_frozen_occ: int,
+        choose,
+    ) -> dict[str, Any]:
+        """The AVAS rotation and selection on one orbital set, shared by both builders.
+
+        ``coeff`` columns are ``[doubly occupied (n_docc) | singly occupied | virtual]``;
+        a spin channel of the per-spin path passes ``n_docc = n_occ`` (every occupied
+        spin orbital is projected, there is no singly occupied block).  The occupied
+        block after the ``n_frozen_occ`` core and the virtual block are each rotated to
+        the eigenvectors of their AVAS projection; ``choose(w_occ, w_virt)`` (weights
+        ascending / descending) returns how many of each to keep; every group is then
+        semi-canonicalized against ``fock``.
+
+        Returns a dict with the rotated ``coeff`` and ``energy``, ``active`` / ``inactive``
+        column indices, the ``occ_weights`` / ``virt_weights`` and the kept counts.
+        """
+        c = coeff.copy()
+        energy = energy.copy()
+        n_orb = c.shape[1]
+        if not 0 <= n_frozen_occ <= n_docc:
+            raise ValueError(
+                f"n_frozen_occ={n_frozen_occ} outside [0, {n_docc}] doubly occupied orbitals"
+            )
+
+        def project(idx: np.ndarray, ascending: bool) -> np.ndarray:
+            w, u = np.linalg.eigh(c[:, idx].T @ ao_projector @ c[:, idx])
+            order = np.argsort(w) if ascending else np.argsort(w)[::-1]
+            c[:, idx] = c[:, idx] @ u[:, order]
+            return w[order]
+
+        def semicanonicalize(idx: np.ndarray) -> None:
+            if idx.size:
+                e, u = np.linalg.eigh(c[:, idx].T @ fock @ c[:, idx])
+                c[:, idx] = c[:, idx] @ u
+                energy[idx] = e
+
+        # Occupied weights ascending, so the kept ones sit next to the singly occupied
+        # columns; virtual weights descending, so the kept ones come first.
+        occ_idx = np.arange(n_frozen_occ, n_docc)
+        virt_idx = np.arange(n_occ, n_orb)
+        w_occ = project(occ_idx, ascending=True)
+        w_virt = project(virt_idx, ascending=False)
+        n_act_occ, n_act_virt = choose(w_occ, w_virt)
+
+        inactive_occ = occ_idx[: occ_idx.size - n_act_occ]
+        active_occ = occ_idx[occ_idx.size - n_act_occ :]
+        active_virt = virt_idx[:n_act_virt]
+        for group in (inactive_occ, active_occ, active_virt, virt_idx[n_act_virt:]):
+            semicanonicalize(group)
+
+        return {
+            "coeff": c,
+            "energy": energy,
+            "active": np.concatenate([active_occ, np.arange(n_docc, n_occ), active_virt]).astype(
+                int
+            ),
+            "inactive": np.concatenate([np.arange(n_frozen_occ), inactive_occ]).astype(int),
+            "occ_weights": w_occ,
+            "virt_weights": w_virt,
+            "n_active_occ": n_act_occ,
+            "n_active_virt": n_act_virt,
+        }
+
+    def build_orbitals_avas_spin(
+        self,
+        *,
+        ao_projector: np.ndarray,
+        max_size: tuple[int, ...],
+        n_frozen_occ: int = 0,
+        use_relaxed: bool = False,
+    ) -> tuple[EmbeddedOrbitals, EmbeddedOrbitals]:
+        """Per-spin AVAS with the alpha and beta channels selected independently.
+
+        The spin-separated counterpart of :meth:`build_orbitals_avas`, returning the
+        ``(alpha, beta)`` pair :meth:`embedded_hamiltonian_spin` consumes.  Each channel is
+        diagonalized in its own span(A) from its own ``F_emb``
+        (:meth:`_eigh_subsystem_a_spin`), and then rotated and selected on its own
+        (:meth:`_avas_select`): its occupied spin orbitals after the ``n_frozen_occ`` core
+        and its virtuals are projected onto the target AOs and the highest-weight ones
+        kept.  Nothing pairs the channels -- no corresponding orbitals, no shared slots --
+        so each keeps genuine UHF-type orbitals and its own frozen core, which
+        :meth:`embedded_hamiltonian_spin` folds unrestricted (``J[d_a + d_b] - K[d_s]``).
+
+        The one coupling is the orbital count: ``fci.direct_uhf`` takes a single ``norb``,
+        so ``max_size`` fixes it for both channels, with each channel's occupied/virtual
+        split set by its own active electron count.  A threshold cut cannot guarantee a
+        common count, so a budget is required.
+
+        Independent selection has two costs, both reported rather than prevented:
+
+        * **Asymmetric correlation.**  An active orbital of one channel need not have a
+          partner in the other's active space (a bond correlated for one spin only).
+          ``self._avas_info["active_cosines"]`` holds the cosines of the principal angles
+          between the two active spaces (singular values of ``C_a^T S C_b``; 1 = same
+          span), and a warning fires when the smallest drops below
+          ``_FROZEN_OVERLAP_TOL``.  The two channels never share orbitals, so ``target_s2``
+          is unavailable and the solve may be spin-contaminated.
+        * **A spin-polarised core.**  With an explicit ``(nelec_a, nelec_b, norb)`` whose
+          difference differs from subsystem A's ``n_alpha - n_beta``, the frozen cores
+          carry the remainder of the spin.  Valid (the core is folded unrestricted), but
+          the active sector is then not the whole open shell; this warns.
+
+        Closed-shell limit: when the two channels' ``F_emb`` and occupied spaces coincide,
+        both selections are identical to :meth:`build_orbitals_avas`'s.
+
+        Args:
+            ao_projector: ``(nao, nao)`` AO-basis AVAS projector (see
+                :func:`~embasi_qiskit_integration.selectors.avas_ao_projector`).
+            max_size: ``(nelec, norb)``, with the active electrons split so the active
+                space carries all of subsystem A's ``n_alpha - n_beta``, or an explicit
+                ``(nelec_alpha, nelec_beta, norb)``.
+            n_frozen_occ: lowest occupied orbitals of each channel excluded from the
+                projection and always frozen.
+            use_relaxed: diagonalize the relaxed per-spin Fock.
+
+        Returns:
+            ``(alpha, beta)`` :class:`EmbeddedOrbitals`, each describing one spin
+            (``n_occ_b=None``), with equal ``n_active_orbitals``.
+
+        Raises:
+            ValueError: for a malformed or unfillable ``max_size``.
+        """
+        if self._fock_spin is None:
+            raise ValueError(
+                "per-spin AVAS needs the per-spin embedded Fock; run an unrestricted "
+                "run_low_level() against an EmbASI that returns a spin axis"
+            )
+        pair = self._fock_relaxed_spin if use_relaxed else self._fock_spin
+        if pair is None:
+            raise ValueError("use_relaxed=True needs relax_active_hf() to have run")
+        n_occs = [self._mo_spin(self.p.mo_coeffs_A_LL, s).shape[1] for s in (0, 1)]
+        nelec_spin, norb = self._avas_spin_budget(max_size, n_occs)
+
+        out, info = [], {"max_size": tuple(max_size), "channels": []}
+        for ispin in (0, 1):
+            eps, c = self._eigh_subsystem_a_spin(ispin, use_relaxed=use_relaxed)
+            n_occ, nelec = n_occs[ispin], nelec_spin[ispin]
+            n_avail_occ, n_avail_virt = n_occ - n_frozen_occ, c.shape[1] - n_occ
+            if not 0 <= n_frozen_occ <= n_occ:
+                raise ValueError(
+                    f"n_frozen_occ={n_frozen_occ} outside [0, {n_occ}] for spin {ispin}"
+                )
+            if nelec > n_avail_occ or not 0 <= norb - nelec <= n_avail_virt:
+                raise ValueError(
+                    f"avas max_size {tuple(max_size)} needs {nelec} occupied and "
+                    f"{norb - nelec} virtual spin-{ispin} orbitals; subsystem A offers "
+                    f"{n_avail_occ} occupied (after n_frozen_occ={n_frozen_occ}) and "
+                    f"{n_avail_virt} virtual"
+                )
+            sel = self._avas_select(
+                c,
+                eps,
+                pair[ispin],
+                ao_projector,
+                n_occ=n_occ,
+                n_docc=n_occ,
+                n_frozen_occ=n_frozen_occ,
+                choose=lambda w_occ, w_virt, n=nelec: (n, norb - n),
+            )
+            out.append(
+                EmbeddedOrbitals(
+                    coeff=sel["coeff"],
+                    energy=sel["energy"],
+                    n_occ=n_occ,
+                    inactive=sel["inactive"],
+                    active=sel["active"],
+                )
+            )
+            info["channels"].append(
+                {
+                    "occ_weights": sel["occ_weights"],
+                    "virt_weights": sel["virt_weights"],
+                    "n_active_occ": sel["n_active_occ"],
+                    "n_active_virt": sel["n_active_virt"],
+                    "n_frozen": int(sel["inactive"].size),
+                }
+            )
+
+        alpha, beta = out
+        cosines = np.linalg.svd(alpha.c_active.T @ self._s_arr @ beta.c_active, compute_uv=False)
+        info["active_cosines"] = cosines
+        info["core_spin"] = int(alpha.inactive.size - beta.inactive.size)
+        self._avas_info = info
+
+        if cosines.min() < _FROZEN_OVERLAP_TOL:
+            warnings.warn(
+                f"the alpha and beta AVAS active spaces diverge: the smallest principal "
+                f"cosine between them is {cosines.min():.3f} (< {_FROZEN_OVERLAP_TOL}), so "
+                "at least one active orbital of one spin has no partner in the other's "
+                "active space and is correlated for one spin only. Adjust the labels or "
+                "max_size, or pair the channels.",
+                stacklevel=3,
+            )
+        if info["core_spin"]:
+            warnings.warn(
+                f"the frozen cores carry spin: alpha freezes {alpha.inactive.size} and beta "
+                f"{beta.inactive.size} orbitals, so the active sector {nelec_spin} does not "
+                f"hold all of subsystem A's n_alpha - n_beta = {n_occs[0] - n_occs[1]}. The "
+                "core is folded unrestricted, so this is valid, but the open shell is only "
+                "partly correlated.",
+                stacklevel=3,
+            )
+        return alpha, beta
+
+    @staticmethod
+    def _avas_spin_budget(
+        max_size: tuple[int, ...], n_occs: list[int]
+    ) -> tuple[tuple[int, int], int]:
+        """``((nelec_alpha, nelec_beta), norb)`` from a per-spin AVAS ``max_size``.
+
+        A two-entry ``(nelec, norb)`` splits the active electrons so the active sector
+        carries subsystem A's whole ``n_alpha - n_beta``; three entries give the split
+        explicitly.
+        """
+        size = tuple(int(n) for n in max_size)
+        if len(size) == 3:
+            nelec_a, nelec_b, norb = size
+        elif len(size) == 2:
+            nelec, norb = size
+            a_spin = n_occs[0] - n_occs[1]
+            if (nelec - a_spin) % 2 or nelec < abs(a_spin):
+                raise ValueError(
+                    f"avas max_size nelec={nelec} cannot hold subsystem A's n_alpha - "
+                    f"n_beta = {a_spin}: nelec - {a_spin} must be even and non-negative"
+                )
+            nelec_a, nelec_b = (nelec + a_spin) // 2, (nelec - a_spin) // 2
+        else:
+            raise ValueError(
+                f"avas max_size must be (nelec, norb) or (nelec_alpha, nelec_beta, norb); "
+                f"got {size}"
+            )
+        if min(nelec_a, nelec_b) < 0 or norb < max(nelec_a, nelec_b):
+            raise ValueError(
+                f"avas max_size {size}: electron counts must be non-negative and fit in norb={norb}"
+            )
+        return (nelec_a, nelec_b), norb
+
+    @staticmethod
+    def _avas_budget(
+        max_size: tuple[int, ...], n_somo: int, *, n_avail_occ: int, n_avail_virt: int
+    ) -> tuple[int, int]:
+        """``(n_active_doubly_occupied, n_active_virtual)`` for a fixed AVAS budget.
+
+        The singly occupied orbitals are always active, so they take ``n_somo`` of both
+        ``nelec`` and ``norb``; the remaining electrons fill doubly occupied orbitals and
+        the remaining orbitals are virtual.
+        """
+        if len(max_size) != 2:
+            raise ValueError(
+                f"avas max_size must be (nelec, norb) for one orbital set; got {tuple(max_size)}"
+                " (an explicit (nelec_alpha, nelec_beta, norb) needs the per-spin downfold)"
+            )
+        nelec, norb = (int(n) for n in max_size)
+        n_paired = nelec - n_somo
+        if n_paired < 0 or n_paired % 2:
+            raise ValueError(
+                f"avas max_size nelec={nelec} cannot hold the {n_somo} unpaired electron(s) "
+                f"of subsystem A: nelec - {n_somo} must be even and non-negative"
+            )
+        n_act_occ = n_paired // 2
+        n_act_virt = norb - n_act_occ - n_somo
+        if n_act_occ > n_avail_occ:
+            raise ValueError(
+                f"avas max_size ({nelec}, {norb}) needs {n_act_occ} doubly occupied orbitals "
+                f"but only {n_avail_occ} are available after the frozen core"
+            )
+        if not 0 <= n_act_virt <= n_avail_virt:
+            raise ValueError(
+                f"avas max_size ({nelec}, {norb}) needs {n_act_virt} virtual orbitals "
+                f"({norb} - {n_act_occ} doubly - {n_somo} singly occupied); subsystem A "
+                f"has {n_avail_virt}"
+            )
+        return n_act_occ, n_act_virt
+
     def build_orbitals_uno(
         self,
         *,

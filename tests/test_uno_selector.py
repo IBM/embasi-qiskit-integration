@@ -178,6 +178,35 @@ def test_target_s2_needs_shared_orbitals(monkeypatch):
     )
 
 
+def test_sqd_takes_the_spin_target_and_evolution_time(monkeypatch):
+    """--target_s2 reaches SQD as spin_sq and --evolution_time as the circuit time; the
+    shared-orbital requirement for a spin target holds for SQD as for FCI."""
+    monkeypatch.setattr(sys, "argv", ["prog"])
+    from embasi_qiskit_integration.embedding import EmbeddingWorkflow
+    from embasi_qiskit_integration.solvers import SQDSolver
+
+    common = {
+        "solver": "sqd",
+        "sampler": "aer",
+        "aer_method": "statevector",
+        "spin": 2,
+        "unrestricted": True,
+        "spin_downfold": True,
+    }
+    solver = EmbeddingWorkflow(
+        **common, selector="uno", target_s2=2.0, evolution_time=3.0
+    )._build_solver()
+    assert isinstance(solver, SQDSolver)
+    assert solver.spin_sq == 2.0
+    assert solver.evolution_time == 3.0
+
+    default = EmbeddingWorkflow(**common, selector="uno")._build_solver()
+    assert default.spin_sq is None and default.evolution_time == 1.0  # unchanged defaults
+
+    with pytest.raises(ValueError, match="--selector uno"):
+        EmbeddingWorkflow(**common, selector="apc-concentric", target_s2=2.0)._build_solver()
+
+
 def test_fci_spin_target_works_for_a_spin_dependent_hamiltonian():
     """The UNO path's downfold carries (h1a, h1b): direct_uhf, which PySCF's fix_spin_
     refuses, so the penalty is applied by our own solver subclass."""
