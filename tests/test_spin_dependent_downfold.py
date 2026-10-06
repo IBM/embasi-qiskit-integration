@@ -184,6 +184,42 @@ def test_per_spin_orbitals_report_their_own_occupied_counts():
     assert alpha.n_occ_b is None and beta.n_occ_b is None
 
 
+def test_concentric_cl_grows_each_channels_shells_through_its_own_fock():
+    """Per-spin CL: shells >= 1 follow the channel's own F_emb, not the one it was built with.
+
+    The localiser is built (as the workflow does) with one Fock matrix; on the spin path each
+    channel must override it with its own, or both channels' shells would grow through the
+    same spin-summed coupling.
+    """
+    from embasi_qiskit_integration.selectors import concentric_localization_selector
+
+    nao = 10
+    ad = _spin_stub(nao=nao, n_occ_a=(3, 2), n_occ_b=2)
+    rng = np.random.default_rng(5)
+    # The stub's Focks do not couple A's virtuals, so shell 1 would be empty; give each
+    # channel its own coupling instead (still pushing B up through its projector).
+    fock = []
+    for ispin in (0, 1):
+        f = rng.standard_normal((nao, nao))
+        fock.append(f + f.T + ad._p_b_spin[ispin])
+    ad._fock_spin = (fock[0], fock[1])
+    decoy = rng.standard_normal((nao, nao))
+    decoy = decoy + decoy.T
+
+    loc = concentric_localization_selector(ad._s, np.array([0, 1]), decoy, n_shells=1)
+    alpha, beta = ad.build_orbitals_spin(virtual_localizer=loc)
+
+    for ispin, orb in ((0, alpha), (1, beta)):
+        _eps, c = ad._eigh_subsystem_a_spin(ispin)
+        n_keep = orb.active.size
+        own, _ = loc(c, orb.n_occ, fock=fock[ispin])
+        built_with, _ = loc(c, orb.n_occ)
+        proj = orb.c_active @ orb.c_active.T
+        assert np.allclose(proj, own[:, :n_keep] @ own[:, :n_keep].T, atol=1e-8)
+        # Guard against a vacuous pass: the decoy Fock must select a different space.
+        assert not np.allclose(proj, built_with[:, :n_keep] @ built_with[:, :n_keep].T)
+
+
 def test_build_orbitals_spin_refuses_without_per_spin_state():
     """A restricted run has no pair to build from and must say so, not guess."""
     from embasi_qiskit_integration.projection_embedding_adapter import (

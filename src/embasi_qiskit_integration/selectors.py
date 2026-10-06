@@ -298,6 +298,9 @@ def concentric_localization_selector(
             :func:`mulliken_selector`).
         fock: embedded Fock matrix ``F_emb`` (``adapter._fock``), shape (nao, nao) --
             the shell-expansion metric for shells >= 1.  Unlike SPADE, CL needs it.
+            A call may override it (``localiser(coeff, n_occ, fock=...)``): the
+            per-spin path passes each channel's own ``F_emb``, so that channel's shells
+            grow through its own Fock coupling rather than the spin-summed one.
         n_shells: number of Fock shell expansions after shell 0 (``0`` -> the
             fragment-spanned shell only, the single-shell case; the paper's
             convergence graphs suggest one cycle suffices in the working basis).
@@ -334,11 +337,14 @@ def concentric_localization_selector(
         v = vt.T  # right singular vectors: an orthogonal rotation of c_ker's columns
         return c_ker @ v[:, :rank], c_ker @ v[:, rank:]
 
-    def _localise(coeff: np.ndarray, n_occ: int) -> tuple[np.ndarray, np.ndarray]:
+    def _localise(
+        coeff: np.ndarray, n_occ: int, fock: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
         c_virt = coeff[:, n_occ:]
         n_virt = c_virt.shape[1]
         if n_virt == 0:
             return coeff.copy(), np.empty(0)
+        f_shell = f if fock is None else np.asarray(fock, dtype=float)
 
         # Shell 0: project onto the fragment AO basis and split spanned vs kernel.
         # ``c_virt_prime`` is the projection SEED for the SVD only -- it is NOT
@@ -350,7 +356,7 @@ def concentric_localization_selector(
 
         # Shells 1..n_shells: grow the span through the Fock coupling to the kernel.
         for _ in range(n_shells):
-            c_new, c_ker = _span_kernel(c_kept, c_ker, f)
+            c_new, c_ker = _span_kernel(c_kept, c_ker, f_shell)
             if c_new.shape[1] == 0:
                 break  # kernel exhausted / no further Fock coupling
             c_kept = np.hstack([c_kept, c_new])
@@ -399,6 +405,8 @@ def concentric_localization_selector(
     _localise.gap_tol = 0.5  # type: ignore[attr-defined]
     _localise.max_virtual = None  # type: ignore[attr-defined]
     _localise.min_virtual = min_virtual  # type: ignore[attr-defined]
+    # Tells callers they may pass a per-call ``fock`` (see the ``fock`` argument).
+    _localise.accepts_fock = True  # type: ignore[attr-defined]
     return _localise
 
 

@@ -2647,6 +2647,8 @@ class ProjectionEmbeddingAdapter:
             virtual_localizer: rotates and cuts **each channel's own** virtual block
                 (its own sigma^2 ordering, since each was diagonalized in its own
                 span(A)), before the two channels are reconciled to a common ``norb``.
+                A localiser that grows shells through a Fock matrix (``concentric-cl``,
+                marked ``accepts_fock``) is given that channel's own ``F_emb``.
                 The per-channel cut therefore bounds what the reconciliation may promise.
             use_relaxed: diagonalize the relaxed per-spin Fock.
 
@@ -2692,7 +2694,14 @@ class ProjectionEmbeddingAdapter:
                 # span(A), so alpha's rotation does not apply to beta.
                 from embasi_qiskit_integration.selectors import _gap_cut
 
-                c, sigma2 = virtual_localizer(c, n_occ)
+                # A Fock-coupled localiser (concentric-cl) grows its shells through THIS
+                # channel's own F_emb -- the one `c` was diagonalized from -- rather than
+                # the spin-summed Fock it was built with.
+                fock_kw = {}
+                if getattr(virtual_localizer, "accepts_fock", False):
+                    pair = self._fock_relaxed_spin if use_relaxed else self._fock_spin
+                    fock_kw = {"fock": pair[ispin]}  # type: ignore[index]
+                c, sigma2 = virtual_localizer(c, n_occ, **fock_kw)
                 eps = eps.copy()
                 eps[n_occ:] = np.nan  # rotated-virtual eigenvalues are meaningless
                 # Read the cut knobs immediately after THIS call: `concentric-cl` pins
