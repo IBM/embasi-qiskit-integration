@@ -198,10 +198,19 @@ def test_sqd_takes_the_spin_target_and_evolution_time(monkeypatch):
     )._build_solver()
     assert isinstance(solver, SQDSolver)
     assert solver.spin_sq == 2.0
-    assert solver.evolution_time == 3.0
+    assert solver.evolution_time == [3.0]  # a scalar is a one-point sweep
 
     default = EmbeddingWorkflow(**common, selector="uno")._build_solver()
-    assert default.spin_sq is None and default.evolution_time == 1.0  # unchanged defaults
+    assert default.spin_sq is None and default.evolution_time == [1.0]  # unchanged defaults
+    assert default.num_groups == [15]
+
+    # The sweep axes take lists from the command line, as the reference workflow's do.
+    monkeypatch.setattr(
+        sys, "argv", ["prog", "--evolution_time", "1,2,3", "--num_groups", "[10, 20]"]
+    )
+    swept = EmbeddingWorkflow(**common, selector="uno")._build_solver()
+    assert swept.evolution_time == [1.0, 2.0, 3.0]
+    assert swept.num_groups == [10, 20]
 
     with pytest.raises(ValueError, match="--selector uno"):
         EmbeddingWorkflow(**common, selector="apc-concentric", target_s2=2.0)._build_solver()

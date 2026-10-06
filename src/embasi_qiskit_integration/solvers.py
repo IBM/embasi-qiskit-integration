@@ -11,7 +11,7 @@ is completed in Phase 6.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -287,10 +287,14 @@ class SQDSolver(ActiveSpaceSolver):
     (deterministic CI without the qiskit-fermions dependency); Aer/Runtime
     samplers run the real circuits.
 
-    With ``method="qdrift"`` the ansatz is an *ensemble*: ``num_randomizations``
-    circuits are each sampled at ``shots`` and their counts pooled, so the total
-    shot budget is ``num_randomizations * shots``. The default of 1 keeps a single
-    circuit, matching the exact-evolution path.
+    With ``method="qdrift"`` the ansatz is an *ensemble* over the sweep
+    ``evolution_time x num_groups`` (each a scalar or a sequence):
+    ``num_randomizations`` circuits per combination, each sampled at ``shots``, with
+    the counts of the whole sweep pooled into one SQD run -- the reference workflow's
+    recipe, where several evolution times together span more of the determinant space
+    than any one alone.  The total shot budget is
+    ``len(evolution_time) * len(num_groups) * num_randomizations * shots``.
+    ``method="exact"`` builds one circuit per evolution time.
 
     ``optimize`` (default True) lets the generator
     relabel the fermionic modes to shorten each circuit. That makes every circuit
@@ -307,8 +311,8 @@ class SQDSolver(ActiveSpaceSolver):
         shots: int = 1_000,
         ansatz: str = "sqdrift",
         method: str = "qdrift",
-        evolution_time: float = 1.0,
-        num_groups: int = 15,
+        evolution_time: float | Sequence[float] = 1.0,
+        num_groups: int | Sequence[int] = 15,
         num_randomizations: int = 500,
         initial_state_bitstring: str | None = None,
         samples_per_batch: int = 300,
@@ -375,6 +379,8 @@ class SQDSolver(ActiveSpaceSolver):
             shots=self.shots,
             ansatz=self.ansatz,
             method=self.method,
+            evolution_time=[float(t) for t in np.atleast_1d(self.evolution_time)],
+            num_groups=[int(n) for n in np.atleast_1d(self.num_groups)],
             n_circuits=len(circuits),
             sampler=type(self.sampler).__name__,
             **_sampler_backend_diagnostics(self.sampler),
@@ -421,9 +427,9 @@ class SQDSolver(ActiveSpaceSolver):
 
         # Bare evolution circuits: the reference determinant is chosen here, at
         # run time, rather than baked in by the generator.
-        # Every sweep axis is pinned to a single value here: a solver call wants a
-        # definite ensemble size (num_randomizations), not the generator's default
-        # time x num_groups sweep, which would build thousands of circuits per solve.
+        # The sweep is the caller's evolution_time x num_groups (one point by default),
+        # never the generator's own (1, 2, 3) x 15 default, so a solve's ensemble size
+        # is always what the caller configured.
         result = build_sqdrift_circuits(
             ham,
             method=self.method,

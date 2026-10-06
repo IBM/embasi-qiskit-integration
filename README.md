@@ -220,19 +220,25 @@ is accepted by both `solve` and `scripts/embedding_workflow.py`:
 uv run embasi-qiskit-integration solve <jobdir> --sqd_method exact    # one full-evolution circuit per time
 uv run embasi-qiskit-integration solve <jobdir> --sqd_method qdrift \
     --num_randomizations 500 --num_groups 15 --evolution_time 1.0     # randomized ensemble (default)
+uv run embasi-qiskit-integration solve <jobdir> --sqd_method qdrift \
+    --num_randomizations 100 --num_groups 10,15,20 --evolution_time 1,2,3  # swept and pooled
 ```
 
-- `exact` synthesises **one** exact time-evolution circuit at `--evolution_time`. Deepest
+- `exact` synthesises **one** exact time-evolution circuit per `--evolution_time`. Deepest
   circuit, no ensemble, and `--num_randomizations` / `--num_groups` are ignored.
-- `qdrift` draws an **ensemble** of `--num_randomizations` randomized circuits, samples
-  each at `--shots`, and pools the counts. The real shot budget is therefore
-  `num_randomizations * shots`, not `shots`, which at a fixed total budget is
-  substantially more accurate than a single deep circuit.
+- `qdrift` draws an **ensemble** of `--num_randomizations` randomized circuits per
+  `(evolution_time, num_groups)` combination, samples each at `--shots`, and pools the
+  counts of the whole sweep into one SQD run. The real shot budget is therefore
+  `len(evolution_time) * len(num_groups) * num_randomizations * shots`, not `shots`,
+  which at a fixed total budget is substantially more accurate than a single deep circuit.
 
 The qDRIFT knobs only bite under `--sqd_method qdrift`: `--num_randomizations` (default
 **500**) is the ensemble size, `--num_groups` (default **15**) the length of the
 randomized product inside each circuit, and `--evolution_time` (default **1.0**) the
-evolution time. Since the default is `qdrift` at 500 randomizations, a bare
+evolution time. `--evolution_time` and `--num_groups` are lists (`1,2,3`, `'[1, 2, 3]'`
+or a repeated flag; a single value is a one-point list) and are swept as a cartesian
+product, as in lahs-workflows' `circuit_generator` step (whose defaults are
+`[1, 2, 3]` x `[10, 15, 20]`). Since the default is `qdrift` at 500 randomizations, a bare
 `--shots 1000` run submits 500 circuits — cut `--num_randomizations` before pointing it
 at real hardware.
 

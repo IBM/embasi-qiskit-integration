@@ -88,6 +88,7 @@ from typing import Any, Literal, Protocol
 import numpy as np
 from pydantic_settings import BaseSettings, CliApp, SettingsConfigDict
 
+from embasi_qiskit_integration._sweep import FloatSweep, IntSweep
 from embasi_qiskit_integration.circuit_run.base import SamplerKind
 from embasi_qiskit_integration.contract import SolverResult
 from embasi_qiskit_integration.projection_embedding_adapter import (
@@ -823,9 +824,13 @@ class EmbeddingWorkflow(BaseSettings):
     # configuration recovery can span -- too short and the subspace misses
     # configurations (measured on a nitrile CAS(6,6): 1.0 -> 35 distinct bitstrings and
     # +3.5 mHa, 3.0 -> 56 and exact).
-    evolution_time: float = 1.0
-    num_groups: int = 15
-    num_randomizations: int = 500  # for method="qdrift", number of random circuits to sample
+    # Both are sweep axes, as in the reference workflow: the ensemble is built over
+    # time x num_groups (e.g. --evolution_time 1,2,3 --num_groups 10,15,20) and every
+    # circuit is pooled into one SQD run.  A scalar means a one-point axis.
+    evolution_time: FloatSweep = [1.0]
+    num_groups: IntSweep = [15]
+    # For method="qdrift": random circuits per (time, num_groups) combination.
+    num_randomizations: int = 500
 
     # ---------------- main ---------------- #
     def cli_cmd(self) -> None:
@@ -1163,10 +1168,11 @@ class EmbeddingWorkflow(BaseSettings):
                 target = ""
                 if dg.get("spin_sq_target") is not None:
                     target = f" (target {dg['spin_sq_target']:g})"
+                times = ", ".join(f"{t:g}" for t in self.evolution_time)
                 log(
                     f"   SQD: {dg['n_distinct_bitstrings']} distinct sampled bitstrings from "
                     f"{dg.get('n_shots', self.shots)} shots, {dg.get('n_circuits', '?')} "
-                    f"circuit(s), evolution_time {self.evolution_time:g}; <S^2> = "
+                    f"circuit(s), evolution_time {times}; <S^2> = "
                     f"{dg.get('spin_square', float('nan')):.4f}{target}; "
                     f"{dg.get('n_iterations', '?')} recovery iteration(s)"
                 )

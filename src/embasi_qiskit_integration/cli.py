@@ -29,6 +29,7 @@ from pydantic_settings import (
 )
 
 from embasi_qiskit_integration import ipc
+from embasi_qiskit_integration._sweep import FloatSweep, IntSweep
 
 
 class SolveCommand(BaseSettings):
@@ -55,9 +56,10 @@ class SolveCommand(BaseSettings):
     workers: int = 1
     # SQD solver parameters
     sqd_method: Literal["exact", "qdrift"] = "qdrift"
-    evolution_time: float = 1.0
-    num_groups: int = 15
-    num_randomizations: int = 500  # for method="qdrift", number of random circuits to sample
+    # Sweep axes: the ensemble spans time x num_groups, pooled into one SQD run.
+    evolution_time: FloatSweep = [1.0]
+    num_groups: IntSweep = [15]
+    num_randomizations: int = 500  # for method="qdrift", random circuits per combination
     measure_twirling: bool = True
     # Idle-qubit decoherence suppression; off by default (it lengthens the schedule).
     dynamical_decoupling: bool = False
