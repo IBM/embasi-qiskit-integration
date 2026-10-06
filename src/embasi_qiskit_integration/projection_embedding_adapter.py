@@ -2705,6 +2705,228 @@ class ProjectionEmbeddingAdapter:
             )
         return n_act_occ, n_act_virt
 
+    @staticmethod
+    def _pair_channel_blocks(
+        ca: np.ndarray, cb: np.ndarray, s: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Pair two S-orthonormal column blocks by maximum overlap (Amos-Hall).
+
+        Returns ``(ca_pair, cb_pair, ca_rest, cb_rest)``: ``m = min(na, nb)`` paired columns
+        per block, column ``i`` of one partnered with column ``i`` of the other, plus each
+        block's unpaired remainder (empty for the narrower block).  Every output is its
+        input block rotated by an orthogonal factor, so S-orthonormality and the block's
+        span -- hence the channel's density, for an occupied block -- are untouched.
+
+        The NARROWER block is kept exactly as given and only the wider one is rotated (the
+        orthogonal Procrustes solution against it).  That is what makes the closed-shell
+        limit exact: at ``ca == cb`` the overlap is the identity, whose SVD is arbitrary
+        but whose polar factor is not, so both blocks come back unchanged -- a bare SVD
+        pairing would scramble canonical orbitals inside a degenerate unit spectrum.
+        """
+        na, nb = ca.shape[1], cb.shape[1]
+        m = min(na, nb)
+        if m == 0:
+            return ca[:, :0], cb[:, :0], ca, cb
+        u, _sv, vt = np.linalg.svd(ca.T @ s @ cb)
+        if na <= nb:
+            # `u` is (m, m): keep alpha, rotate beta onto it.  ca^T S cb_pair = u s u^T.
+            return ca, cb @ vt[:m].T @ u.T, ca[:, :0], cb @ vt[m:].T
+        # `vt` is (m, m): keep beta, rotate alpha onto it.  ca_pair^T S cb = vt^T s vt.
+        return ca @ u[:, :m] @ vt, cb, ca @ u[:, m:], cb[:, :0]
+
+    def build_orbitals_apc_concentric_spin(
+        self,
+        *,
+        fragment_ao: np.ndarray,
+        n_shells: int = 0,
+        max_size: int | tuple[int, int],
+        fixed: bool = False,
+        use_relaxed: bool = False,
+    ) -> tuple[EmbeddedOrbitals, EmbeddedOrbitals]:
+        """Per-spin ``apc-concentric``: CL per channel, pair the channels, APC once.
+
+        The open-shell counterpart of :meth:`build_orbitals_apc_concentric`, returning the
+        ``(alpha, beta)`` pair :meth:`embedded_hamiltonian_spin` consumes.  Each channel stays
+        in *its own* span(A) (the only way the per-spin ``P_B`` annihilates it; see
+        :meth:`_eigh_subsystem_a_spin`), but APC's ``Chooser`` ranks *spatial* orbitals with
+        occupations 2/1/0, and an independent selection per channel could keep different
+        orbitals, different cores and different ``norb``.  So the channels are first
+        paired into **slots**, and APC selects slots:
+
+        1. **CL per channel**, against that channel's own ``F_emb`` (``_fock_spin[s]``), on
+           its own eigenbasis.  Uncapped: APC does the truncation.
+        2. **Corresponding orbitals** (:meth:`_pair_channel_blocks`), in three passes:
+           alpha-occ vs beta-occ -> ``n_b`` doubly-occupied slots, and the ``A_spin``
+           alpha-occupied columns left over are the SOMOs; SOMOs vs beta's kept virtuals
+           -> ``A_spin`` singly-occupied slots; the remaining kept virtuals of both
+           channels -> empty slots.  Unpaired leftovers are not candidates.
+        3. **Rank each channel with same-spin terms** -- ``diag(C^T F_s C)`` and exchange
+           from ``K[dm_s]`` alone, since exchange couples like spins -- and give each slot
+           the larger of its two channel entropies (a pair stays if either channel needs
+           it).  ``Chooser`` gives every 1-slot a synthetic max entropy, so the SOMOs, and
+           with them ``A_spin``, always survive.
+        4. **One selection for both channels.**  Slot ``p`` is column ``p`` in both sets,
+           so ``active`` and ``inactive`` are the *same* index arrays: ``norb`` matches by
+           construction, and the frozen cores correspond by construction (unlike
+           :meth:`build_orbitals_spin`'s lowest-k count).
+
+        Column layout per channel is ``[slots | unpaired kept virtuals | CL kernel]``, with
+        the occupied slots first in both, so ``coeff[:, :n_occ]`` is still each channel's
+        occupied block.  ``energy`` holds ``diag(C^T F_s C)``: the paired columns are
+        rotated, so these are expectation values, not eigenvalues.
+
+        Closed-shell limit: at ``alpha == beta`` every pairing is the identity (see
+        :meth:`_pair_channel_blocks`) and ``2 K[dm_s] == K[dm_total]``, so the selection
+        reproduces :meth:`build_orbitals_apc_concentric` exactly.
+
+        DRAFT -- the APC pair model (King & Gagliardi 2021, eq. 19) is derived for
+        closed-shell pairs; its per-channel use here is an unvalidated extension.
+
+        Args:
+            fragment_ao: AO indices of the active-fragment atoms.
+            n_shells: CL shell expansions after shell 0, per channel.
+            max_size: APC budget -- an orbital-count ceiling, or ``(nelec, norb)`` with
+                ``fixed=True``.  ``nelec`` counts both channels, so its parity must match
+                ``A_spin``.
+            fixed: pin the exact ``(nelec, norb)`` (recommended for ``max_cycles > 1``).
+            use_relaxed: rank against the relaxed per-spin Fock.
+
+        Warns:
+            UserWarning: a *selected* slot's pair overlap ``|<a_p|S|b_p>|`` falls below
+                ``_FROZEN_OVERLAP_TOL`` -- the two channels no longer describe one spatial
+                orbital there (expected at stretched geometries).  The downfold is still
+                valid, since it takes two arbitrary orbital sets; what degrades is the
+                slot's meaning, and the ``(aa|bb)``-based ``<S^2>``.
+
+        Raises:
+            ValueError: no per-spin Fock; beta holds more electrons than alpha; too few
+                beta virtuals to partner the SOMOs; or APC strands a SOMO.
+        """
+        from embasi_qiskit_integration.selectors import (
+            apc_active_space,
+            apc_orbital_entropies,
+            apc_pair_coefficients,
+            concentric_localization_selector,
+        )
+
+        pair = self._fock_relaxed_spin if use_relaxed else self._fock_spin
+        if pair is None:
+            raise ValueError(
+                "no per-spin embedded Fock available; build_orbitals_apc_concentric_spin "
+                "needs an unrestricted run_low_level()"
+                + (" and relax_active_hf()" if use_relaxed else "")
+            )
+        s = self._s_arr
+
+        # Pass 1: each channel's eigenbasis, CL-rotated against its OWN Fock.
+        occ, kept, rest = [], [], []
+        for ispin in (0, 1):
+            _eps, c = self._eigh_subsystem_a_spin(ispin, use_relaxed=use_relaxed)
+            n_occ = self._mo_spin(self.p.mo_coeffs_A_LL, ispin).shape[1]
+            cl = concentric_localization_selector(s, fragment_ao, pair[ispin], n_shells=n_shells)
+            c_loc, _sigma2 = cl(c, n_occ)
+            k = int(cl.max_virtual)  # CL pins its shell-determined count on itself
+            occ.append(c_loc[:, :n_occ])
+            kept.append(c_loc[:, n_occ : n_occ + k])
+            rest.append(c_loc[:, n_occ + k :])
+
+        n_a, n_b = occ[0].shape[1], occ[1].shape[1]
+        if n_b > n_a:
+            raise ValueError(
+                f"subsystem A has more beta ({n_b}) than alpha ({n_a}) electrons; the "
+                "slot pairing assumes alpha is the majority spin (A_spin >= 0)"
+            )
+        n_somo = n_a - n_b
+        if kept[1].shape[1] < n_somo:
+            raise ValueError(
+                f"beta's CL pool has {kept[1].shape[1]} virtuals, too few to partner the "
+                f"{n_somo} alpha SOMO(s); raise n_shells"
+            )
+
+        # Pass 2: corresponding orbitals.  Beta's occupied block is the narrower one, so it
+        # stays canonical and alpha's is rotated onto it; the alpha remainder is the SOMOs.
+        a_dbl, b_dbl, a_somo, _ = self._pair_channel_blocks(occ[0], occ[1], s)
+        # SOMOs are the narrower block here, so they stay put and beta's virtuals rotate.
+        a_somo, b_somo, _, b_virt = self._pair_channel_blocks(a_somo, kept[1], s)
+        a_virt, b_virt, a_left, b_left = self._pair_channel_blocks(kept[0], b_virt, s)
+
+        n_slot_virt = a_virt.shape[1]
+        n_slots = n_b + n_somo + n_slot_virt
+        slots_a = np.hstack([a_dbl, a_somo, a_virt])
+        slots_b = np.hstack([b_dbl, b_somo, b_virt])
+        coeffs = (
+            np.hstack([slots_a, a_left, rest[0]]),
+            np.hstack([slots_b, b_left, rest[1]]),
+        )
+        occ_pattern = np.concatenate(
+            [np.full(n_b, 2), np.full(n_somo, 1), np.zeros(n_slot_virt, dtype=int)]
+        ).astype(int)
+        pair_overlap = np.abs(np.einsum("pi,pq,qi->i", slots_a, s, slots_b))
+
+        # Pass 3: rank each channel with same-spin quantities, over the slots only.
+        n_occ_ch = (n_a, n_b)
+        energies, entropies = [], []
+        for ispin, c_full in enumerate(coeffs):
+            slots = c_full[:, :n_slots]
+            c_occ = c_full[:, : n_occ_ch[ispin]]
+            # `apc_pair_coefficients` halves its exchange diagonal, calibrated to the
+            # restricted `K[2 C C^T]`.  Same-spin exchange is `K[dm_s]`, so pass twice it:
+            # identical to the restricted input on a closed shell, and correct otherwise.
+            k_ao = 2.0 * self.ints.get_k(c_occ @ c_occ.T)
+            f_diag = np.einsum("pi,pq,qi->i", c_full, pair[ispin], c_full)
+            k_diag = np.einsum("pi,pq,qi->i", slots, k_ao, slots)
+            n_o = n_occ_ch[ispin]  # slot columns below this are occupied IN THIS CHANNEL
+            c_pairs = apc_pair_coefficients(f_diag[:n_o], f_diag[n_o:n_slots], k_diag[n_o:])
+            s_occ, s_virt = apc_orbital_entropies(c_pairs)
+            energies.append(f_diag)
+            entropies.append(np.concatenate([s_occ, s_virt]))
+        slot_entropy = np.maximum(entropies[0], entropies[1])
+
+        if fixed and (int(max_size[0]) - n_somo) % 2:  # type: ignore[index]
+            raise ValueError(
+                f"apc max_size nelec={max_size[0]} (both channels) cannot hold "  # type: ignore[index]
+                f"A_spin={n_somo} unpaired electron(s): nelec - A_spin must be even"
+            )
+        active = apc_active_space(occ_pattern, slot_entropy, max_size, fixed=fixed)
+        print(f"ACTIVE SPACE (slots): {active}")
+        active_set = set(active.tolist())
+        stranded = [p for p in range(n_slots) if occ_pattern[p] == 1 and p not in active_set]
+        if stranded:
+            raise ValueError(
+                f"APC left SOMO slot(s) {stranded} outside the active space (occupation "
+                f"pattern {occ_pattern.tolist()}); a singly-occupied slot cannot be frozen. "
+                "Raise max_size, or use fixed=False so the ranking may keep it."
+            )
+        # Frozen = unselected DOUBLY-occupied slots, the same columns in both channels.
+        inactive = np.array([p for p in range(n_b) if p not in active_set], dtype=int)
+
+        weak = [
+            (int(p), float(pair_overlap[p]))
+            for p in sorted(active_set | set(inactive))
+            if pair_overlap[p] < _FROZEN_OVERLAP_TOL
+        ]
+        if weak:
+            detail = ", ".join(f"slot {p}: {o:.3g}" for p, o in weak)
+            warnings.warn(
+                f"alpha/beta pairing is weak for selected slot(s) ({detail}; "
+                f"|<a_p|S|b_p>| < {_FROZEN_OVERLAP_TOL}): the two channels no longer describe "
+                "one spatial orbital there.  The downfold remains valid; the slot's "
+                "interpretation (and <S^2>) does not.",
+                stacklevel=2,
+            )
+        self._apc_spin_pair_overlap = pair_overlap  # diagnostics for the workflow log
+
+        return tuple(  # type: ignore[return-value]
+            EmbeddedOrbitals(
+                coeff=coeffs[ispin],
+                energy=energies[ispin],
+                n_occ=n_occ_ch[ispin],
+                inactive=inactive,
+                active=active,
+            )
+            for ispin in (0, 1)
+        )
+
     def build_orbitals_uno(
         self,
         *,

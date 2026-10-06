@@ -594,8 +594,17 @@ def build_selector(
                 max_size=max_size,
                 fixed=fixed,
                 use_relaxed=use_relaxed,
+                spin=False,
             ):
-                return emb.build_orbitals_apc_concentric(
+                # `spin=True` is the `spin_downfold` path: the same CL + APC recipe, run
+                # per channel and reconciled through paired slots, returning an
+                # (alpha, beta) pair instead of one `EmbeddedOrbitals`.
+                build = (
+                    emb.build_orbitals_apc_concentric_spin
+                    if spin
+                    else emb.build_orbitals_apc_concentric
+                )
+                return build(
                     fragment_ao=frag,
                     n_shells=n_shells,
                     max_size=max_size,
@@ -667,9 +676,10 @@ class EmbeddingWorkflow(BaseSettings):
     # (h1a, h1b) + (aa, ab, bb) Hamiltonian.  Needs `unrestricted=True` and an EmbASI that
     # reports a spin axis.  A spin-RESTRICTED downfold is ill-defined on an open shell (SPADE
     # partitions each channel independently, so a spin-summed P_B annihilates neither), but
-    # this stays a flag rather than a silent switch: index selectors and the APC builder
-    # are unsupported here (``--selector uno`` is the exception), and only the FCI solver
-    # consumes the pair.
+    # this stays a flag rather than a silent switch: the mulliken index selector is
+    # unsupported here, apc-concentric runs per channel through paired alpha/beta slots
+    # (DRAFT, see `build_orbitals_apc_concentric_spin`), and only the FCI solver consumes
+    # the pair.
     spin_downfold: bool = False
 
     a_nmos: int | None = None  # Fixes the number of electrons selected by SPADE
@@ -995,22 +1005,17 @@ class EmbeddingWorkflow(BaseSettings):
             if self.spin_downfold:
                 # Two orbital sets, each diagonalized in its own span(A), downfolded to an
                 # (h1a, h1b) pair.  A *localiser* (spade, concentric-cl) is applied per
-                # channel and reconciled to a common active-orbital count; the UNO
-                # `orbital_builder` returns one orbital set shared by both channels (see
-                # `build_orbitals_uno`), and the AVAS one selects each channel on its own
-                # (see `build_orbitals_avas_spin`).  An index `selector` (mulliken) and the
-                # APC `orbital_builder` are refused, since both rank against one spin-summed
-                # Fock and would mix the channels this path exists to separate.
-                # `--n_virtual` caps the common active space.
-                if selector is not None or (
-                    orbital_builder is not None and self.selector not in ("uno", "avas")
-                ):
+                # channel and reconciled to a common active-orbital count; the APC
+                # `orbital_builder` pairs the channels into slots and selects once (see
+                # `build_orbitals_apc_concentric_spin`).  An index `selector` (mulliken)
+                # is refused: it ranks against one spin-summed Fock and would mix the
+                # channels this path exists to separate.
+                if selector is not None:
                     raise ValueError(
                         f"spin_downfold=True does not support selector={self.selector!r}: "
-                        "index selection (mulliken) and the APC builder rank columns "
-                        "against one spin-summed Fock, which mixes the channels. Use "
-                        "--selector none, spade, concentric-cl (applied per channel), uno "
-                        "or avas, or cap with --n_virtual."
+                        "index selection (mulliken) ranks columns against one spin-summed "
+                        "Fock, which mixes the channels. Use --selector none, spade, "
+                        "concentric-cl, apc-concentric, uno or avas, or cap with --n_virtual."
                     )
                 if orbital_builder is not None and self.selector == "avas":
                     # Independent per-channel selection (`build_orbitals_avas_spin`): no
@@ -1043,6 +1048,16 @@ class EmbeddingWorkflow(BaseSettings):
                         f"{info['n_fractional']} fractional UNOs in subsystem A; environment "
                         f"spin-common to {info['env_max_angle_deg']:.1e} deg; electrons outside "
                         f"the complement {info['electrons_lost']:.1e}"
+                    )
+                elif orbital_builder is not None:
+                    spin_orbitals = orbital_builder(emb, spin=True)
+                    overlap = emb._apc_spin_pair_overlap[spin_orbitals[0].active]
+                    log(
+                        f"   selector=apc-concentric (per-spin slots) kept "
+                        f"{spin_orbitals[0].n_active_orbitals} slots, froze "
+                        f"{spin_orbitals[0].inactive.size} doubly-occupied "
+                        f"(max_size={self.apc_max_size}, fixed={self.apc_fixed}); "
+                        f"min active pair overlap {overlap.min():.3f}"
                     )
                 else:
                     spin_orbitals = emb.build_orbitals_spin(
