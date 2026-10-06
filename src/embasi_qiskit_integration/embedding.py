@@ -263,6 +263,22 @@ class EmbeddingSetup(Protocol):
     def density_fit(self) -> bool: ...
     @property
     def df_auxbasis(self) -> str | None: ...
+    @property
+    def scf_max_cycle(self) -> int | None: ...
+    @property
+    def init_guess(self) -> str | None: ...
+    @property
+    def init_guess_breaksym(self) -> Any: ...
+    @property
+    def localisation(self) -> str: ...
+    @property
+    def uno_fill(self) -> str: ...
+    @property
+    def avas_ao_labels(self) -> list[str] | None: ...
+    @property
+    def uno_n_env(self) -> int | None: ...
+    @property
+    def scf_stability(self) -> bool: ...
 
     # selector (build_selector)
     @property
@@ -319,6 +335,11 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
     # the ASE Atoms and exposes no charge argument, so its low-level SCF may assume a neutral
     # system.  Treat non-zero-charge embedding runs as unvalidated until confirmed.
     _check_shell_consistency(cfg.spin, cfg.unrestricted)
+    if cfg.uno_n_env is not None:
+        if cfg.localisation != "UNO-SPADE":
+            raise ValueError("--uno_n_env needs --localisation UNO-SPADE")
+        if getattr(cfg, "a_nmos", None) is not None:
+            raise ValueError("--uno_n_env and --a_nmos both fix the UNO-SPADE cut; give only one")
     mol = pyscf.M(
         atom=ase_atoms_to_pyscf(atoms),
         basis=cfg.basis,
@@ -333,6 +354,15 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
     else:
         mf_ll = mol.KS(xc=cfg.xc_ll)
         mf_hl = mol.KS(xc=cfg.xc_hl)
+    # EmbASI runs each SCF on these objects (`mf.kernel(dm0=mf.get_init_guess())` when it
+    # has no density of its own), so their cycle cap and guess settings are honoured.
+    for mf in (mf_ll, mf_hl):
+        if cfg.scf_max_cycle is not None:
+            mf.max_cycle = cfg.scf_max_cycle
+        if cfg.init_guess is not None:
+            mf.init_guess = cfg.init_guess
+        if cfg.init_guess_breaksym is not None and hasattr(mf, "init_guess_breaksym"):
+            mf.init_guess_breaksym = cfg.init_guess_breaksym
 
     projection = ProjectionEmbedding(
         atoms,
@@ -340,6 +370,10 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
         calc_base_ll=PySCF(method=mf_ll),
         calc_base_hl=PySCF(method=mf_hl),
         projection="level-shift",
+        localisation=cfg.localisation,
+        # Only when set, so a run against an EmbASI without the option is unaffected.
+        **({"uno_n_env": cfg.uno_n_env} if cfg.uno_n_env is not None else {}),
+        **({"scf_stability": True} if cfg.scf_stability else {}),
         parallel=parallel,
     )
     # PySCFIntegrals wraps the *same* mf_hl/mf_ll objects handed to
@@ -351,6 +385,28 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
     return ProjectionEmbeddingAdapter(
         projection, integrals, mu=cfg.mu, unrestricted=cfg.unrestricted
     )
+
+
+def avas_valence_ao(mol, frag_ao, labels=None) -> np.ndarray:
+    """Fragment AO indices the ``avas`` UNO fill projects onto.
+
+    ``labels`` are PySCF AVAS-style AO labels (``"Fe 3d"``, ``"C 2p"``, ...) matched with
+    ``mol.search_ao_label`` and restricted to ``frag_ao``; ``None`` takes the fragment's p
+    shells, which suits main-group pi/sigma bonds but not a transition metal's d shell.
+    """
+    frag_ao = np.asarray(frag_ao, dtype=int)
+    ao_labels = mol.ao_labels(fmt=False)
+    if not labels:
+        return np.array([i for i in frag_ao if ao_labels[i][2].endswith("p")], dtype=int)
+    hits = np.asarray(mol.search_ao_label(list(labels)), dtype=int)
+    valence = np.intersect1d(hits, frag_ao)
+    if valence.size == 0:
+        shells = sorted({" ".join(ao_labels[i][1:3]) for i in frag_ao})
+        raise ValueError(
+            f"--avas_ao_labels {list(labels)} match no AO of the fragment; its shells are: "
+            f"{', '.join(shells)}"
+        )
+    return valence
 
 
 def build_selector(
@@ -393,6 +449,44 @@ def build_selector(
     """
     if cfg.selector == "none":
         return None, None, None
+    if cfg.selector == "uno":
+        # Unrestricted natural orbitals of subsystem A over one orbital set shared by both
+        # spins (see `build_orbitals_uno`); budget from `apc_max_size`/`apc_fixed`.
+        if cfg.apc_max_size is None:
+            raise ValueError("--selector uno requires --apc_max_size (nelec,norb)")
+        max_size, fixed = cfg.apc_max_size, cfg.apc_fixed
+        # After the atom reorder the active atoms come first; their AOs define the fragment
+        # for the fill (all of them for apc-fragment, the valence p shells for avas).
+        from embasi_qiskit_integration.selectors import fragment_ao_indices
+
+        frag_ao = fragment_ao_indices(emb.ints.mol, list(range(len(cfg.active_atoms))))
+        valence_ao = avas_valence_ao(emb.ints.mol, frag_ao, cfg.avas_ao_labels)
+
+        def _uno_builder(
+            emb,
+            max_size=max_size,
+            fixed=fixed,
+            use_relaxed=use_relaxed,
+            spin=False,
+            fill=cfg.uno_fill,
+            frag_ao=frag_ao,
+            valence_ao=valence_ao,
+        ):
+            if not spin:
+                raise ValueError(
+                    "--selector uno needs the per-spin downfold: pass --unrestricted True "
+                    "--spin_downfold True (with --localisation UNO-SPADE)"
+                )
+            return emb.build_orbitals_uno(
+                max_size=max_size,
+                fixed=fixed,
+                use_relaxed=use_relaxed,
+                fill=fill,
+                fragment_ao=frag_ao,
+                valence_ao=valence_ao,
+            )
+
+        return None, None, _uno_builder
     from embasi_qiskit_integration.selectors import (
         concentric_localization_selector,
         fragment_ao_indices,
@@ -510,11 +604,53 @@ class EmbeddingWorkflow(BaseSettings):
     # (h1a, h1b) + (aa, ab, bb) Hamiltonian.  Needs `unrestricted=True` and an EmbASI that
     # reports a spin axis.  A spin-RESTRICTED downfold is ill-defined on an open shell (SPADE
     # partitions each channel independently, so a spin-summed P_B annihilates neither), but
-    # this stays a flag rather than a silent switch: index selectors are unsupported here and
-    # only the FCI solver consumes the pair.
+    # this stays a flag rather than a silent switch: index selectors and the APC builder
+    # are unsupported here (``--selector uno`` is the exception), and only the FCI solver
+    # consumes the pair.
     spin_downfold: bool = False
 
     a_nmos: int | None = None  # Fixes the number of electrons selected by SPADE
+    # EmbASI's partition.  "UNO-SPADE" runs SPADE on the doubly occupied unrestricted
+    # natural orbitals only and puts every fractional/singly occupied one in A, so the
+    # environment is one closed-shell orbital set shared by both spins (with it, a_nmos
+    # counts the doubly occupied orbitals given to A).  Needed by ``--selector uno``.
+    localisation: Literal["SPADE", "UNO-SPADE"] = "SPADE"
+    # ``--selector uno``: how the budget beyond the fractional UNOs is filled.  "avas"
+    # projects onto the fragment's valence p AOs (same chemical orbitals at every geometry),
+    # "apc-fragment" ranks fragment-local orbitals by APC, "apc" ranks all of A by APC.
+    uno_fill: Literal["avas", "apc-fragment", "apc"] = "avas"
+    # ``--uno_fill avas``: the fragment AOs the fill projects onto, as PySCF AVAS labels
+    # (e.g. ["Fe 3d", "C 2p", "O 2p"]); restricted to the fragment's atoms.  None -> the
+    # fragment's p shells (right for C/N/O pi and sigma bonds, not for a transition metal).
+    avas_ao_labels: list[str] | None = None
+    # UNO-SPADE only: fix the number of doubly occupied natural orbitals in the environment,
+    # so B is the same size at every geometry of a scan (A takes the rest).  The doubly
+    # occupied count changes with geometry as orbitals become fractional, so a fixed a_nmos
+    # does not do this.  Cannot be combined with a_nmos.  None -> SPADE's gap.
+    uno_n_env: int | None = None
+    # FCI only: constrain the solve to <S^2> = target_s2 (e.g. 0 singlet, 2 triplet),
+    # keeping the lowest matching root.  Needs alpha and beta to share orbitals: a
+    # restricted downfold, or ``--selector uno``.  None -> unconstrained.
+    target_s2: float | None = None
+    # With --target_s2 and a genuinely spin-dependent downfold (a KS low level makes the
+    # embedding potential depend on A's spin density): average h1a/h1b and solve
+    # spin-adapted anyway.  Exact spin states, at the cost of dropping the physical alpha/beta
+    # difference of the embedding potential.  Off: the penalised unrestricted solve, whose
+    # roots are only approximately pure (reported).
+    fci_spin_average: bool = False
+
+    # --- low-level / high-level SCF controls (None -> PySCF's own default) --- #
+    scf_max_cycle: int | None = None  # SCF iteration cap (PySCF default 50)
+    # Starting guess for each SCF: "minao" (PySCF default), "atom", "huckel", "1e", ...
+    init_guess: str | None = None
+    # Unrestricted runs at 2S = 0 only: how PySCF breaks alpha/beta symmetry in the guess.
+    # 1 (PySCF default) keeps only atom-diagonal blocks of the beta density, "mix" rotates
+    # HOMO/LUMO by 45 degrees between the channels, 0 keeps the guess spin-symmetric.
+    init_guess_breaksym: int | Literal["mix"] | None = None
+    # Supersystem SCF only: after it converges, run PySCF stability analysis in EmbASI and
+    # follow any instability (including breaking the spin symmetry of a closed-shell UHF) to
+    # a stable solution, so a scan does not jump between a saddle point and the minimum.
+    scf_stability: bool = False
 
     # --- active space: solver budget only, not embedding physics --- #
     n_frozen_occ: int = 0
@@ -530,7 +666,7 @@ class EmbeddingWorkflow(BaseSettings):
     # cuts on the σ² gap -- basis invariant, robust when the canonicals delocalise.
     # ``apc-concentric`` adds APC ranking over BOTH occupied and virtual candidates, so it
     # supersedes ``n_frozen_occ``.  ``none`` disables.  See ``selectors`` for the papers.
-    selector: Literal["none", "mulliken", "spade", "concentric-cl", "apc-concentric"] = (
+    selector: Literal["none", "mulliken", "spade", "concentric-cl", "apc-concentric", "uno"] = (
         "concentric-cl"
     )
     # ``concentric-cl``/``apc-concentric`` only: Fock shell expansions after shell 0.
@@ -627,6 +763,7 @@ class EmbeddingWorkflow(BaseSettings):
         if self.xyz is not None and self.xyz.stem.isdigit():
             geometry_parameter = int(self.xyz.stem) / 10.0
 
+        self._check_target_s2()  # before any EmbASI work, so a bad value fails fast
         log("== Step 1: EmbASI low-level projection embedding ==")
         source = f"xyz={self.xyz}" if self.xyz is not None else f"s26[{self.s26_index}]"
         log(f"   geometry: {source}")
@@ -772,26 +909,50 @@ class EmbeddingWorkflow(BaseSettings):
             if self.spin_downfold:
                 # Two orbital sets, each diagonalized in its own span(A), downfolded to an
                 # (h1a, h1b) pair.  A *localiser* (spade, concentric-cl) is applied per
-                # channel and reconciled to a common active-orbital count; an index
-                # `selector` (mulliken) and the APC `orbital_builder` are refused, since
-                # both rank against one spin-summed Fock and would mix the channels this
-                # path exists to separate.  `--n_virtual` caps the common active space.
-                if selector is not None or orbital_builder is not None:
+                # channel and reconciled to a common active-orbital count; the UNO
+                # `orbital_builder` returns one orbital set shared by both channels (see
+                # `build_orbitals_uno`).  An index `selector` (mulliken) and the APC
+                # `orbital_builder` are refused, since both rank against one spin-summed
+                # Fock and would mix the channels this path exists to separate.
+                # `--n_virtual` caps the common active space.
+                if selector is not None or (orbital_builder is not None and self.selector != "uno"):
                     raise ValueError(
                         f"spin_downfold=True does not support selector={self.selector!r}: "
                         "index selection (mulliken) and the APC builder rank columns "
                         "against one spin-summed Fock, which mixes the channels. Use "
-                        "--selector none, spade or concentric-cl (applied per channel), "
-                        "or cap with --n_virtual."
+                        "--selector none, spade, concentric-cl (applied per channel) or "
+                        "uno, or cap with --n_virtual."
                     )
-                spin_orbitals = emb.build_orbitals_spin(
-                    n_frozen_occ=self.n_frozen_occ,
-                    n_virtual=self.n_virtual,
-                    virtual_localizer=virtual_localizer,
-                    use_relaxed=self.relax_hf,
-                )
-                log(f"   alpha: {spin_orbitals[0]}")
-                log(f"   beta : {spin_orbitals[1]}")
+                if orbital_builder is not None:
+                    spin_orbitals = orbital_builder(emb, spin=True)
+                    info = emb._uno_info
+                    act_occ = " ".join(f"{n:.3f}" for n in info["occupations"][info["active"]])
+                    log(
+                        f"   selector=uno (fill={info['fill']}) kept "
+                        f"{spin_orbitals[0].n_active_orbitals} UNOs "
+                        f"(occupations {act_occ}), froze {spin_orbitals[0].inactive.size} core; "
+                        f"{info['n_fractional']} fractional UNOs in subsystem A; environment "
+                        f"spin-common to {info['env_max_angle_deg']:.1e} deg; electrons outside "
+                        f"the complement {info['electrons_lost']:.1e}"
+                    )
+                else:
+                    spin_orbitals = emb.build_orbitals_spin(
+                        n_frozen_occ=self.n_frozen_occ,
+                        n_virtual=self.n_virtual,
+                        virtual_localizer=virtual_localizer,
+                        use_relaxed=self.relax_hf,
+                    )
+                # Not `str(EmbeddedOrbitals)`: each set describes ONE spin (`n_occ_b=None`),
+                # so its restricted `__str__` would double the electron count.
+                for name, orb in zip(("alpha", "beta "), spin_orbitals):
+                    n_act_occ = orb.n_occ - orb.inactive.size
+                    log(
+                        f"   {name}: active {orb.n_active_orbitals} orbitals = "
+                        f"{n_act_occ} occupied + {orb.n_active_orbitals - n_act_occ} "
+                        f"virtual; {n_act_occ} electrons  [subsystem A pool: "
+                        f"{orb.n_occ} occupied ({orb.inactive.size} frozen), "
+                        f"{orb.coeff.shape[1] - orb.n_occ} virtual]"
+                    )
                 ham = emb.embedded_hamiltonian_spin(spin_orbitals)
                 # Alpha represents the pair wherever one set suffices (logging, the
                 # restricted `rdm1_ao` fallback).  `orbitals_b` carries beta's own set: the
@@ -1114,11 +1275,42 @@ class EmbeddingWorkflow(BaseSettings):
         """
         return build_selector(self, emb, log=log, use_relaxed=use_relaxed)
 
+    def _check_target_s2(self) -> None:
+        """Reject a ``--target_s2`` that no spin state has, or the ``--spin`` sector excludes."""
+        if self.target_s2 is None:
+            return
+        # --target_s2 is S(S+1), not 2S: only 0, 0.75, 2, 3.75, 6, ... exist, and S must be
+        # reachable from the M_s the --spin sector fixes (S >= |M_s|, same parity).
+        two_s = np.sqrt(1.0 + 4.0 * float(self.target_s2)) - 1.0
+        if abs(two_s - round(two_s)) > 1e-6:
+            valid = ", ".join(f"{0.25 * n * (n + 2):g}" for n in range(6))
+            raise ValueError(
+                f"--target_s2 {self.target_s2:g} is not S(S+1) for any spin S (valid: "
+                f"{valid}, ...).  It is <S^2>, not 2S: singlet 0, doublet 0.75, "
+                "triplet 2, quintet 6."
+            )
+        if round(two_s) < abs(self.spin) or (round(two_s) - abs(self.spin)) % 2:
+            raise ValueError(
+                f"--target_s2 {self.target_s2:g} (2S = {round(two_s)}) is not reachable "
+                f"from --spin {self.spin} (2M_s): need 2S >= |2M_s| with the same parity"
+            )
+
     def _build_solver(self):
         from embasi_qiskit_integration.solvers import FCISolver, SQDSolver
 
+        if self.target_s2 is not None:
+            self._check_target_s2()
+            # <S^2> is evaluated assuming alpha and beta share one orbital set, which the
+            # per-spin downfold only guarantees with the UNO selector.
+            if self.solver != "fci":
+                raise ValueError("--target_s2 is supported by the FCI solver only")
+            if self.spin_downfold and self.selector != "uno":
+                raise ValueError(
+                    "--target_s2 with --spin_downfold needs --selector uno (shared alpha/beta "
+                    f"orbitals); selector={self.selector!r} gives each spin its own orbitals"
+                )
         if self.solver == "fci":
-            return FCISolver()
+            return FCISolver(target_s2=self.target_s2, spin_average=self.fci_spin_average)
 
         from embasi_qiskit_integration.circuit_run import build_sampler
 

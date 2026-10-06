@@ -416,6 +416,18 @@ class PySCFIntegrals:
     def veff_ll(self, dm: DensityArg) -> np.ndarray:
         return self._spin_average(self.mf_ll.get_veff(self.mol, self._as_veff_arg(self.mf_ll, dm)))
 
+    def veff_ll_spin(self, dm: tuple[np.ndarray, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+        """Each spin channel's low-level effective potential at an ``(alpha, beta)`` pair.
+
+        The per-channel counterpart of :meth:`veff_ll` (which returns the channel mean):
+        ``v_sigma = J[d_a + d_b] - K[d_sigma]`` for HF, the spin-resolved KS potential
+        otherwise.  A restricted low level has one potential for both channels.
+        """
+        v = np.asarray(self.mf_ll.get_veff(self.mol, self._as_veff_arg(self.mf_ll, dm)))
+        if v.ndim == 3 and v.shape[0] == 2:
+            return v[0], v[1]
+        return v, v
+
     def veff_hf(self, dm) -> np.ndarray:
         # `_hf` is the restricted engine (see __init__), so this is normally already
         # (nao, nao); the reduction guards a spin-resolved `dm` argument, which puts
@@ -1892,11 +1904,9 @@ class ProjectionEmbeddingAdapter:
         That is a property of ``v_emb``, **not** a reason to avoid this pair.  Each
         channel is the right operator to contract against *that channel's* density, which
         is precisely what :meth:`embedded_hamiltonian_spin` folds into ``h1_s`` and
-        therefore what :meth:`projection_energy` must subtract back off.  Verified:
-        ``h_core + v_emb_spin(s) + P_B_s`` reproduces the ``h_emb_s`` the downfold used to
-        ``0.0`` — while the same reconstruction with a *per-channel* ``veff_ll`` is 4.18 Ha
-        out, which is why the spin-summed ``veff_ll`` above is the correct convention here.
-
+        therefore what :meth:`projection_energy` must subtract back off.  The mean field
+        stripped from each channel's ``F_emb`` is that channel's own (see
+        :meth:`_veff_ll_channel`), not the channel mean.
         The spin-summed ``v_emb`` is the wrong operator for a per-spin density: it removes
         a quantity the solver never added (+54.0 Ha on ``data/22.inp``).  See
         :meth:`projection_energy`, which now derives its spin-summed ``correction`` /
@@ -1910,8 +1920,26 @@ class ProjectionEmbeddingAdapter:
             None if self._p_b_spin is None else self._p_b_spin[ispin],
             f"the spin-{ispin} projector P_B",
         )
-        h_emb_s = fock - self.ints.veff_ll(self._dm_a_for_veff)
+        h_emb_s = fock - self._veff_ll_channel(ispin)
         return h_emb_s - self.ints.hcore() - p_b_s
+
+    def _veff_ll_channel(self, ispin: int) -> np.ndarray:
+        """Spin ``ispin``'s own low-level mean field at subsystem A's density.
+
+        ``F_emb^sigma`` (A_LL's Fock for that channel) carries ``v_sigma[gamma^A]``, so
+        stripping it back off to leave that channel's bare embedded one-body operator
+        needs the SAME channel's potential.  Subtracting the channel mean instead leaves
+        ``-/+ K[gamma^A_alpha - gamma^A_beta] / 2`` (A's own spin-density exchange, with
+        opposite signs per channel) inside ``h_emb_s``, which the solver's two-electron
+        integrals then count again: the downfolded Hamiltonian is no longer spin-free and
+        the energy is off by an exchange-sized amount (0.42 Ha on a nitrile triplet).  It
+        vanishes on an unpolarised A, which is why closed-shell checks never saw it.
+        Falls back to the mean when no per-spin density or backend support exists.
+        """
+        pair = getattr(self, "_dm_a_spin", None)
+        if pair is not None and hasattr(self.ints, "veff_ll_spin"):
+            return self.ints.veff_ll_spin(pair)[ispin]
+        return self.ints.veff_ll(self._dm_a_for_veff)
 
     # ---------------- orbital construction ---------------- #
     def _eigh_subsystem_a(self, fock: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
@@ -2275,6 +2303,223 @@ class ProjectionEmbeddingAdapter:
             # Carry the beta count through selection; dropping it here would silently
             # demote an open-shell partition back to the restricted reading.
             n_occ_b=orbitals.n_occ_b,
+        )
+
+    def build_orbitals_uno(
+        self,
+        *,
+        max_size: int | tuple[int, int],
+        fixed: bool = True,
+        occ_window: tuple[float, float] = (0.02, 1.98),
+        degeneracy_tol: float = 1.0e-6,
+        env_tol: float = 1.0e-6,
+        use_relaxed: bool = False,
+        fill: str = "avas",
+        fragment_ao: np.ndarray | None = None,
+        valence_ao: np.ndarray | None = None,
+        local_threshold: float = 0.5,
+    ) -> tuple[EmbeddedOrbitals, EmbeddedOrbitals]:
+        """Active space from unrestricted natural orbitals (UNOs) of subsystem A.
+
+        Needs an environment shared by both spins -- EmbASI's ``localisation="UNO-SPADE"``,
+        which builds B from the doubly occupied supersystem UNOs.  (Plain SPADE partitions the
+        spins separately; their environments then differ by several degrees on a
+        spin-polarised system, and no single orbital set is orthogonal to both.)  With a
+        shared B, one S-orthonormal complement of span(B) serves both spins, and both
+        channels' ``P_B`` vanish on it exactly.
+
+        1. **UNOs** of subsystem A's spin-summed density (the relaxed embedded-HF density
+           with ``use_relaxed``, else the current cycle's) in that complement.
+        2. **Ranking:** UNOs with occupation inside ``occ_window`` are never rotated and rank
+           by natural-orbital entropy above everything else.  If fewer are fractional than the
+           budget needs (near equilibrium, where UHF ~ RHF and occupations are 2/0), the rest
+           comes from the NON-fractional doubly occupied and empty UNOs -- each block
+           occupation-degenerate, so defined only up to rotations within it -- by ``fill``:
+
+           * ``"avas"`` (default): rotate each block to maximize overlap with the fragment's
+             valence AOs ``valence_ao`` and rank by that overlap, so the same chemical
+             orbitals are chosen at every geometry.
+           * ``"apc-fragment"``: rotate each block by overlap with all fragment AOs
+             ``fragment_ao``, keep orbitals with weight above ``local_threshold``,
+             semi-canonicalize the local and non-local sets separately and rank the local
+             ones by APC (non-local ones last).
+           * ``"apc"``: semi-canonicalize each degenerate block against the spin-averaged
+             Fock and rank by plain APC over all of A.  Candidates can then be delocalized
+             and change between geometries (measured on a nitrile triplet: up to 45 mHa
+             against the same selection on the whole molecule; ``avas`` 3.8, ``apc-fragment``
+             1.8).
+        3. **Selection:** PySCF's ``Chooser`` on the occupation pattern -- the Nbeta most
+           occupied UNOs doubly occupied, the next ``Nalpha - Nbeta`` singly occupied (always
+           kept), the rest empty; unselected doubly occupied UNOs are the frozen core.
+
+        Both returned sets hold the SAME orbitals (descending occupation), so
+        :meth:`embedded_hamiltonian_spin` builds ``(h1a, h1b)`` from each channel's own
+        embedding operators over one spatial orbital set, and a spin-adapted treatment
+        (``FCISolver(target_s2=...)``) is well defined.
+
+        Raises:
+            ValueError: the two channels' environments differ by more than ``env_tol``
+                (``1 - cos`` of the largest principal angle), i.e. the partition is not
+                spin-common; or the budget's parity cannot hold A's unpaired electrons.
+
+        Warns:
+            UserWarning: the budget freezes or discards a UNO whose occupation lies inside
+                ``occ_window``.
+        """
+        from embasi_qiskit_integration.selectors import (
+            apc_active_space,
+            apc_orbital_entropies,
+            apc_pair_coefficients,
+        )
+
+        if self._fock_spin is None:
+            raise ValueError(
+                "no per-spin embedded Fock available; build_orbitals_uno needs an "
+                "unrestricted run_low_level()"
+            )
+        s = self._s_arr
+        c_env = [self._mo_spin(self.p.mo_coeffs_B_LL, ispin) for ispin in (0, 1)]
+        cosines = np.linalg.svd(c_env[0].T @ s @ c_env[1], compute_uv=False)
+        if c_env[0].shape[1] != c_env[1].shape[1] or (
+            cosines.size and 1.0 - float(cosines.min()) > env_tol
+        ):
+            angle = float(np.degrees(np.arccos(np.clip(cosines.min(), -1.0, 1.0))))
+            raise ValueError(
+                f"the alpha and beta environments differ (widths {c_env[0].shape[1]}/"
+                f"{c_env[1].shape[1]}, largest principal angle {angle:.3g} degrees): UNO "
+                "selection needs one environment shared by both spins.  Run EmbASI with "
+                "localisation='UNO-SPADE' (workflow: --localisation UNO-SPADE)."
+            )
+
+        # S-orthonormal complement of span(B).
+        proj = np.eye(s.shape[0]) - c_env[0] @ (c_env[0].T @ s)
+        chol = np.linalg.cholesky(s)
+        y = proj @ sla.solve_triangular(chol.T, np.eye(s.shape[0]), lower=False)
+        w, u = np.linalg.eigh(y.T @ s @ y)
+        keep = w > 1e-8
+        q = y @ u[:, keep] @ np.diag(1.0 / np.sqrt(w[keep]))
+
+        n_alpha, n_beta = (self._mo_spin(self.p.mo_coeffs_A_LL, k).shape[1] for k in (0, 1))
+        if n_beta > n_alpha:
+            raise ValueError(
+                f"subsystem A has more beta ({n_beta}) than alpha ({n_alpha}) electrons; the "
+                "UNO occupation pattern assumes alpha is the majority spin"
+            )
+        dm_total = self._dm_a_relaxed if use_relaxed else self._dm_a
+        dm_total = self._require(dm_total, "subsystem A's density")
+
+        occ, vec = np.linalg.eigh(q.T @ s @ dm_total @ s @ q)
+        order = np.argsort(occ)[::-1]
+        occ, c_no = occ[order], q @ vec[:, order]
+        lost = float(np.trace(dm_total @ s)) - float(occ.sum())
+
+        pair = self._fock_relaxed_spin if use_relaxed else self._fock_spin
+        f_avg = 0.5 * (pair[0] + pair[1])
+
+        n_orb = c_no.shape[1]
+        n_somo = n_alpha - n_beta
+        pattern = np.zeros(n_orb, dtype=int)
+        pattern[:n_beta], pattern[n_beta:n_alpha] = 2, 1
+        fractional = (occ > occ_window[0]) & (occ < occ_window[1])
+        blocks = [
+            np.flatnonzero((pattern == 2) & ~fractional),
+            np.flatnonzero((pattern == 0) & ~fractional),
+        ]
+
+        def semicanon(idx):
+            if len(idx) > 1:
+                _e, rot = np.linalg.eigh(c_no[:, idx].T @ f_avg @ c_no[:, idx])
+                c_no[:, idx] = c_no[:, idx] @ rot
+
+        def ao_projector(ao):
+            ao = np.asarray(ao, dtype=int)
+            return s[:, ao] @ np.linalg.solve(s[np.ix_(ao, ao)], s[ao, :])
+
+        weight = np.zeros(n_orb)
+        local = np.ones(n_orb, dtype=bool)
+        if fill == "apc":
+            start = 0
+            for stop in range(1, n_orb + 1):
+                if stop == n_orb or abs(occ[stop] - occ[start]) > degeneracy_tol:
+                    semicanon(np.arange(start, stop))
+                    start = stop
+        elif fill in ("avas", "apc-fragment"):
+            ao = valence_ao if fill == "avas" else fragment_ao
+            if ao is None or len(ao) == 0:
+                raise ValueError(
+                    f"fill={fill!r} needs the fragment's "
+                    f"{'valence ' if fill == 'avas' else ''}AO indices"
+                )
+            p_ao = ao_projector(ao)
+            for idx in blocks:
+                if len(idx) == 0:
+                    continue
+                w_blk, rot = np.linalg.eigh(c_no[:, idx].T @ p_ao @ c_no[:, idx])
+                order_blk = np.argsort(w_blk)[::-1]
+                c_no[:, idx] = c_no[:, idx] @ rot[:, order_blk]
+                weight[idx] = w_blk[order_blk]
+            if fill == "apc-fragment":
+                for idx in blocks:
+                    local[idx] = weight[idx] > local_threshold
+                    semicanon(idx[local[idx]])
+                    semicanon(idx[~local[idx]])
+        else:
+            raise ValueError(f"unknown UNO fill {fill!r}: use 'avas', 'apc-fragment' or 'apc'")
+
+        p = np.clip(occ / 2.0, 1e-12, 1 - 1e-12)
+        s_no = -(p * np.log(p) + (1 - p) * np.log(1 - p))
+        f_diag = np.einsum("pi,pq,qi->i", c_no, f_avg, c_no)
+        if fill == "avas":
+            entropy = weight.copy()
+        else:
+            k_diag = np.einsum("pi,pq,qi->i", c_no, self.ints.get_k(dm_total), c_no)
+            dbl, emp = np.flatnonzero(pattern == 2), np.flatnonzero(pattern == 0)
+            s_occ, s_virt = apc_orbital_entropies(
+                apc_pair_coefficients(f_diag[dbl], f_diag[emp], k_diag[emp])
+            )
+            entropy = np.zeros(n_orb)
+            entropy[dbl], entropy[emp] = s_occ, s_virt
+            entropy = np.where(local, entropy, -1.0 + 1e-3 * entropy)  # non-local rank last
+        entropy = np.where(fractional, 10.0 + s_no, entropy)
+
+        if fixed and (int(max_size[0]) - n_somo) % 2:  # type: ignore[index]
+            raise ValueError(
+                f"max_size nelec={max_size[0]} cannot hold A_spin={n_somo} unpaired "  # type: ignore[index]
+                "electron(s): nelec - A_spin must be even"
+            )
+        active = apc_active_space(pattern, entropy, max_size, fixed=fixed)
+        print(f"ACTIVE SPACE (UNO): {active}")
+        active_set = set(active.tolist())
+        if any(pattern[i] == 1 and i not in active_set for i in range(n_orb)):
+            raise ValueError(
+                "the UNO selection left a singly occupied UNO outside the active space"
+            )
+        inactive = np.array([i for i in range(n_beta) if i not in active_set], dtype=int)
+        discarded = [i for i in range(n_alpha, n_orb) if i not in active_set]
+        cut = [(int(i), float(occ[i])) for i in inactive if occ[i] < occ_window[1]]
+        cut += [(int(i), float(occ[i])) for i in discarded if occ[i] > occ_window[0]]
+        if cut:
+            detail = ", ".join(f"UNO {i}: {n:.3f}" for i, n in cut)
+            warnings.warn(
+                f"the active-space budget cuts through the fractional UNOs ({detail}): these "
+                f"are frozen or discarded although their occupation lies inside {occ_window}. "
+                "Raise max_size to include them.",
+                stacklevel=2,
+            )
+        self._uno_info = {
+            "occupations": occ,
+            "active": active,
+            "n_fractional": int(fractional.sum()),
+            "fill": fill,
+            "fill_weight": weight[active],
+            "electrons_lost": lost,
+            "env_max_angle_deg": float(
+                np.degrees(np.arccos(np.clip(cosines.min(), -1.0, 1.0))) if cosines.size else 0.0
+            ),
+        }
+        return tuple(  # type: ignore[return-value]
+            EmbeddedOrbitals(coeff=c_no, energy=f_diag, n_occ=n, inactive=inactive, active=active)
+            for n in (n_alpha, n_beta)
         )
 
     # ---------------- downfolding ---------------- #
@@ -2645,9 +2890,9 @@ class ProjectionEmbeddingAdapter:
             # Each channel's own projector must be invisible in its own active space.
             leaks.append(float(np.abs(c_act.T @ self._p_b_spin[ispin] @ c_act).max()))
             fock = self._fock_spin[ispin]  # type: ignore[index]
-            # h_emb per channel: strip the low-level mean field, exactly as `h_emb` does
-            # for the spin-summed Fock (see that property for why it is veff_ll).
-            h_emb_s = fock - self.ints.veff_ll(self._dm_a_for_veff)
+            # h_emb per channel: strip THIS channel's low-level mean field (see
+            # `_veff_ll_channel`; the channel mean would leave A's spin-density exchange in).
+            h_emb_s = fock - self._veff_ll_channel(ispin)
             # Kept for `e_core` below, which must charge each channel's frozen core to
             # its OWN one-body operator -- the same one its h1 is built from.
             h_emb_pair.append(h_emb_s)
