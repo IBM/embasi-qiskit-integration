@@ -321,6 +321,15 @@ def build_atoms(cfg: EmbeddingSetup) -> tuple[Any, int]:
 
 def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbeddingAdapter:
     """Set up ProjectionEmbedding exactly as the EmbASI PySCF example does."""
+    # Validate the config before importing EmbASI: the import loads mpi4py, which needs
+    # an MPI library, and a bad flag should fail the same way with or without one.
+    _check_shell_consistency(cfg.spin, cfg.unrestricted)
+    if cfg.uno_n_env is not None:
+        if cfg.localisation != "UNO-SPADE":
+            raise ValueError("--uno_n_env needs --localisation UNO-SPADE")
+        if getattr(cfg, "a_nmos", None) is not None:
+            raise ValueError("--uno_n_env and --a_nmos both fix the UNO-SPADE cut; give only one")
+
     import pyscf
     from embasi.embedding import ProjectionEmbedding
     from pyscf.pbc.tools.pyscf_ase import PySCF, ase_atoms_to_pyscf
@@ -339,12 +348,6 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
     sort_embed_mask = np.sort(embed_mask)
     atoms = atoms[idx_list]
 
-    _check_shell_consistency(cfg.spin, cfg.unrestricted)
-    if cfg.uno_n_env is not None:
-        if cfg.localisation != "UNO-SPADE":
-            raise ValueError("--uno_n_env needs --localisation UNO-SPADE")
-        if getattr(cfg, "a_nmos", None) is not None:
-            raise ValueError("--uno_n_env and --a_nmos both fix the UNO-SPADE cut; give only one")
     mol = pyscf.M(
         atom=ase_atoms_to_pyscf(atoms),
         basis=cfg.basis,
