@@ -394,3 +394,34 @@ def test_spin_penalty_applies_on_the_spin_dependent_path():
     _, civecs = solver.kernel((base.h1 + noise / 2, base.h1 - noise / 2), (base.h2,) * 3, 4, (2, 2))
     for c in civecs:
         assert fci.spin_op.spin_square0(c, 4, (2, 2))[0] == pytest.approx(0.0, abs=1e-3)
+
+
+@pytest.mark.parametrize(("nelec", "target", "scale"), [((2, 2), 0.0, 0.02), ((3, 1), 2.0, 0.2)])
+def test_penalised_spin_target_reports_the_energy_of_its_state(nelec, target, scale):
+    """On the penalised direct_uhf path each eigenvalue is <H> + shift * <(S^2 - t)^2>.  An
+    orbital-dependent h1a/h1b split (a KS low level) breaks [H, S^2], so the kept root is
+    slightly contaminated and that penalty is nonzero -- it must not reach the energy.  (A
+    uniform +/- c*I shift only adds c*(Na - Nb) and still commutes with S^2, which is why the
+    tests above could not see it.)  Checked against the energy rebuilt from the result's own
+    RDMs, which describe exactly the returned state."""
+    base = _hund_model()
+    rng = np.random.default_rng(1)
+    d = rng.standard_normal((4, 4))
+    d = scale * (d + d.T)
+    ham = EmbeddedHamiltonian(
+        h1=base.h1,
+        h1a=base.h1 + d / 2,
+        h1b=base.h1 - d / 2,
+        h2=base.h2,
+        e_core=0.3,
+        nelec=nelec,
+    )
+    res = FCISolver(target_s2=target, nroots=6).solve(ham)
+    assert "uhf" in res.diagnostics["solver"]
+    e_rdm = (
+        ham.e_core
+        + np.einsum("pq,pq->", ham.h1a, res.rdm1a)
+        + np.einsum("pq,pq->", ham.h1b, res.rdm1b)
+        + 0.5 * np.einsum("pqrs,pqrs->", ham.h2, res.rdm2)
+    )
+    assert res.energy == pytest.approx(e_rdm, abs=1e-8)

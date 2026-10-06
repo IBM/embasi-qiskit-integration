@@ -65,7 +65,8 @@ class FCISolver(ActiveSpaceSolver):
     pair, with ``spin_average``) is averaged and solved spin-adapted (``direct_spin1``), so
     the roots are exact spin states.  A genuinely spin-dependent pair (a KS low level) is
     solved with the penalised ``direct_uhf``, whose roots are only approximately pure: the
-    lowest root within ``s2_tol`` of the target is kept, and its <S^2> is reported.
+    lowest root within ``s2_tol`` of the target is kept, and its <S^2> is reported.  The
+    reported energy is always <H> of the kept root, never the penalised eigenvalue.
     """
 
     def __init__(
@@ -148,9 +149,14 @@ class FCISolver(ActiveSpaceSolver):
                 obj = solver.FCISolver()
                 fci.addons.fix_spin_(obj, ss=self.target_s2)
             obj.nroots = self.nroots
-            energies, cis = obj.kernel(h1e, eri, norb, ham.nelec)
-            energies = np.atleast_1d(energies)
+            _, cis = obj.kernel(h1e, eri, norb, ham.nelec)
             cis = cis if self.nroots > 1 else [cis]
+            # Each eigenvalue is <H> + shift * <(S^2 - t)^2>.  On the spin-adapted path the
+            # roots are spin eigenstates and the penalty vanishes, but a genuinely
+            # spin-dependent pair breaks [H, S^2]: the roots are contaminated and the penalty
+            # would land in the energy (33 mHa on a triplet at |h1a-h1b| ~ 0.4 Ha).  Re-evaluate
+            # <H> with the module-level (unpenalised) energy, and choose among roots by it.
+            energies = np.array([solver.energy(h1e, eri, c, norb, ham.nelec) for c in cis])
             s2s = np.array([fci.spin_op.spin_square0(c, norb, ham.nelec)[0] for c in cis])
             # A spin-free solve gives exact spin states; a genuinely spin-dependent one
             # (penalised direct_uhf) only approximately pure ones, so allow s2_tol there.
