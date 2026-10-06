@@ -128,3 +128,24 @@ def test_explicit_bitstring_with_relabeling_is_refused(n2_ham):
     )
     with pytest.raises(ValueError, match="cannot be combined with optimize=True"):
         solver.build_circuits(n2_ham)
+
+
+def test_sweep_axes_build_their_product_and_pool_it(n2_ham):
+    """``evolution_time`` and ``num_groups`` are sweep axes: the ensemble is their product
+    times ``num_randomizations``, all handed to one SQD run (the reference workflow's
+    recipe), not just the first point."""
+    pytest.importorskip("qiskit_fermions")
+    from embasi_qiskit_integration.circuit_run.aer import AerSampler
+
+    solver = SQDSolver(
+        AerSampler(),
+        method="qdrift",
+        evolution_time=[1.0, 2.0, 3.0],
+        num_groups=[5, 10],
+        num_randomizations=2,
+        seed=42,
+        optimize=False,
+    )
+    assert len(solver.build_circuits(n2_ham)) == 3 * 2 * 2
+    solver.evolution_time, solver.num_groups = 1.0, 5  # scalars: a one-point sweep
+    assert len(solver.build_circuits(n2_ham)) == 2

@@ -11,7 +11,7 @@ is completed in Phase 6.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -52,13 +52,67 @@ def _sampler_backend_diagnostics(sampler) -> dict:
 
 
 class FCISolver(ActiveSpaceSolver):
-    """Exact full configuration interaction via PySCF — the numerical oracle."""
+    """Exact full configuration interaction via PySCF — the numerical oracle.
+
+    ``target_s2`` constrains the solve to a spin state: a spin penalty (``fix_spin_``) on
+    ``nroots`` roots, keeping the lowest root whose <S^2> matches.  Near dissociation the
+    spin multiplets become near-degenerate and the lowest state in a given M_s sector can
+    have higher S (a triplet run landing on a quintet); a single penalised root can also
+    converge onto an excited state of the right spin.  <S^2> is evaluated for alpha and
+    beta sharing one orbital set -- the case this is meant for (a restricted downfold, or
+    the UNO selector's shared orbitals).  ``None`` (default) keeps the unconstrained solve.
+    With a target, an ``(h1a, h1b)`` pair differing by less than ``spin_free_tol`` (or any
+    pair, with ``spin_average``) is averaged and solved spin-adapted (``direct_spin1``), so
+    the roots are exact spin states.  A genuinely spin-dependent pair (a KS low level) is
+    solved with the penalised ``direct_uhf``, whose roots are only approximately pure: the
+    lowest root within ``s2_tol`` of the target is kept, and its <S^2> is reported.  The
+    reported energy is always <H> of the kept root, never the penalised eigenvalue.
+    """
+
+    def __init__(
+        self,
+        target_s2: float | None = None,
+        nroots: int = 3,
+        spin_free_tol: float = 1.0e-3,
+        spin_average: bool = False,
+        s2_tol: float = 0.05,
+    ) -> None:
+        self.target_s2 = target_s2
+        self.nroots = nroots
+        self.spin_free_tol = spin_free_tol
+        self.spin_average = spin_average
+        self.s2_tol = s2_tol
 
     def solve(self, ham: EmbeddedHamiltonian) -> SolverResult:
         from pyscf import fci
 
         norb = ham.norb
-        if ham.is_spin_dependent:
+        spin_dependent = ham.is_spin_dependent
+        averaged = 0.0
+        if spin_dependent and self.target_s2 is not None:
+            # A spin target asks for a spin eigenstate, which needs a spin-free Hamiltonian.
+            # With orbitals shared by both channels (the only case target_s2 is allowed for)
+            # an h1a/h1b difference at the level of SCF noise is not physics -- an HF low
+            # level with a closed-shell environment is exactly spin-free -- but near
+            # dissociation, where the multiplets are near-degenerate, even 1e-4 Ha mixes
+            # them completely.  Average it away and solve spin-adapted; a genuinely
+            # spin-dependent pair (a KS low level) stays on the penalised direct_uhf path.
+            averaged = float(np.abs(np.asarray(ham.h1a) - np.asarray(ham.h1b)).max())
+            if averaged < self.spin_free_tol or self.spin_average:
+                if averaged >= self.spin_free_tol:
+                    import warnings
+
+                    warnings.warn(
+                        f"spin_average removes a genuine alpha/beta difference of "
+                        f"{averaged:.2e} Ha from h1 (above spin_free_tol={self.spin_free_tol:g}): "
+                        "the embedding potential is spin-dependent (a KS low level), so the "
+                        "averaged Hamiltonian differs from the embedded one -- 45 mHa on a "
+                        "nitrile triplet at |h1a-h1b| = 0.39 Ha.  The default penalised solve "
+                        "keeps the physical difference.",
+                        stacklevel=2,
+                    )
+                spin_dependent = False
+        if spin_dependent:
             # A genuine spin-dependent downfold: the two channels see different
             # one-body operators, which `direct_spin1` cannot express (it takes a
             # single h1e and distinguishes spin only through `nelec`).
@@ -80,10 +134,50 @@ class FCISolver(ActiveSpaceSolver):
         else:
             solver = fci.direct_spin1
             h1e, eri, tag = ham.h1, ham.h2, "pyscf-fci"
+            if ham.is_spin_dependent:
+                # The averaged pair (see above).
+                h1e = 0.5 * (np.asarray(ham.h1a) + np.asarray(ham.h1b))
+                tag = f"pyscf-fci-spin-averaged(|h1a-h1b|={averaged:.1e})"
 
-        e, ci = solver.kernel(h1e, eri, norb, ham.nelec)
+        if self.target_s2 is None:
+            e, ci = solver.kernel(h1e, eri, norb, ham.nelec)
+        else:
+            if solver is fci.direct_uhf:
+                # PySCF's fix_spin_ refuses direct_uhf, so apply the same penalty here.
+                obj = _spin_penalised_uhf(self.target_s2)
+            else:
+                obj = solver.FCISolver()
+                fci.addons.fix_spin_(obj, ss=self.target_s2)
+            obj.nroots = self.nroots
+            _, cis = obj.kernel(h1e, eri, norb, ham.nelec)
+            cis = cis if self.nroots > 1 else [cis]
+            # Each eigenvalue is <H> + shift * <(S^2 - t)^2>.  On the spin-adapted path the
+            # roots are spin eigenstates and the penalty vanishes, but a genuinely
+            # spin-dependent pair breaks [H, S^2]: the roots are contaminated and the penalty
+            # would land in the energy (33 mHa on a triplet at |h1a-h1b| ~ 0.4 Ha).  Re-evaluate
+            # <H> with the module-level (unpenalised) energy, and choose among roots by it.
+            energies = np.array([solver.energy(h1e, eri, c, norb, ham.nelec) for c in cis])
+            s2s = np.array([fci.spin_op.spin_square0(c, norb, ham.nelec)[0] for c in cis])
+            # A spin-free solve gives exact spin states; a genuinely spin-dependent one
+            # (penalised direct_uhf) only approximately pure ones, so allow s2_tol there.
+            tol = s2_tol_used = 1e-3 if not spin_dependent else self.s2_tol
+            ok = np.flatnonzero(np.abs(s2s - self.target_s2) < tol)
+            if not ok.size:
+                raise RuntimeError(
+                    f"no FCI root with <S^2> = {self.target_s2} (+/- {tol:g}) among "
+                    f"{self.nroots}: {s2s}"
+                    + (
+                        "; the downfold is genuinely spin-dependent (|h1a-h1b| = "
+                        f"{averaged:.1e}): consider --fci_spin_average"
+                        if spin_dependent
+                        else ""
+                    )
+                )
+            best = ok[np.argmin(energies[ok])]
+            e, ci = float(energies[best]), cis[best]
+            tag += f"-s2={self.target_s2:g}(got {s2s[best]:.4f}, tol {s2_tol_used:g})"
         rdm1a, rdm1b = solver.make_rdm1s(ci, norb, ham.nelec)
-        if ham.is_spin_dependent:
+        if spin_dependent:
             # `direct_uhf` returns spin-resolved blocks, so combine them here: rdm1 is the
             # sum, and rdm2 is `aa + bb + ab + ab^T` since the alpha-beta block appears
             # once in each ordering.
@@ -101,6 +195,32 @@ class FCISolver(ActiveSpaceSolver):
             rdm1b=np.asarray(rdm1b),
             diagnostics={"solver": tag},
         )
+
+
+def _spin_penalised_uhf(target_s2: float, shift: float = 0.2):
+    """A ``direct_uhf`` FCI solver with the penalty ``shift * (S^2 - target_s2)^2``.
+
+    PySCF's ``fci.addons.fix_spin_`` does not support ``direct_uhf``.  The penalty is added
+    to each Hamiltonian application through ``fci.spin_op.contract_ss``, which treats alpha
+    and beta orbital ``p`` as the same spatial orbital -- valid when the two channels share
+    one orbital set (the UNO selector), even though their one-body operators differ.
+    """
+    from pyscf.fci import direct_uhf, spin_op
+
+    class _Penalised(direct_uhf.FCISolver):
+        # PySCF diagonalizes small CI spaces (<= pspace_size determinants, 400 by default --
+        # a CAS(6,6)) directly from `pspace`, never calling contract_2e, which would silently
+        # drop the penalty.  Force the iterative solver so every H.c goes through it.
+        davidson_only = True
+
+        def contract_2e(self, eri, fcivec, norb, nelec, link_index=None, **kwargs):
+            ci1 = super().contract_2e(eri, fcivec, norb, nelec, link_index, **kwargs)
+            vec = np.asarray(fcivec).reshape(ci1.shape)
+            tmp = spin_op.contract_ss(vec, norb, nelec).reshape(ci1.shape) - target_s2 * vec
+            tmp = spin_op.contract_ss(tmp, norb, nelec).reshape(ci1.shape) - target_s2 * tmp
+            return ci1 + shift * tmp
+
+    return _Penalised()
 
 
 def _rhf_from_integrals(ham: EmbeddedHamiltonian):
@@ -167,10 +287,14 @@ class SQDSolver(ActiveSpaceSolver):
     (deterministic CI without the qiskit-fermions dependency); Aer/Runtime
     samplers run the real circuits.
 
-    With ``method="qdrift"`` the ansatz is an *ensemble*: ``num_randomizations``
-    circuits are each sampled at ``shots`` and their counts pooled, so the total
-    shot budget is ``num_randomizations * shots``. The default of 1 keeps a single
-    circuit, matching the exact-evolution path.
+    With ``method="qdrift"`` the ansatz is an *ensemble* over the sweep
+    ``evolution_time x num_groups`` (each a scalar or a sequence):
+    ``num_randomizations`` circuits per combination, each sampled at ``shots``, with
+    the counts of the whole sweep pooled into one SQD run -- the reference workflow's
+    recipe, where several evolution times together span more of the determinant space
+    than any one alone.  The total shot budget is
+    ``len(evolution_time) * len(num_groups) * num_randomizations * shots``.
+    ``method="exact"`` builds one circuit per evolution time.
 
     ``optimize`` (default True) lets the generator
     relabel the fermionic modes to shorten each circuit. That makes every circuit
@@ -187,8 +311,8 @@ class SQDSolver(ActiveSpaceSolver):
         shots: int = 1_000,
         ansatz: str = "sqdrift",
         method: str = "qdrift",
-        evolution_time: float = 1.0,
-        num_groups: int = 15,
+        evolution_time: float | Sequence[float] = 1.0,
+        num_groups: int | Sequence[int] = 15,
         num_randomizations: int = 500,
         initial_state_bitstring: str | None = None,
         samples_per_batch: int = 300,
@@ -255,6 +379,8 @@ class SQDSolver(ActiveSpaceSolver):
             shots=self.shots,
             ansatz=self.ansatz,
             method=self.method,
+            evolution_time=[float(t) for t in np.atleast_1d(self.evolution_time)],
+            num_groups=[int(n) for n in np.atleast_1d(self.num_groups)],
             n_circuits=len(circuits),
             sampler=type(self.sampler).__name__,
             **_sampler_backend_diagnostics(self.sampler),
@@ -301,9 +427,9 @@ class SQDSolver(ActiveSpaceSolver):
 
         # Bare evolution circuits: the reference determinant is chosen here, at
         # run time, rather than baked in by the generator.
-        # Every sweep axis is pinned to a single value here: a solver call wants a
-        # definite ensemble size (num_randomizations), not the generator's default
-        # time x num_groups sweep, which would build thousands of circuits per solve.
+        # The sweep is the caller's evolution_time x num_groups (one point by default),
+        # never the generator's own (1, 2, 3) x 15 default, so a solve's ensemble size
+        # is always what the caller configured.
         result = build_sqdrift_circuits(
             ham,
             method=self.method,

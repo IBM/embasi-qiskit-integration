@@ -66,6 +66,7 @@ __all__ = [
     "concentric_localization_selector",
     "spade_virtual_selector",
     "fragment_ao_indices",
+    "avas_ao_projector",
     "apc_pair_coefficients",
     "apc_orbital_entropies",
     "apc_active_space",
@@ -298,6 +299,9 @@ def concentric_localization_selector(
             :func:`mulliken_selector`).
         fock: embedded Fock matrix ``F_emb`` (``adapter._fock``), shape (nao, nao) --
             the shell-expansion metric for shells >= 1.  Unlike SPADE, CL needs it.
+            A call may override it (``localiser(coeff, n_occ, fock=...)``): the
+            per-spin path passes each channel's own ``F_emb``, so that channel's shells
+            grow through its own Fock coupling rather than the spin-summed one.
         n_shells: number of Fock shell expansions after shell 0 (``0`` -> the
             fragment-spanned shell only, the single-shell case; the paper's
             convergence graphs suggest one cycle suffices in the working basis).
@@ -334,11 +338,14 @@ def concentric_localization_selector(
         v = vt.T  # right singular vectors: an orthogonal rotation of c_ker's columns
         return c_ker @ v[:, :rank], c_ker @ v[:, rank:]
 
-    def _localise(coeff: np.ndarray, n_occ: int) -> tuple[np.ndarray, np.ndarray]:
+    def _localise(
+        coeff: np.ndarray, n_occ: int, fock: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
         c_virt = coeff[:, n_occ:]
         n_virt = c_virt.shape[1]
         if n_virt == 0:
             return coeff.copy(), np.empty(0)
+        f_shell = f if fock is None else np.asarray(fock, dtype=float)
 
         # Shell 0: project onto the fragment AO basis and split spanned vs kernel.
         # ``c_virt_prime`` is the projection SEED for the SVD only -- it is NOT
@@ -350,7 +357,7 @@ def concentric_localization_selector(
 
         # Shells 1..n_shells: grow the span through the Fock coupling to the kernel.
         for _ in range(n_shells):
-            c_new, c_ker = _span_kernel(c_kept, c_ker, f)
+            c_new, c_ker = _span_kernel(c_kept, c_ker, f_shell)
             if c_new.shape[1] == 0:
                 break  # kernel exhausted / no further Fock coupling
             c_kept = np.hstack([c_kept, c_new])
@@ -399,6 +406,8 @@ def concentric_localization_selector(
     _localise.gap_tol = 0.5  # type: ignore[attr-defined]
     _localise.max_virtual = None  # type: ignore[attr-defined]
     _localise.min_virtual = min_virtual  # type: ignore[attr-defined]
+    # Tells callers they may pass a per-call ``fock`` (see the ``fock`` argument).
+    _localise.accepts_fock = True  # type: ignore[attr-defined]
     return _localise
 
 
@@ -489,6 +498,69 @@ def fragment_ao_indices(mol, active_atoms) -> np.ndarray:
     aoslice = mol.aoslice_by_atom()
     ranges = [np.arange(aoslice[a, 2], aoslice[a, 3]) for a in active_atoms]
     return np.hstack(ranges).astype(int) if ranges else np.empty(0, dtype=int)
+
+
+# --------------------------------------------------------------------------- #
+# AVAS (Atomic Valence Active Space)
+# --------------------------------------------------------------------------- #
+#
+# Sayfutyarova, Sun, Chan & Knizia, J. Chem. Theory Comput. 2017, 13, 4063
+# (doi:10.1021/acs.jctc.7b00128): project the occupied and virtual blocks separately
+# onto a set of target valence AOs in a minimal reference basis, rotate each block to
+# the eigenvectors of that projection, and keep the orbitals whose projected weight
+# exceeds a threshold.  The construction follows PySCF's ``mcscf.avas`` (without IAOs);
+# the rotation itself lives on the adapter
+# (:meth:`ProjectionEmbeddingAdapter.build_orbitals_avas`), since it must stay inside
+# span(A) and respect the embedding's occupied/virtual split.
+
+
+def avas_ao_projector(mol, ao_labels, atoms=None, minao: str = "minao") -> np.ndarray:
+    """AO-basis matrix ``M`` whose ``C^T M C`` is the AVAS projection of orbitals ``C``.
+
+    ``M = S_21^T S_22^{-1} S_21``, with ``S_22`` the overlap of the target reference AOs
+    and ``S_21`` their cross overlap with ``mol``'s basis: ``c^T M c`` is the squared
+    norm of orbital ``c`` projected onto span(target AOs), in ``[0, 1]`` for an
+    S-normalised ``c``.
+
+    Args:
+        mol: the PySCF ``Mole`` the orbitals are expanded in.
+        ao_labels: PySCF AO labels selecting the target AOs in the reference basis
+            (``"Fe 3d"``, ``"C 2p"``, ...), matched with ``search_ao_label``.
+        atoms: restrict the targets to the AOs on these atoms (indices into ``mol``);
+            ``None`` keeps every match.  The workflow passes the active fragment, so a
+            label also present in the environment only targets the fragment's copy.
+        minao: the minimal reference basis the labels are matched in (PySCF's AVAS
+            default).
+
+    Raises:
+        ValueError: if no reference AO matches.
+    """
+    import scipy.linalg
+    from pyscf import gto
+
+    pmol = mol.copy()
+    pmol.atom = mol._atom
+    pmol.unit = "B"
+    pmol.symmetry = False
+    pmol.basis = minao
+    pmol.build(False, False)
+
+    targets = np.asarray(pmol.search_ao_label(list(ao_labels)), dtype=int)
+    if atoms is not None:
+        targets = np.intersect1d(targets, fragment_ao_indices(pmol, list(atoms)))
+    if targets.size == 0:
+        ref_ao = fragment_ao_indices(pmol, list(atoms)) if atoms is not None else range(pmol.nao)
+        labels = pmol.ao_labels(fmt=False)
+        shells = sorted({" ".join(labels[i][1:3]) for i in ref_ao})
+        raise ValueError(
+            f"AVAS labels {list(ao_labels)} match no {minao} AO"
+            f"{' of the active fragment' if atoms is not None else ''}; available shells: "
+            f"{', '.join(shells)}"
+        )
+
+    s22 = pmol.intor_symmetric("int1e_ovlp")[np.ix_(targets, targets)]
+    s21 = gto.intor_cross("int1e_ovlp", pmol, mol)[targets]
+    return s21.T @ scipy.linalg.solve(s22, s21, assume_a="pos")
 
 
 # --------------------------------------------------------------------------- #

@@ -35,12 +35,16 @@ pytestmark = [pytest.mark.embasi, pytest.mark.slow]
 REF_NELEC = (5, 4)
 REF_NORB = 8
 REF_E_CORE = 25.2020184581
-REF_E_SOLVER = -53.5507789338
-REF_TOTAL = -149.6092847931
-REF_CORRECTION = -0.0020832881
+# Repinned when each channel's h_emb began stripping its OWN low-level mean field rather
+# than the channel mean (`_veff_ll_channel`): E_SOLVER moved by +0.0759 Ha and the
+# correction by -0.0188 Ha, the total by only +0.0005 Ha; e_core is unchanged at
+# n_frozen_occ=0.  Reproducible to 1e-10 across repeated runs.
+REF_E_SOLVER = -53.4749243205
+REF_TOTAL = -149.6088162044
+REF_CORRECTION = -0.0208953079
 # Each channel referenced to its own round-0 density AND contracted against its own
 # `v_emb_spin`.
-REF_CORRECTION_SPIN = (0.0001734614, -0.0022567495)
+REF_CORRECTION_SPIN = (-0.0001391774, -0.0207561305)
 
 
 def _build_open_shell_adapter():
@@ -81,6 +85,22 @@ def _build_open_shell_adapter():
     return ProjectionEmbeddingAdapter(
         projection, PySCFIntegrals(mf_hl, mf_ll), mu=1.0e6, unrestricted=True
     )
+
+
+def _veff_ll_per_channel(adapter):
+    """Each channel's own low-level mean field at subsystem A's density pair.
+
+    ``F_emb^sigma`` carries ``v_sigma[gamma^A]``, so each channel's bare embedded operator
+    strips that channel's own potential; the channel mean would leave A's spin-density
+    exchange in ``h_emb`` (see ``ProjectionEmbeddingAdapter._veff_ll_channel``).  Taken
+    straight from PySCF's ``get_veff`` rather than the adapter's helpers, so the rebuilds
+    below stay independent of the code under test.
+    """
+    pair = adapter._dm_a_for_veff
+    assert isinstance(pair, tuple), "the open-shell fixture must carry a density pair"
+    v = np.asarray(adapter.ints.mf_ll.get_veff(adapter.ints.mol, np.stack(pair)))
+    assert v.shape[0] == 2, "an unrestricted low level returns one potential per channel"
+    return v[0], v[1]
 
 
 @pytest.fixture(scope="module")
@@ -164,10 +184,10 @@ def test_downfold_matches_an_independently_rebuilt_hamiltonian(open_shell):
 
     adapter, alpha, beta, ham, result = open_shell
     c_a, c_b = alpha.c_active, beta.c_active
-    # The PAIR, not the spin-summed `_dm_a_arr`: at `xc_ll=PBE` the xc functional is
-    # nonlinear in the spin densities, so a summed input has PySCF substitute `d/2` for both
-    # channels and depolarise the low-level mean field.
-    veff_ll = adapter.ints.veff_ll(adapter._dm_a_for_veff)
+    # Each channel's own potential at the PAIR (not the spin-summed `_dm_a_arr`: at
+    # `xc_ll=PBE` the xc functional is nonlinear in the spin densities, so a summed input
+    # has PySCF substitute `d/2` for both channels and depolarise the mean field).
+    veff_ll_a, veff_ll_b = _veff_ll_per_channel(adapter)
 
     # Frozen-core mean field as the downfold folds it: the sum of both channels' inactive
     # densities.  Zero at this fixture's n_frozen_occ=0, but spelled out correctly so
@@ -175,12 +195,12 @@ def test_downfold_matches_an_independently_rebuilt_hamiltonian(open_shell):
     c_in_a, c_in_b = alpha.c_inactive, beta.c_inactive
     veff_in = adapter.ints.veff_hf(c_in_a @ c_in_a.T + c_in_b @ c_in_b.T)
 
-    def _h1(c, fock):
+    def _h1(c, fock, veff_ll):
         h = c.T @ (fock - veff_ll + veff_in) @ c
         return 0.5 * (h + h.T)
 
-    h1a = _h1(c_a, adapter._fock_spin[0])
-    h1b = _h1(c_b, adapter._fock_spin[1])
+    h1a = _h1(c_a, adapter._fock_spin[0], veff_ll_a)
+    h1b = _h1(c_b, adapter._fock_spin[1], veff_ll_b)
     eri = (
         adapter.ints.eri_mo(c_a),
         adapter.ints.eri_mo_mixed(c_a, c_b),
@@ -302,10 +322,12 @@ def test_frozen_core_e_core_charges_each_channel_to_its_own_fock(open_shell_froz
 
     The two channels see *different* embedded Focks, so beta's frozen core must be
     charged to ``h_emb_b``, not to alpha's. Contracting the summed core density against
-    ``h_emb_a`` alone -- which this did -- overcharges by exactly
-    ``tr[d_b (h_emb_a - h_emb_b)]``: **0.0162 Ha (10.2 kcal/mol)** here, with the
-    electron count, the spin sector and the projector leak all still exact, which is why
-    nothing else caught it.
+    ``h_emb_a`` alone overcharges by exactly ``tr[d_b (h_emb_a - h_emb_b)]``.  That was
+    0.0162 Ha here while each channel stripped the channel-mean mean field; with each
+    stripping its own (``_veff_ll_channel``) the two operators agree on the core to
+    ~5e-8 Ha on this system, so the independent rebuild below is what tests the
+    per-channel charging -- the cross-term identity is kept, but no longer has a
+    measurable size to guard.
 
     Rebuilt from the adapter's raw per-spin Fock and integral backend, so a bookkeeping
     slip shows up as a disagreement rather than as a plausible number.
@@ -318,11 +340,10 @@ def test_frozen_core_e_core_charges_each_channel_to_its_own_fock(open_shell_froz
 
     dm_core_a, dm_core_b = c_in_a @ c_in_a.T, c_in_b @ c_in_b.T
     dm_core = dm_core_a + dm_core_b
-    # The PAIR, not the spin-summed `_dm_a_arr` -- see the note in
-    # test_downfold_matches_an_independently_rebuilt_hamiltonian.
-    veff_ll = adapter.ints.veff_ll(adapter._dm_a_for_veff)
-    h_emb_a = adapter._fock_spin[0] - veff_ll
-    h_emb_b = adapter._fock_spin[1] - veff_ll
+    # Each channel strips its own potential -- see `_veff_ll_per_channel`.
+    veff_ll_a, veff_ll_b = _veff_ll_per_channel(adapter)
+    h_emb_a = adapter._fock_spin[0] - veff_ll_a
+    h_emb_b = adapter._fock_spin[1] - veff_ll_b
 
     # Two-body core term from the raw AO ERIs, independent of the adapter's own fold: the
     # unrestricted core energy is `0.5 tr[d J[d]] - 0.5 sum_s tr[d_s K[d_s]]`, NOT
@@ -345,15 +366,13 @@ def test_frozen_core_e_core_charges_each_channel_to_its_own_fock(open_shell_froz
     )
     assert ham.e_core == pytest.approx(float(e_core_expected), abs=1e-9)
 
-    # The regression: both cores charged to alpha's operator. Assert the gap is real and
-    # that it is precisely the cross term, so this fails loudly if the fix is reverted.
+    # The regression: both cores charged to alpha's operator differ by precisely the
+    # cross term.
     e_core_alpha_only = (
         adapter.ints.energy_nuc() + np.einsum("ij,ji->", dm_core, h_emb_a) + e_core_two_body
     )
     cross = float(np.einsum("ij,ji->", dm_core_b, h_emb_a - h_emb_b))
     assert float(e_core_alpha_only) - float(e_core_expected) == pytest.approx(cross, abs=1e-9)
-    # Physically significant on this system: ~10 kcal/mol, not round-off.
-    assert abs(cross) > 1e-3
 
 
 def test_frozen_core_downfold_matches_an_independent_rebuild(open_shell_frozen):
@@ -394,11 +413,10 @@ def test_frozen_core_downfold_matches_an_independent_rebuild(open_shell_frozen):
         np.einsum("ij,ji->", dm_core_a, _k(dm_core_a))
         + np.einsum("ij,ji->", dm_core_b, _k(dm_core_b))
     )
-    # The PAIR, not the spin-summed `_dm_a_arr` -- see the note in
-    # test_downfold_matches_an_independently_rebuilt_hamiltonian.
-    veff_ll = adapter.ints.veff_ll(adapter._dm_a_for_veff)
-    h_emb_a = adapter._fock_spin[0] - veff_ll
-    h_emb_b = adapter._fock_spin[1] - veff_ll
+    # Each channel strips its own potential -- see `_veff_ll_per_channel`.
+    veff_ll_a, veff_ll_b = _veff_ll_per_channel(adapter)
+    h_emb_a = adapter._fock_spin[0] - veff_ll_a
+    h_emb_b = adapter._fock_spin[1] - veff_ll_b
 
     def _h1(c, h_emb, veff_in):
         h = c.T @ (h_emb + veff_in) @ c
@@ -503,9 +521,14 @@ def test_workflow_open_shell_survives_a_second_cycle(tmp_path):
     Fock rather than drop it -- a regression that made cycle 2 raise.
 
     Kept separate from the single-cycle pin above because the two assert different
-    things: that one pins a number, this one pins that the loop *advances*.  The fed-back
-    density is the per-channel pair, so a channel lifted through the wrong active space
-    would move this total too.
+    things: that one pins a number, this one that the loop runs a second cycle and lands
+    on it.  With ``v_emb``/``P_B`` frozen for the A-only step, each channel's ``h_emb``
+    is ``F_emb^sigma[gamma] - v_sigma[gamma]`` at the SAME fed-back density, so its
+    gamma-dependence cancels and, with all of A active, cycle 2 solves the cycle-1
+    Hamiltonian again.  (While ``h_emb`` stripped the channel-mean potential, a leftover
+    ``-/+ K[gamma_a - gamma_b] / 2`` made the total drift here; that drift was the
+    double-counting artefact, not feedback.)  A channel lifted through the wrong active
+    space, or a fed-back density leaking into the downfold, would move this total.
     """
     from ase import Atoms
     from ase.io import write
@@ -543,10 +566,9 @@ def test_workflow_open_shell_survives_a_second_cycle(tmp_path):
     )
     energy = workflow.run(log=lambda *_a, **_k: None)
     assert energy.is_spin_resolved
-    # It moved off the single-shot value (the feedback did something) but stayed close
-    # (it is a correction, not a different calculation).
-    assert float(energy.total) != pytest.approx(REF_TOTAL, abs=1e-9)
-    assert float(energy.total) == pytest.approx(REF_TOTAL, abs=0.5)
+    # The downfolded Hamiltonian does not depend on the fed-back density (see above), so
+    # the second cycle reproduces the single-shot pin.
+    assert float(energy.total) == pytest.approx(REF_TOTAL, abs=1e-8)
     # The split stays exact through the loop.
     assert sum(energy.correction_spin) == pytest.approx(energy.correction, abs=1e-10)
 
