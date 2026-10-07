@@ -25,6 +25,10 @@ fermions = ["qiskit-fermions>=0.1.0,<0.2.0"]
 relabel  = ["pyomo>=6.7", "highspy>=1.7"]
 hardware = ["qiskit-ibm-runtime", "samplomatic"]
 embed    = ["embasi @ git+https://github.com/tamm-cci/EmbASI.git@qm-code-adapter"]
+# An MPI runtime for the mpi4py that EmbASI imports, for Linux hosts with none.
+# Opt-in, and not part of `all`: mpi4py loads a library in .venv/lib before the system
+# one, so on a cluster with its own MPI this would shadow it and mismatch its mpirun.
+mpi      = ["mpich; sys_platform == 'linux'"]
 chem     = ["rdkit>=2023.9"]         # SMILES-derived charge in molecule/geometry.py (optional)
 dev      = ["pytest>=7", "pytest-cov", "ruff==0.15.20", "mypy>=2.2,<2.4", "pre-commit", "rdkit>=2023.9"]
 # Every runtime extra in one shot (excludes `dev` tooling).
