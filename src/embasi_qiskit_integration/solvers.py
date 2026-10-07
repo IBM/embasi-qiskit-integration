@@ -290,9 +290,8 @@ class SQDSolver(ActiveSpaceSolver):
     With ``method="qdrift"`` the ansatz is an *ensemble* over the sweep
     ``evolution_time x num_groups`` (each a scalar or a sequence):
     ``num_randomizations`` circuits per combination, each sampled at ``shots``, with
-    the counts of the whole sweep pooled into one SQD run -- the reference workflow's
-    recipe, where several evolution times together span more of the determinant space
-    than any one alone.  The total shot budget is
+    the counts of the whole sweep pooled into one SQD run, where several evolution
+    times together span more of the determinant space than any one alone.  The total shot budget is
     ``len(evolution_time) * len(num_groups) * num_randomizations * shots``.
     ``method="exact"`` builds one circuit per evolution time.
 
