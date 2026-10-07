@@ -30,25 +30,39 @@ hardware. EmbASI is only required to close the embedding loop (Phase 8).
 
 ## Installation
 
+The core package (`numpy`, `scipy`, `pyscf`, `pydantic`, `pydantic-settings`)
+covers the classical path only (`FCISolver`, integrals, FCIDUMP I/O). Everything
+else is an extra:
+
+| Extra | Installs | Needed for |
+|---|---|---|
+| `quantum` | `qiskit`, `qiskit-aer`, `qiskit-addon-sqd`, `ffsim` | `SQDSolver`, Aer sampling |
+| `fermions` | `qiskit-fermions>=0.1,<0.2` | building SqDRIFT circuits (any non-mock SQD run) |
+| `relabel` | `pyomo`, `highspy` | [mode relabeling](#mode-relabeling-optimize); **required by `SQDSolver`'s default `optimize=True`** |
+| `hardware` | `qiskit-ibm-runtime`, `samplomatic` | `--sampler runtime`, readout characterisation |
+| `embed` | EmbASI (from git, `qm-code-adapter` branch) + `ase`, `asi4py`, `mpi4py`, `scalapack4py` | `scripts/embedding_workflow.py`, the EmbASI-marked tests |
+| `mpi` | `mpich` (Linux only) | an MPI runtime for `mpi4py` on hosts with none — see below |
+| `chem` | `rdkit` | SMILES-derived charges in `.xyz` metadata |
+| `dev` | `pytest`, `ruff`, `mypy`, `pre-commit`, `rdkit` | tests and lint |
+| `all` | `quantum` + `fermions` + `relabel` + `hardware` + `embed` | every runtime path (not `mpi`, `chem`, `dev`) |
+
+Install from the lockfile with uv (recommended; tested on Python 3.12):
+
 ```bash
-# with uv (recommended)
-uv venv --python 3.12
-source .venv/bin/activate
-uv pip install -e ".[dev,quantum]"
-
-# optional extras
-uv pip install -e ".[fermions]"   # qiskit-fermions from PyPI (prebuilt wheels; see Prerequisites)
-uv pip install -e ".[hardware]"   # IBM Quantum Runtime
-uv pip install -e ".[chem]"       # rdkit, for SMILES-derived charges in .xyz metadata
-
-# every runtime extra in one shot (quantum + fermions + relabel + hardware + embed)
-uv pip install -e ".[all]"        # add `dev` for test/lint tooling: ".[all,dev]"
+uv sync --python 3.12 --extra all --extra dev    # everything
+uv sync --python 3.12 --extra all --extra mpi    # Linux host without a system MPI
+uv sync --python 3.12 --extra quantum --extra fermions --extra relabel   # quantum path only
+source .venv/bin/activate                         # optional, instead of `uv run`
 ```
 
-`qiskit-fermions` is published on PyPI, so the `fermions` extra installs it as a
-normal dependency (`qiskit-fermions>=0.1.0`). On common platforms pip fetches a
-prebuilt `abi3` wheel; only an unsupported platform falls back to the source
-distribution, which compiles a Rust extension at install time.
+`uv sync` removes packages not in the selected extras, so name every extra you need
+each time. Without uv: `pip install -e ".[all,dev]"`.
+
+**MPI.** EmbASI imports `mpi4py`, which needs an MPI library at import time
+(otherwise: `RuntimeError: cannot load MPI library`). Use a system MPI where one
+exists (e.g. Homebrew `open-mpi` on macOS); otherwise add the `mpi` extra, which
+bundles MPICH. Don't add it on a cluster whose own `mpirun` you use: the bundled
+library takes precedence and every rank runs as rank 0 of 1.
 
 ## Quickstart
 
@@ -77,7 +91,7 @@ from embasi_qiskit_integration.circuit_run.aer import AerSampler
 from embasi_qiskit_integration.solvers import SQDSolver
 
 # SQDSolver builds the SqDRIFT ansatz, samples it, and runs the SQD loop.
-# (AerSampler + SqDRIFT needs the `quantum` + `fermions` extras.)
+# (AerSampler + SqDRIFT needs the `quantum` + `fermions` + `relabel` extras.)
 res = SQDSolver(AerSampler(), shots=100_000, seed=24).solve(ham)
 print(res.energy)  # within 2e-3 Ha of FCI; res.diagnostics carries provenance
 ```
@@ -103,8 +117,7 @@ validated against the installed Aer, so a typo fails immediately, and it is reco
 
 The sampler is the only thing that changes.
 
-**Set up credentials once** (install the `hardware` extra first, `uv pip install
--e ".[hardware]"`):
+**Set up credentials once** (needs the `hardware` extra, included in `all`):
 
 ```python
 from qiskit_ibm_runtime import QiskitRuntimeService
@@ -374,7 +387,7 @@ its own. `--active_atoms` indexes into the `.xyz` atom order.
 
 It is MPI-safe (the solve runs on rank 0 and the result is broadcast), so it can
 be driven the way real EmbASI runs — under `mpirun` (needs the `embed` extra for
-`mpi4py`):
+`mpi4py`, and an MPI library matching that `mpirun`; see [Installation](#installation)):
 
 ```bash
 mpirun -n 2 uv run python scripts/embedding_workflow.py --solver sqd
@@ -400,7 +413,8 @@ canonical order so a given seed always maps to the same physical group.
 
 ### Mode relabeling (`optimize`)
 
-`optimize=True` (the default when the `relabel` extra is installed) runs
+`optimize=True` (the `SQDSolver` default; the `solve` CLI's `--optimize` instead
+defaults to "on if the `relabel` extra is installed") runs
 `qiskit-fermions`' `RelabelModes` pass, which reorders the fermionic modes to
 minimize the span of the sampled excitations. That shortens the synthesised
 circuits substantially — on N2 CAS(8o,10e) the per-draw depth dropped from
@@ -518,11 +532,12 @@ build a real `embasi.embedding.ProjectionEmbedding`. The package's own logic
 in the default suite via small PySCF-backed test doubles, so you only need this
 to exercise the real embedding backend.
 
-1. **Install EmbASI** via the `embed` extra (EmbASI is on PyPI; this pulls it
-   plus `ase`, `asi4py`, and `mpi4py`):
+1. **Install EmbASI** via the `embed` extra (EmbASI is not on PyPI; this pulls
+   it from git plus `ase`, `asi4py`, `mpi4py` and `scalapack4py` — and `mpi4py`
+   needs an MPI library, see [Installation](#installation)):
 
    ```bash
-   uv pip install -e ".[embed]"
+   uv sync --extra all --extra dev
    ```
 
 2. **Provide a QM driver.** EmbASI communicates with a QM package through the
