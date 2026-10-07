@@ -250,8 +250,7 @@ The qDRIFT knobs only bite under `--sqd_method qdrift`: `--num_randomizations` (
 randomized product inside each circuit, and `--evolution_time` (default **1.0**) the
 evolution time. `--evolution_time` and `--num_groups` are lists (`1,2,3`, `'[1, 2, 3]'`
 or a repeated flag; a single value is a one-point list) and are swept as a cartesian
-product, as in lahs-workflows' `circuit_generator` step (whose defaults are
-`[1, 2, 3]` x `[10, 15, 20]`). Since the default is `qdrift` at 500 randomizations, a bare
+product. Since the default is `qdrift` at 500 randomizations, a bare
 `--shots 1000` run submits 500 circuits — cut `--num_randomizations` before pointing it
 at real hardware.
 
@@ -413,8 +412,9 @@ canonical order so a given seed always maps to the same physical group.
 
 ### Mode relabeling (`optimize`)
 
-`optimize=True` (the `SQDSolver` default; the `solve` CLI's `--optimize` instead
-defaults to "on if the `relabel` extra is installed") runs
+`optimize=True` (the default of `SQDSolver` and of `scripts/embedding_workflow.py
+--optimize`; the `solve` CLI's `--optimize` instead defaults to "on if the `relabel`
+extra is installed") runs
 `qiskit-fermions`' `RelabelModes` pass, which reorders the fermionic modes to
 minimize the span of the sampled excitations. That shortens the synthesised
 circuits substantially — on N2 CAS(8o,10e) the per-draw depth dropped from
@@ -458,6 +458,12 @@ build_sqdrift_circuits(ham, method="qdrift", canonical_permutation=True)
 Requesting `optimize=True` without the `relabel` extra raises instead of silently
 producing unpermuted circuits.
 
+Each circuit's relabel solve is capped at `time_limit` seconds (default 10) and
+typically runs to it, so with the default 500 randomizations
+relabeling dominates an SQD solve. Under noiseless Aer it buys nothing — on N2
+CAS(8o,10e), 40 circuits took 405 s with it and 5 s without, at the same energy — so
+pass `--optimize False` there, and keep it on for hardware.
+
 ### Parallel generation (`workers`)
 
 `workers=N` shards a combination's randomizations into contiguous seed-chunks,
@@ -465,7 +471,11 @@ one per worker process. Because each randomization is an independently seeded
 draw, the output is byte-identical to the sequential build — only faster (N2
 CAS(8o,10e), 8 draws with relabeling: 81.5s → 12.5s at `workers=8`). A
 process-local operator cache keeps the expensive operator construction to once
-per worker. `workers=0` means one per CPU.
+per worker. `workers=0` means one per CPU — on a batch-scheduler node that is the
+whole node, not your allocation, so give an explicit count there. Keep `workers` at or
+below the cores you actually have: each relabel solve is wall-clock limited, so an
+oversubscribed one can stop at a different permutation and change the sampled counts.
+`scripts/embedding_workflow.py` takes `--workers` (default 1).
 
 Workers are spawned, so a *script* using `workers > 1` must guard its entry point
 with `if __name__ == "__main__":` (the standard `multiprocessing` requirement);

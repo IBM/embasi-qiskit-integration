@@ -132,8 +132,7 @@ def test_explicit_bitstring_with_relabeling_is_refused(n2_ham):
 
 def test_sweep_axes_build_their_product_and_pool_it(n2_ham):
     """``evolution_time`` and ``num_groups`` are sweep axes: the ensemble is their product
-    times ``num_randomizations``, all handed to one SQD run (the reference workflow's
-    recipe), not just the first point."""
+    times ``num_randomizations``, all handed to one SQD run, not just the first point."""
     pytest.importorskip("qiskit_fermions")
     from embasi_qiskit_integration.circuit_run.aer import AerSampler
 
@@ -149,3 +148,21 @@ def test_sweep_axes_build_their_product_and_pool_it(n2_ham):
     assert len(solver.build_circuits(n2_ham)) == 3 * 2 * 2
     solver.evolution_time, solver.num_groups = 1.0, 5  # scalars: a one-point sweep
     assert len(solver.build_circuits(n2_ham)) == 2
+
+
+def test_workflow_forwards_circuit_construction_flags(monkeypatch):
+    """--optimize / --time_limit / --workers reach SQDSolver, with their defaults."""
+    import sys
+
+    from embasi_qiskit_integration.embedding import EmbeddingWorkflow
+
+    common = {"solver": "sqd", "sampler": "aer", "aer_method": "statevector"}
+    monkeypatch.setattr(sys, "argv", ["prog"])
+    default = EmbeddingWorkflow(**common)._build_solver()
+    assert (default.optimize, default.time_limit, default.workers) == (True, 10.0, 1)
+
+    monkeypatch.setattr(
+        sys, "argv", ["prog", "--optimize", "False", "--time_limit", "2.5", "--workers", "8"]
+    )
+    flagged = EmbeddingWorkflow(**common)._build_solver()
+    assert (flagged.optimize, flagged.time_limit, flagged.workers) == (False, 2.5, 8)
