@@ -290,9 +290,8 @@ class SQDSolver(ActiveSpaceSolver):
     With ``method="qdrift"`` the ansatz is an *ensemble* over the sweep
     ``evolution_time x num_groups`` (each a scalar or a sequence):
     ``num_randomizations`` circuits per combination, each sampled at ``shots``, with
-    the counts of the whole sweep pooled into one SQD run -- the reference workflow's
-    recipe, where several evolution times together span more of the determinant space
-    than any one alone.  The total shot budget is
+    the counts of the whole sweep pooled into one SQD run, where several evolution
+    times together span more of the determinant space than any one alone.  The total shot budget is
     ``len(evolution_time) * len(num_groups) * num_randomizations * shots``.
     ``method="exact"`` builds one circuit per evolution time.
 
@@ -352,6 +351,7 @@ class SQDSolver(ActiveSpaceSolver):
         # set this when a wrong-multiplicity state could lie below the intended one.
         self.spin_sq = spin_sq
         self._permutations: list[list[int] | None] = []
+        self._reseeded: list[dict] = []
 
     def solve(self, ham: EmbeddedHamiltonian) -> SolverResult:
         from embasi_qiskit_integration.circuit_run import merge_counts, unpermute_counts_list
@@ -389,6 +389,8 @@ class SQDSolver(ActiveSpaceSolver):
             fcidump_sha=ham.meta.get("sha"),
             optimize=self.optimize,
             n_permuted=sum(1 for p in self._permutations if p is not None),
+            n_reseeded_circuits=len(self._reseeded),
+            reseeded_circuits=list(self._reseeded),
             workers=self.workers,
         )
         return res
@@ -409,6 +411,7 @@ class SQDSolver(ActiveSpaceSolver):
         if not getattr(self.sampler, "requires_circuit", True):
             # Replayed counts are already in the original mode order.
             self._permutations = [None]
+            self._reseeded = []
             return [None]
 
         if self.ansatz != "sqdrift":
@@ -445,6 +448,7 @@ class SQDSolver(ActiveSpaceSolver):
             workers=self.workers,
         )
         self._permutations = list(result.permutations)
+        self._reseeded = list(result.reseeded)
 
         if self.initial_state_bitstring is not None and result.any_permuted:
             raise ValueError(
