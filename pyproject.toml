@@ -22,9 +22,7 @@ quantum  = ["qiskit>=1.0", "qiskit-aer", "qiskit-addon-sqd", "ffsim"]
 # PauliEvolutionGate rejects ("Operator contains complex coefficients"), failing the
 # SqDRIFT circuit tests.  Unpin once the generator is updated for that change.
 fermions = ["qiskit-fermions>=0.1.0,<0.2.0"]
-# highspy <1.14: HiGHS 1.14.0-1.15.1 segfault in MIP presolve on some relabel models
-# (Linux x86_64; 1.13.1 solves them). Lift once HiGHS fixes it.
-relabel  = ["pyomo>=6.7", "highspy>=1.7,<1.14"]
+relabel  = ["pyomo>=6.7", "highspy>=1.7"]
 hardware = ["qiskit-ibm-runtime", "samplomatic"]
 embed    = ["embasi @ git+https://github.com/tamm-cci/EmbASI.git@qm-code-adapter"]
 # An MPI runtime for the mpi4py that EmbASI imports, for Linux hosts with none.

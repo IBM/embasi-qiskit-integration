@@ -10,8 +10,8 @@ import math
 import multiprocessing
 import os
 from collections.abc import Sequence
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from embasi_qiskit_integration.circuit_generator.operator import (
@@ -53,6 +53,10 @@ class SqdriftBuildResult:
     # is ``[0, 1, ..., num_randomizations - 1]`` per sweep combination; for a
     # seed-chunk it is that chunk's contiguous slice (e.g. ``[100, ..., 149]``).
     randomization_indices: list[int] = field(default_factory=list)
+    # Draws rebuilt with a replacement seed because their build crashed (see
+    # :func:`_retry_failed`): one ``{"time", "num_groups", "randomization",
+    # "seed", "replacement_seed", "attempts"}`` record each.
+    reseeded: list[dict] = field(default_factory=list)
 
     def __len__(self) -> int:
         """Number of circuits in the result."""
@@ -92,6 +96,7 @@ class SqdriftBuildResult:
         self.circuits.extend(other.circuits)
         self.permutations.extend(other.permutations)
         self.randomization_indices.extend(other.randomization_indices)
+        self.reseeded.extend(other.reseeded)
         self.num_modes = self.num_modes or other.num_modes
         self.optimize_requested = self.optimize_requested or other.optimize_requested
 
@@ -244,6 +249,13 @@ def build_sqdrift_circuits(
             standard :mod:`multiprocessing` requirement. Without it the workers
             fail with ``BrokenProcessPool``.
 
+            With ``optimize=True``, a worker that dies mid-build (e.g. HiGHS
+            segfaulting in presolve on one relabel model) does not fail the build:
+            the draws that crash on their own are redrawn with replacement seeds
+            until they build, and listed in :attr:`SqdriftBuildResult.reseeded`.
+            A sequential build (``workers=1``) runs in-process, where a native crash
+            cannot be caught, so it has no such retry.
+
     Returns:
         A :class:`SqdriftBuildResult`. It iterates and indexes as the circuit
         list, so existing list-style callers keep working; ``permutations``
@@ -391,6 +403,7 @@ def _build_parallel(
     spec: _BuildSpec,
     tasks: list[tuple[list[tuple[float, int]], range]],
     workers: int,
+    build_fn=None,
 ) -> SqdriftBuildResult:
     """Build ``tasks`` in a process pool and reassemble them in sequential order.
 
@@ -398,17 +411,24 @@ def _build_parallel(
     eagerly starts ``max_workers`` processes, so an oversized pool (e.g.
     ``workers=128`` for 2 randomizations) would fork dozens of idle workers.
 
-    A failed chunk re-raises rather than being logged and dropped: a silently
-    short ensemble would flow into SQD as a quietly wrong energy.
+    A failed chunk is never dropped: a quietly short ensemble would flow into SQD as
+    a quietly wrong energy. With ``optimize=True`` a failure is retried
+    (:func:`_retry_failed`): the draws that fail on their own are rebuilt with a
+    replacement seed until they build. Without relabeling any failure raises.
+
+    ``build_fn`` stands in for :func:`_build_chunk` (tests inject a worker that
+    crashes on chosen draws); it must be a module-level function so it pickles.
     """
+    build_fn = build_fn or _build_chunk
     effective_workers = min(_resolve_workers(workers), len(tasks))
     results: dict[int, SqdriftBuildResult] = {}
+    failed: dict[int, BaseException] = {}
 
     with ProcessPoolExecutor(
         max_workers=effective_workers, mp_context=multiprocessing.get_context("spawn")
     ) as executor:
         futures = {
-            executor.submit(_build_chunk, spec, combos, rand_range): position
+            executor.submit(build_fn, spec, combos, rand_range): position
             for position, (combos, rand_range) in enumerate(tasks)
         }
         for future in as_completed(futures):
@@ -416,11 +436,19 @@ def _build_parallel(
             try:
                 results[position] = future.result()
             except Exception as exc:
-                combos, rand_range = tasks[position]
-                raise RuntimeError(
-                    f"SqDRIFT chunk {combos} randomizations "
-                    f"[{rand_range.start}, {rand_range.stop}) failed: {exc}"
-                ) from exc
+                # One dead worker breaks the pool, failing every pending chunk with
+                # BrokenProcessPool -- not just the chunk that crashed.
+                failed[position] = exc
+
+    if failed:
+        if not spec.optimize:
+            position = min(failed)
+            combos, rand_range = tasks[position]
+            raise RuntimeError(
+                f"SqDRIFT chunk {combos} randomizations "
+                f"[{rand_range.start}, {rand_range.stop}) failed: {failed[position]}"
+            ) from failed[position]
+        results.update(_retry_failed(spec, tasks, failed, effective_workers, build_fn))
 
     # Chunks complete out of order; reassemble by their planned position so the
     # circuit order matches the sequential build exactly.
@@ -452,6 +480,126 @@ def _build_parallel(
                 len(tasks),
             )
     return merged
+
+
+# Replacement seeds tried per draw before a crashing draw stops the build.
+_MAX_RESEED_ATTEMPTS = 10
+
+
+def _run_isolated(jobs: dict, workers: int) -> dict:
+    """Run each ``{key: (fn, args)}`` job in a fresh single-use process, ``workers`` at a time.
+
+    Returns ``{key: (True, result)}`` or ``{key: (False, exception)}``. A job whose
+    process dies takes down only its own one-worker pool, so the others still finish.
+    """
+    context = multiprocessing.get_context("spawn")
+
+    def run_one(fn, args):
+        with ProcessPoolExecutor(max_workers=1, mp_context=context) as executor:
+            return executor.submit(fn, *args).result()
+
+    outcome: dict = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(jobs)))) as threads:
+        futures = {threads.submit(run_one, fn, args): key for key, (fn, args) in jobs.items()}
+        for future in as_completed(futures):
+            try:
+                outcome[futures[future]] = (True, future.result())
+            except Exception as exc:
+                outcome[futures[future]] = (False, exc)
+    return outcome
+
+
+def _retry_failed(
+    spec: _BuildSpec,
+    tasks: list[tuple[list[tuple[float, int]], range]],
+    failed: dict[int, BaseException],
+    workers: int,
+    build_fn,
+) -> dict[int, SqdriftBuildResult]:
+    """Rebuild failed chunks; give each draw that fails on its own a new seed until it builds.
+
+    First each failed chunk is rebuilt alone in a fresh process: chunks that only
+    failed because another worker broke the pool come back unchanged. A chunk that
+    fails again is rebuilt one draw per process, which isolates the draws that fail
+    on their own. Each of those is redrawn with a replacement seed until it builds,
+    keeping its position in the ensemble.
+
+    Draw ``i`` normally uses ``seed + i``; attempt ``k`` uses ``seed + k * N + i``
+    (``N`` = randomizations per combination), so a replacement never repeats a seed
+    of this build and a rerun picks the same replacement. After
+    ``_MAX_RESEED_ATTEMPTS`` failed replacements the build raises -- a failure on
+    every seed is systematic, not one unlucky draw.
+    """
+    rebuilt = _run_isolated({pos: (build_fn, (spec, *tasks[pos])) for pos in failed}, workers)
+    recovered = {pos: result for pos, (ok, result) in rebuilt.items() if ok}
+
+    per_draw = {
+        (pos, combo, r): (build_fn, (spec, [combo], range(r, r + 1)))
+        for pos, (ok, _) in rebuilt.items()
+        if not ok
+        for combo in tasks[pos][0]
+        for r in tasks[pos][1]
+    }
+    outcome = _run_isolated(per_draw, workers) if per_draw else {}
+
+    # Draws that failed alone: redraw them, all of one attempt in parallel.
+    n_rand = max(rand_range.stop for _, rand_range in tasks)
+    pending = {key: str(value) for key, (ok, value) in outcome.items() if not ok}
+    attempts: dict = dict.fromkeys(pending, 0)
+    while pending:
+        attempt = 1 + max(attempts[key] for key in pending)
+        if attempt > _MAX_RESEED_ATTEMPTS:
+            listing = ", ".join(
+                f"t={combo[0]:g} ngroups={combo[1]} #{r}" for (_, combo, r) in sorted(pending)
+            )
+            raise RuntimeError(
+                f"SqDRIFT: {len(pending)} draw(s) failed to build with "
+                f"{_MAX_RESEED_ATTEMPTS} replacement seeds each ({listing}). "
+                f"Last error: {next(iter(pending.values()))}"
+            )
+        reseeded_spec = replace(spec, seed=spec.seed + attempt * n_rand)
+        retry = _run_isolated(
+            {
+                key: (build_fn, (reseeded_spec, [key[1]], range(key[2], key[2] + 1)))
+                for key in pending
+            },
+            workers,
+        )
+        for key, (ok, value) in retry.items():
+            attempts[key] = attempt
+            if ok:
+                _, combo, r = key
+                record = {
+                    "time": combo[0],
+                    "num_groups": combo[1],
+                    "randomization": r,
+                    "seed": spec.seed + r,
+                    "replacement_seed": reseeded_spec.seed + r,
+                    "attempts": attempt,
+                }
+                value.reseeded.append(record)
+                outcome[key] = (True, value)
+                del pending[key]
+                logger.warning(
+                    "SqDRIFT: draw t=%g ngroups=%d #%d crashed with seed %d; rebuilt with "
+                    "replacement seed %d (attempt %d).",
+                    combo[0],
+                    combo[1],
+                    r,
+                    record["seed"],
+                    record["replacement_seed"],
+                    attempt,
+                )
+            else:
+                pending[key] = str(value)
+
+    for pos in sorted({key[0] for key in per_draw}):
+        chunk = SqdriftBuildResult(optimize_requested=spec.optimize)
+        for combo in tasks[pos][0]:
+            for r in tasks[pos][1]:
+                chunk.extend(outcome[(pos, combo, r)][1])
+        recovered[pos] = chunk
+    return recovered
 
 
 def _build_chunk(
