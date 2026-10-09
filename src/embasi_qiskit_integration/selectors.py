@@ -259,6 +259,8 @@ def concentric_localization_selector(
     n_shells: int = 0,
     min_virtual: int = 0,
     max_virtual: int | None = None,
+    canonical: bool = False,
+    shell0_size: int | None = None,
 ) -> VirtualLocalizer:
     """Build the *iterative* Concentric Localization (CL) virtual-space localiser.
 
@@ -314,6 +316,20 @@ def concentric_localization_selector(
             drops the outermost shell tail.  ``None`` (default) keeps the full
             shell-determined ``k``.  A cap below ``min_virtual`` wins (the ceiling
             is the harder constraint when the two conflict).
+        canonical: pseudocanonicalize the kept shells -- diagonalize ``F_emb`` within
+            their span and order them by ascending orbital energy -- so a
+            ``max_virtual`` cap keeps the *lowest-energy* kept virtuals instead of the
+            most fragment-local ones.  This is the post-processing of the reference
+            projection-embedding implementation (Rossmannek et al., J. Phys. Chem. Lett.
+            2023), whose active virtuals are the lowest canonical orbitals of the
+            truncated span.  An orthogonal rotation of the kept columns, so
+            S-orthonormality is untouched.
+        shell0_size: keep exactly this many shell-0 columns instead of the SVD rank.
+            The reference implementation keeps ``num_basis_functions`` (the fragment AO
+            count) columns even when fewer singular values are non-zero, so its shell 0
+            then includes null-space vectors whose choice is up to LAPACK.  Set it
+            (with ``len(fragment_ao)``) only to reproduce that code; ``None`` (default)
+            keeps the mathematically defined fragment-coupled span.
 
     Returns:
         A ``VirtualLocalizer`` closing over ``S``, the fragment, and ``F_emb``.
@@ -353,7 +369,11 @@ def concentric_localization_selector(
         s_pbwb = s[frag, :]  # (n_frag, nao)
         s_inv = np.linalg.inv(s[np.ix_(frag, frag)])
         c_virt_prime = s_inv @ s_pbwb @ c_virt
-        c_kept, c_ker = _span_kernel(c_virt_prime, c_virt, s_pbwb)
+        if shell0_size is None:
+            c_kept, c_ker = _span_kernel(c_virt_prime, c_virt, s_pbwb)
+        else:
+            _u, _sv, vt = np.linalg.svd(c_virt_prime.T @ s_pbwb @ c_virt)
+            c_kept, c_ker = c_virt @ vt.T[:, :shell0_size], c_virt @ vt.T[:, shell0_size:]
 
         # Shells 1..n_shells: grow the span through the Fock coupling to the kernel.
         for _ in range(n_shells):
@@ -361,6 +381,11 @@ def concentric_localization_selector(
             if c_new.shape[1] == 0:
                 break  # kernel exhausted / no further Fock coupling
             c_kept = np.hstack([c_kept, c_new])
+
+        if canonical and c_kept.shape[1] > 1:
+            # eigh returns ascending eigenvalues: the cap below then keeps the lowest.
+            _w, u_kept = np.linalg.eigh(c_kept.T @ f_shell @ c_kept)
+            c_kept = c_kept @ u_kept
 
         k = c_kept.shape[1]
         # Full rotated virtual block: kept shells first, then the kernel remainder,

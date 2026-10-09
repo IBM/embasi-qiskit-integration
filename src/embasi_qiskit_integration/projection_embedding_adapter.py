@@ -787,6 +787,26 @@ VirtualLocalizer = Callable[[np.ndarray, int], "tuple[np.ndarray, np.ndarray]"]
 # --------------------------------------------------------------------------- #
 # Adapter
 # --------------------------------------------------------------------------- #
+def _require_scf_converged(layer: Any, what: str) -> None:
+    """Raise if the PySCF SCF behind an EmbASI layer did not converge.
+
+    EmbASI does not stop on a failed SCF: it continues from the *input* density (with a
+    RuntimeWarning in a long log), so every downstream energy is quietly wrong -- e.g.
+    +200 mHa for stretched C≡N in PBE.  Only PySCF layers are checked (their method object
+    carries ``converged``); other backends pass through unchanged.
+    """
+    mf = getattr(getattr(getattr(layer, "atoms", None), "calc", None), "method", None)
+    if mf is None or not hasattr(mf, "converged") or getattr(mf, "max_cycle", 1) <= 0:
+        return
+    if not mf.converged:
+        raise RuntimeError(
+            f"The {what} did not converge in {mf.max_cycle} cycles (E = {mf.e_tot:.8f} Ha); "
+            "EmbASI would continue from the input density. Try --scf_newton True "
+            "(second-order SCF, for stalls at small HOMO-LUMO gaps) or a larger "
+            "--scf_max_cycle."
+        )
+
+
 class ProjectionEmbeddingAdapter:
     """Wraps a live ``embasi.embedding.ProjectionEmbedding``."""
 
@@ -989,6 +1009,13 @@ class ProjectionEmbeddingAdapter:
         dm_a, dm_b, _overlap, v_emb_embasi, p_b_embasi = self.p.construct_embedding_potential(
             dma_in=wrapped_dma_in, dmb_in=wrapped_dmb_in, a_nspade_mos=a_nmos
         )
+        # Without input densities EmbASI ran a real supersystem SCF (with them it only
+        # re-evaluates, run_noscf, where "not converged" is expected).  A failed SCF is
+        # replaced by the INPUT density there, which silently shifts every energy.
+        if dma_in is None and dmb_in is None:
+            _require_scf_converged(
+                getattr(self.p, "AB_LL", None), "supersystem low-level SCF (AB_LL)"
+            )
 
         # `_as_ao_matrix` normalises EmbASI's SpinKpointArray to a real (nao, nao) block
         # (see `_as_ao_matrix` for the dtype convention).
@@ -1080,6 +1107,9 @@ class ProjectionEmbeddingAdapter:
             emb_pot = self._wrap_density(self._require(self._v_emb_embasi, "v_emb"))
             proj_pot = self._wrap_density(self.p_b)
         self.p.A_HL.run_emb_scf(dm_in=dm_in, emb_pot=emb_pot, proj_pot=proj_pot)
+        _require_scf_converged(
+            getattr(self.p, "A_HL", None), "relaxed subsystem-A HF (A_HL, --relax_hf)"
+        )
 
         # Same assembly as _assemble_fock_a_only's self._fock, but off A_HL's
         # converged one-electron blocks instead of A_LL's frozen ones (mirrors

@@ -372,6 +372,14 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
             mf.init_guess = cfg.init_guess
         if cfg.init_guess_breaksym is not None and hasattr(mf, "init_guess_breaksym"):
             mf.init_guess_breaksym = cfg.init_guess_breaksym
+    # Second-order (Newton) SCF for the low level.  At stretched bonds the small HOMO-LUMO
+    # gap leaves DIIS circling a converged energy whose orbital gradient never meets
+    # conv_tol_grad, and EmbASI then falls back to the *input* density (stretched C≡N in
+    # PBE: +200 mHa).  Low level only: DIIS converges the high-level (embedded HF) SCF
+    # where Newton did not (2.5 Å).  Read with a default so drivers whose settings
+    # predate the flag are unaffected.
+    if getattr(cfg, "scf_newton", False):
+        mf_ll = mf_ll.newton()
 
     projection = ProjectionEmbedding(
         atoms,
@@ -632,6 +640,8 @@ def build_selector(
                 emb._fock_relaxed_arr if use_relaxed else emb._fock,
                 n_shells=cfg.n_shells,
                 max_virtual=cfg.n_virtual,
+                # Read with a default so drivers whose settings predate the flag work.
+                canonical=getattr(cfg, "cl_canonical", False),
             ),
             None,
         )
@@ -738,6 +748,10 @@ class EmbeddingWorkflow(BaseSettings):
     # 1 (PySCF default) keeps only atom-diagonal blocks of the beta density, "mix" rotates
     # HOMO/LUMO by 45 degrees between the channels, 0 keeps the guess spin-symmetric.
     init_guess_breaksym: int | Literal["mix"] | None = None
+    # Use PySCF's second-order (Newton) SCF for the low-level calculations.  Off by
+    # default; turn on when the low-level SCF does not converge (e.g. PBE at a stretched
+    # bond, where DIIS stalls and EmbASI continues from the input density).
+    scf_newton: bool = False
     # Supersystem SCF only: after it converges, run PySCF stability analysis in EmbASI and
     # follow any instability (including breaking the spin symmetry of a closed-shell UHF) to
     # a stable solution, so a scan does not jump between a saddle point and the minimum.
@@ -767,6 +781,16 @@ class EmbeddingWorkflow(BaseSettings):
     # 0 keeps just the fragment-spanned shell; higher values grow the candidate space
     # (and the qubit count) for accuracy.
     n_shells: int = 0
+    # ``concentric-cl`` only: pseudocanonicalize the kept shells (diagonalize F_emb in
+    # their span, ascending energy), so ``n_virtual`` keeps the lowest-energy virtuals
+    # rather than the most fragment-local -- the reference implementation's recipe.
+    cl_canonical: bool = False
+    # WF-in-DFT energy expression.  "first-order" (default): the paper-Eq.-8 assembly with
+    # v_emb frozen at the low-level density and a first-order correction, iterated by the
+    # outer loop.  "reference": the reference implementation's single-shot protocol -- a
+    # variational HF-in-DFT SCF-in-SCF for A, then the active-space correlation on top
+    # (see reference_protocol); needs --max_cycles 1, --n_frozen_occ and --n_virtual.
+    wf_in_dft_energy: Literal["first-order", "reference"] = "first-order"
     # ``apc-concentric`` only: APC's active-space budget, as (nelec, norb).  Required
     # when selector="apc-concentric"; inert otherwise.
     apc_max_size: tuple[int, int] | None = None
@@ -892,6 +916,12 @@ class EmbeddingWorkflow(BaseSettings):
         # WF-in-DFT only.  Collective on every rank: EmbASI's supersystem SCF,
         # SPADE/Pipek-Mezey localisation, and the embedded Fock all run in here.
         emb.run_low_level(a_nmos=self.a_nmos)
+        if self.wf_in_dft_energy == "reference":
+            output = self._reference_wf_in_dft(emb, rank=rank, log=log)
+            if self.output_path is not None:
+                with self.output_path.open("a") as out:
+                    out.write(f"{self.xyz}; {output.total}\n")
+            return output
         if self.relax_hf:
             log(
                 "   relaxing the subsystem-A HF reference on A_HL "
@@ -920,6 +950,50 @@ class EmbeddingWorkflow(BaseSettings):
                 out.write(f"{self.xyz}; {output.total}\n")
 
         return output
+
+    def _reference_wf_in_dft(self, emb, *, rank, log):
+        """Single-shot WF-in-DFT with the reference implementation's energy.
+
+        See :mod:`~embasi_qiskit_integration.reference_protocol`: a variational HF-in-DFT
+        SCF-in-SCF for subsystem A, then the active-space correlation on top, in the
+        canonical orbitals of the converged embedded Fock matrix.  Returns a
+        :class:`ProjectionEnergy` whose ``e_low_total`` is the variational energy
+        ``E[γ_A]`` and whose ``e_high_A`` is the correlation, so ``total`` is the
+        protocol's total; the other terms are zero by construction.
+        """
+        from embasi_qiskit_integration.projection_embedding_adapter import ProjectionEnergy
+        from embasi_qiskit_integration.reference_protocol import reference_wf_in_dft_hamiltonian
+        from embasi_qiskit_integration.selectors import fragment_ao_indices
+
+        if self.max_cycles != 1:
+            raise ValueError("--wf_in_dft_energy reference is single-shot: pass --max_cycles 1")
+        if self.n_virtual is None:
+            raise ValueError("--wf_in_dft_energy reference needs --n_virtual (and --n_frozen_occ)")
+        frag = fragment_ao_indices(emb.ints.mol, list(range(len(self.active_atoms))))
+        ham, info = reference_wf_in_dft_hamiltonian(
+            emb,
+            frag,
+            n_frozen_occ=self.n_frozen_occ,
+            n_virtual=self.n_virtual,
+            n_shells=self.n_shells,
+        )
+        log("== Steps 2-4: reference WF-in-DFT protocol (variational SCF-in-SCF) ==")
+        log(
+            f"   E[γ_A] = {info.e_variational:.6f} Ha after {info.n_iterations} SCF-in-SCF "
+            f"iterations; CAS({sum(ham.nelec)}e, {ham.norb}o), "
+            f"{info.n_virtual_kept} canonical concentric virtual(s)"
+        )
+        log(f"   active orbital energies: {np.round(info.active_orbital_energies, 5)}")
+        result = self._solve(ham, self._build_solver(), rank=rank, log=log)
+        correlation = result.energy - info.e_variational
+        log(f"   E_solver + e_core = {result.energy:.6f} Ha (correlation {correlation:.6f} Ha)")
+        return ProjectionEnergy(
+            e_low_total=info.e_variational,
+            e_low_A=0.0,
+            e_high_A=correlation,
+            correction=0.0,
+            projector_leak=0.0,
+        )
 
     def _is_dft_in_dft(self) -> bool:
         """True when the high level is a density functional (-> paper Eq. 2).
