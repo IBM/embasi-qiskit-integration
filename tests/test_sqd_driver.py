@@ -120,3 +120,46 @@ def test_spin_dependent_fallback_warns_about_both_approximations(n2_ham, mock_co
     text = " ".join(str(w.message) for w in rec)
     assert "alpha-only" in text, "the warning must disclose that h2 is alpha-only too"
     assert "LARGER" in text
+
+
+@pytest.fixture
+def nitrile_cas44(data_dir):
+    """Butyronitrile CAS(4,4) WF-in-HF at R(C-N) = 2.4 A (reference protocol)."""
+    return fcidump.read(data_dir / "nitrile_cas44_2p4.fcidump")
+
+
+def _full_space_counts(ham):
+    """One count per determinant of the (n_alpha, n_beta) sector: beta|alpha, MSB-left."""
+    from pyscf.fci import cistring
+
+    na, nb = ham.nelec
+    strs_a = cistring.make_strings(range(ham.norb), na)
+    strs_b = cistring.make_strings(range(ham.norb), nb)
+    fmt = f"0{ham.norb}b"
+    return {format(b, fmt) + format(a, fmt): 1 for a in strs_a for b in strs_b}
+
+
+@pytest.mark.parametrize("spin_sq", [None, 0.0])
+def test_sqd_full_space_reaches_the_ground_state(nitrile_cas44, spin_sq):
+    """Covering the whole sector, SQD must reproduce FCI -- whatever pyscf's own guess.
+
+    pyscf's ``kernel_fixed_space`` starts from the lowest-diagonal determinant, here in a
+    different symmetry sector than the ground state, and used to return the third root
+    (+5.4 mHa; +5.9 mHa with ``spin_sq=0``) on this exact Hamiltonian.  The ground state
+    is a singlet, so the target does not change the answer.
+    """
+    from pyscf import fci
+
+    ham = nitrile_cas44
+    e_fci = fci.direct_spin1.FCI().kernel(ham.h1, ham.h2, ham.norb, ham.nelec)[0] + ham.e_core
+    res = run_sqd(ham, _full_space_counts(ham), spin_sq=spin_sq, seed=24)
+    assert res.diagnostics["final_sqd_subspace_dimension"] == 36
+    assert abs(res.energy - e_fci) < 1e-6
+
+
+def test_sqd_without_the_reference_determinant_keeps_pyscfs_guess(nitrile_cas44):
+    """A subspace lacking the aufbau determinant still solves (with pyscf's own start)."""
+    ham = nitrile_cas44
+    counts = {b: n for b, n in _full_space_counts(ham).items() if not b.endswith("0011")}
+    res = run_sqd(ham, counts, seed=24, max_iterations=1)
+    assert np.isfinite(res.energy)

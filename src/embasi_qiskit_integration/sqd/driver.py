@@ -25,6 +25,48 @@ from embasi_qiskit_integration.circuit_run.spin_layout import (
 from embasi_qiskit_integration.contract import EmbeddedHamiltonian, SolverResult
 
 
+def _solve_sci_batch_from_reference(
+    ci_strings, one_body_tensor, two_body_tensor, norb, nelec, *, spin_sq=None
+):
+    """The addon's ``solve_sci_batch``, but each Davidson starts from the aufbau determinant.
+
+    Left to itself, pyscf's ``selected_ci.kernel_fixed_space`` starts from the single
+    lowest-diagonal determinant (plus 1e-5 noise).  Near dissociation that determinant
+    can sit in a different symmetry sector than the ground state, and the iteration never
+    leaves it: on a butyronitrile CAS(4,4) at 2.4 A the subspace was the FULL 36-determinant
+    space and it still returned the third root (+5.4 mHa; +5.9 mHa with ``spin_sq=0``).
+    Starting from the aufbau determinant -- the one the sampling circuits prepare -- gives
+    the exact ground state there, including the quintet ground states of CAS(6,6).
+    A subspace without that determinant keeps pyscf's own guess.
+    """
+    from pyscf.fci import selected_ci
+    from qiskit_addon_sqd.fermion import solve_sci
+
+    ref_a, ref_b = (1 << nelec[0]) - 1, (1 << nelec[1]) - 1
+    results = []
+    for strs_a, strs_b in ci_strings:
+        kwargs = {}
+        ia = np.flatnonzero(np.asarray(strs_a) == ref_a)
+        ib = np.flatnonzero(np.asarray(strs_b) == ref_b)
+        if ia.size and ib.size:
+            ci0 = np.zeros((len(strs_a), len(strs_b)))
+            ci0[ia[0], ib[0]] = 1.0
+            # Must be an SCIvector: kernel_fixed_space silently ignores a plain array.
+            kwargs["ci0"] = selected_ci._as_SCIvector(ci0, (strs_a, strs_b))
+        results.append(
+            solve_sci(
+                (strs_a, strs_b),
+                one_body_tensor,
+                two_body_tensor,
+                norb=norb,
+                nelec=nelec,
+                spin_sq=spin_sq,
+                **kwargs,
+            )
+        )
+    return results
+
+
 def run_sqd(
     ham: EmbeddedHamiltonian,
     counts: dict[str, int],
@@ -110,13 +152,10 @@ def run_sqd(
 
     rng = np.random.default_rng(seed) if seed is not None else None
 
-    sci_solver = None
-    if spin_sq is not None:
-        import functools
+    import functools
 
-        from qiskit_addon_sqd.fermion import solve_sci_batch
-
-        sci_solver = functools.partial(solve_sci_batch, spin_sq=spin_sq)
+    # Always our own batch solver, for its starting vector (see its docstring).
+    sci_solver = functools.partial(_solve_sci_batch_from_reference, spin_sq=spin_sq)
 
     extra: dict = {}
     if initial_occupancies is not None:
