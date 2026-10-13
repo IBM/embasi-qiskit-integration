@@ -144,9 +144,9 @@ def test_sqd_full_space_reaches_the_ground_state(nitrile_cas44, spin_sq):
     """Covering the whole sector, SQD must reproduce FCI -- whatever pyscf's own guess.
 
     pyscf's ``kernel_fixed_space`` starts from the lowest-diagonal determinant, here in a
-    different symmetry sector than the ground state, and used to return the third root
-    (+5.4 mHa; +5.9 mHa with ``spin_sq=0``) on this exact Hamiltonian.  The ground state
-    is a singlet, so the target does not change the answer.
+    different symmetry sector than the ground state, and used to return an excited root
+    on this Hamiltonian.  The ground state is a singlet, so the target does not change
+    the answer.
     """
     from pyscf import fci
 

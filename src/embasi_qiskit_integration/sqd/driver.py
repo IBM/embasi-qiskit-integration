@@ -33,11 +33,10 @@ def _solve_sci_batch_from_reference(
     Left to itself, pyscf's ``selected_ci.kernel_fixed_space`` starts from the single
     lowest-diagonal determinant (plus 1e-5 noise).  Near dissociation that determinant
     can sit in a different symmetry sector than the ground state, and the iteration never
-    leaves it: on a butyronitrile CAS(4,4) at 2.4 A the subspace was the FULL 36-determinant
-    space and it still returned the third root (+5.4 mHa; +5.9 mHa with ``spin_sq=0``).
-    Starting from the aufbau determinant -- the one the sampling circuits prepare -- gives
-    the exact ground state there, including the quintet ground states of CAS(6,6).
-    A subspace without that determinant keeps pyscf's own guess.
+    leaves it, so an excited root comes back even when the subspace is the full space.
+    Starting from the aufbau determinant -- the one the sampling circuits prepare --
+    reaches the ground state, including high-spin ground states.  A subspace without that
+    determinant keeps pyscf's own guess.
     """
     from pyscf.fci import selected_ci
     from qiskit_addon_sqd.fermion import solve_sci

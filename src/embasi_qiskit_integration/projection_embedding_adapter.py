@@ -791,9 +791,9 @@ def _require_scf_converged(layer: Any, what: str) -> None:
     """Raise if the PySCF SCF behind an EmbASI layer did not converge.
 
     EmbASI does not stop on a failed SCF: it continues from the *input* density (with a
-    RuntimeWarning in a long log), so every downstream energy is quietly wrong -- e.g.
-    +200 mHa for stretched C≡N in PBE.  Only PySCF layers are checked (their method object
-    carries ``converged``); other backends pass through unchanged.
+    RuntimeWarning in a long log), so every downstream energy is quietly wrong.  Only
+    PySCF layers are checked (their method object carries ``converged``); other backends
+    pass through unchanged.
     """
     mf = getattr(getattr(getattr(layer, "atoms", None), "calc", None), "method", None)
     if mf is None or not hasattr(mf, "converged") or getattr(mf, "max_cycle", 1) <= 0:

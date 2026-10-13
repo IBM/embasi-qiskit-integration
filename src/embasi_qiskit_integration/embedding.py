@@ -374,10 +374,9 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
             mf.init_guess_breaksym = cfg.init_guess_breaksym
     # Second-order (Newton) SCF for the low level.  At stretched bonds the small HOMO-LUMO
     # gap leaves DIIS circling a converged energy whose orbital gradient never meets
-    # conv_tol_grad, and EmbASI then falls back to the *input* density (stretched C≡N in
-    # PBE: +200 mHa).  Low level only: DIIS converges the high-level (embedded HF) SCF
-    # where Newton did not (2.5 Å).  Read with a default so drivers whose settings
-    # predate the flag are unaffected.
+    # conv_tol_grad, and EmbASI then falls back to the *input* density.  Low level only:
+    # DIIS converges the high-level (embedded HF) SCF in cases where Newton does not.
+    # Read with a default so drivers whose settings predate the flag are unaffected.
     if getattr(cfg, "scf_newton", False):
         mf_ll = mf_ll.newton()
 
