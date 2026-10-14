@@ -206,6 +206,7 @@ default (they are assigned only inside ``construct_embedding_potential``), which
 
 from __future__ import annotations
 
+import embasi_qiskit_integration._pyscf_compat  # noqa: F401
 import hashlib
 import warnings
 from collections.abc import Callable

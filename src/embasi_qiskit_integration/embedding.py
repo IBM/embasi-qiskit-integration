@@ -82,6 +82,7 @@ Comput. 8, 2564 (2012), doi:10.1021/ct300544e.
 
 from __future__ import annotations
 
+import embasi_qiskit_integration._pyscf_compat  # noqa: F401
 from pathlib import Path
 from typing import Any, Literal, Protocol
 

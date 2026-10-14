@@ -41,7 +41,8 @@ coverage.xml
 # Outputs
 /output
 /data
+/experiments
 
 # Logging and Experiments
-execute.sh
+execute*
 plot_cas_pes.py
