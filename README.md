@@ -38,7 +38,7 @@ else is an extra:
 |---|---|---|
 | `quantum` | `qiskit`, `qiskit-aer`, `qiskit-addon-sqd`, `ffsim` | `SQDSolver`, Aer sampling |
 | `fermions` | `qiskit-fermions>=0.1,<0.2` | building SqDRIFT circuits (any non-mock SQD run) |
-| `relabel` | `pyomo`, `highspy` | [mode relabeling](#mode-relabeling-optimize); **required by `SQDSolver`'s default `optimize=True`** |
+| `relabel` | `pyomo`, `highspy`, `ortools` | [mode relabeling](#mode-relabeling-optimize); **required by `SQDSolver`'s default `optimize=True`** |
 | `hardware` | `qiskit-ibm-runtime`, `samplomatic` | `--sampler runtime`, readout characterisation |
 | `embed` | EmbASI (from git, `qm-code-adapter` branch) + `ase`, `asi4py`, `mpi4py`, `scalapack4py` | `scripts/embedding_workflow.py`, the EmbASI-marked tests |
 | `mpi` | `mpich` (Linux only) | an MPI runtime for `mpi4py` on hosts with none — see below |
@@ -270,8 +270,10 @@ uv run embasi-qiskit-integration solve <jobdir> \
     --enable_readout_characterisation true --readout_error_threshold 0.03       # measure, then pin a layout
 ```
 
-**Circuit-generation knobs.** `--optimize` / `--time_limit` control mode relabeling
-and `--workers` shards circuit construction across processes (see §2 above);
+**Circuit-generation knobs.** `--optimize` / `--time_limit` / `--relabel_solver` /
+`--cpsat_workers` / `--cpsat_deterministic` control mode relabeling,
+`--per_time_randomization` seeds each evolution time's draws separately, and
+`--workers` shards circuit construction across processes (see §2 above);
 `--workers 0` uses one per CPU. Generation progress and the relabel hit rate are
 reported through the standard `logging` module under the
 `embasi_qiskit_integration` logger — a zero-permutation run warns, so
@@ -442,27 +444,71 @@ counts = sampler.run(result.circuits, shots)
 counts = unpermute_counts_list(counts, result.permutations)  # required!
 ```
 
-By default the permutation is whatever the MILP solver returned, applied in a
-single pass chain. **That is not reproducible**: the excitation-span model is
-degenerate and HiGHS is not a pure function of it — solving one model repeatedly in
-a single process returned one optimum five times and then a different one (depths
-382 vs 368). Since the permutation is undone on the counts, that instability
-reaches the pooled distribution. Pass `canonical_permutation=True` to derive the
-permutation from a fixed candidate set instead, at the cost of a second
-pass-manager run per randomization:
-
-```python
-build_sqdrift_circuits(ham, method="qdrift", canonical_permutation=True)
-```
-
 Requesting `optimize=True` without the `relabel` extra raises instead of silently
 producing unpermuted circuits.
 
-Each circuit's relabel solve is capped at `time_limit` seconds (default 10) and
-typically runs to it, so with the default 500 randomizations
-relabeling dominates an SQD solve. Under noiseless Aer it buys nothing — on N2
-CAS(8o,10e), 40 circuits took 405 s with it and 5 s without, at the same energy — so
-pass `--optimize False` there, and keep it on for hardware.
+**The permutation is cached per draw.** The relabel model depends only on the
+excitations a qDRIFT draw sampled, never on `time` (which only scales the angles), so
+by default randomization `i` gathers the same excitations, and gets the same
+permutation, at every time. The permutation is cached by a content hash of that
+model (excitation set, mode count, backend and solver settings), so a three-time
+sweep solves each model once instead of three times. A sharded build (`workers > 1`)
+shares the cache between its workers through a temporary directory, with a lock so a
+model is solved by one worker while the others wait for it;
+`relabel_cache_dir=<path>` keeps that directory, so a repeated build reuses its
+solves (safe to delete). When a time limit leaves the optimum unproven, the first
+permutation found is kept for every time.
+
+Each solve is capped at `time_limit` seconds (default 60) and with HiGHS typically
+runs to it, so relabeling dominates an SQD solve. Under noiseless Aer it buys
+nothing — on N2 CAS(8o,10e), 40 circuits took 405 s with it and 5 s without (at the
+previous 10 s limit), at the same energy — so pass `--optimize False` there, and keep
+it on for hardware.
+
+**`per_time_randomization=True`** draws each time independently, from a seed hashed
+from `(seed, i, time)`, so every time is its own sample (more independent circuits,
+and no cross-time cache hits). It changes the seeds even for a single-time run. The
+default `False` keeps the `seed + i` draws.
+
+**`relabel_solver="cpsat"`** solves the same default objective with OR-Tools CP-SAT.
+At about 16 modes it proves the optimum in under a second, where HiGHS needs 30–60 s
+to match it. Above that neither solver proves the optimum within a minute, and
+CP-SAT's edge comes from its parallel search: on 8 threads it gives far shallower
+circuits than HiGHS, on 1 thread it ties or loses. Measured 2-qubit depth after
+relabeling, real qDRIFT draws (`num_groups=20`), mean of 3:
+
+| modes | no relabel | HiGHS 5 s | HiGHS 60 s | CP-SAT 1 thread 60 s | CP-SAT 8 threads 5 s |
+| ----- | ---------- | --------- | ---------- | -------------------- | -------------------- |
+| 16    | 474        | 297       | 209        | 210                  | 208                  |
+| 32    | 887        | 847       | 738        | 615                  | 575                  |
+| 64    | 1547       | 813       | 448        | 632                  | 232                  |
+| 120   | 2706       | 1485      | 736        | 688                  | 271                  |
+
+`cpsat_workers` (default 8) is its thread count per solve, and multiplies with
+`workers`, so give CP-SAT its threads by lowering `workers` (to about cores /
+`cpsat_workers`). With `workers` near the core count each solve effectively runs on
+one thread, where CP-SAT has no advantage.
+
+```python
+build_sqdrift_circuits(ham, method="qdrift", relabel_solver="cpsat", cpsat_workers=4)
+```
+
+**Reproducibility.** The excitation-span model is degenerate (many orderings tie),
+and neither backend is guaranteed to pick the same tied optimum on every run: HiGHS,
+pinned here to one thread, was still seen to return a different optimum on a repeated
+solve of one model in one process, and CP-SAT on several threads races its workers
+(one 16-mode model gave 6 different permutations in 6 runs). Within a build the cache
+makes every circuit of a draw use one permutation. Across builds,
+`cpsat_deterministic=True` switches CP-SAT to interleaved search, which is
+reproducible but searches less well (10–20% worse objective at 32 modes, and 8×
+longer to prove the optimum at 16 modes); it is part of the cache key and has no
+effect with `highs`. A `relabel_cache_dir` reused between builds also pins the
+permutations it holds.
+
+On macOS, a process that runs both backends must import `highspy` before `ortools`:
+the OR-Tools wheel bundles its own HiGHS, and with it loaded first a later HiGHS
+solve can segfault. The CP-SAT backend does this itself; a script that imports
+`ortools` on its own should import `highspy` first.
 
 ### Parallel generation (`workers`)
 

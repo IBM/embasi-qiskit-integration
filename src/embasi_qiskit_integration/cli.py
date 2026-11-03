@@ -51,7 +51,14 @@ class SolveCommand(BaseSettings):
     shots: int = 1_000  # per circuit for SQD
     seed: int = 42
     optimize: bool | None = None
-    time_limit: float = 10.0  # per-solve wall-clock limit for the relabel MILP
+    time_limit: float = 60.0  # per-solve wall-clock limit for the relabel solve (0 = none)
+    # Relabel backend: HiGHS MILP, or OR-Tools CP-SAT (shallower circuits above ~16 modes
+    # when given threads; cpsat_workers multiplies with workers).
+    relabel_solver: Literal["highs", "cpsat"] = "highs"
+    cpsat_workers: int = 8
+    cpsat_deterministic: bool = False  # reproducible CP-SAT (interleaved, weaker search)
+    # Seed each evolution time's draws independently instead of sharing them.
+    per_time_randomization: bool = False
     # Processes used to build the circuit ensemble. 0 means one per CPU.
     workers: int = 1
     # SQD solver parameters
@@ -116,6 +123,10 @@ class SolveCommand(BaseSettings):
             seed=self.seed,
             optimize=self.optimize,
             time_limit=self.time_limit,
+            relabel_solver=self.relabel_solver,
+            cpsat_workers=self.cpsat_workers,
+            cpsat_deterministic=self.cpsat_deterministic,
+            per_time_randomization=self.per_time_randomization,
             workers=self.workers,
             method=self.sqd_method,
             evolution_time=self.evolution_time,

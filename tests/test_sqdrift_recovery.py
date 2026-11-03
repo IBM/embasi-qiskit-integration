@@ -20,12 +20,13 @@ from embasi_qiskit_integration.circuit_generator.sqdrift import (
     _BuildSpec,
     _build_parallel,
     _plan_tasks,
+    _randomization_seed,
 )
 
 N_DRAWS, WORKERS, SEED = 40, 4, 24
 
 
-def _build(monkeypatch, fail="", mode="segv", optimize=True):
+def _build(monkeypatch, fail="", mode="segv", optimize=True, per_time=False):
     monkeypatch.setenv("EQI_TEST_FAIL_SEEDS", fail)
     monkeypatch.setenv("EQI_TEST_FAIL_MODE", mode)
     spec = _BuildSpec(
@@ -39,7 +40,7 @@ def _build(monkeypatch, fail="", mode="segv", optimize=True):
         include_initial_state=False,
         optimize=optimize,
         time_limit=10.0,
-        canonical_permutation=False,
+        per_time_randomization=per_time,
     )
     tasks = _plan_tasks([1.0], [15], N_DRAWS, WORKERS, SEED)
     return _build_parallel(spec, tasks, WORKERS, build_fn=build_chunk)
@@ -93,3 +94,24 @@ def test_a_failure_on_every_seed_raises(monkeypatch):
 def test_without_relabeling_any_failure_raises(monkeypatch):
     with pytest.raises(RuntimeError, match=r"SqDRIFT chunk .* failed"):
         _build(monkeypatch, fail="37", optimize=False)
+
+
+def test_a_per_time_draw_is_redrawn_and_recorded_with_its_per_time_seeds(monkeypatch):
+    """With per_time_randomization the record holds the hashed seeds the draw really used:
+    the original from ``seed`` and its replacement from the shifted base ``seed + N``."""
+    seed = _randomization_seed(SEED, 13, 1.0, True)
+    replacement = _randomization_seed(SEED + N_DRAWS, 13, 1.0, True)
+    result = _build(monkeypatch, fail=str(seed), per_time=True)
+    assert result.reseeded == [
+        {
+            "time": 1.0,
+            "num_groups": 15,
+            "randomization": 13,
+            "seed": seed,
+            "replacement_seed": replacement,
+            "attempts": 1,
+        }
+    ]
+    expected = [_randomization_seed(SEED, r, 1.0, True) for r in range(N_DRAWS)]
+    expected[13] = replacement
+    assert result.circuits == _labels(expected)

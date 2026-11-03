@@ -151,7 +151,7 @@ def test_sweep_axes_build_their_product_and_pool_it(n2_ham):
 
 
 def test_workflow_forwards_circuit_construction_flags(monkeypatch):
-    """--optimize / --time_limit / --workers reach SQDSolver, with their defaults."""
+    """The circuit-construction flags reach SQDSolver, with their defaults."""
     import sys
 
     from embasi_qiskit_integration.embedding import EmbeddingWorkflow
@@ -159,10 +159,21 @@ def test_workflow_forwards_circuit_construction_flags(monkeypatch):
     common = {"solver": "sqd", "sampler": "aer", "aer_method": "statevector"}
     monkeypatch.setattr(sys, "argv", ["prog"])
     default = EmbeddingWorkflow(**common)._build_solver()
-    assert (default.optimize, default.time_limit, default.workers) == (True, 10.0, 1)
+    assert (default.optimize, default.time_limit, default.workers) == (True, 60.0, 1)
+    assert (default.relabel_solver, default.cpsat_workers) == ("highs", 8)
+    assert (default.cpsat_deterministic, default.per_time_randomization) == (False, False)
 
     monkeypatch.setattr(
-        sys, "argv", ["prog", "--optimize", "False", "--time_limit", "2.5", "--workers", "8"]
+        sys,
+        "argv",
+        [
+            "prog",
+            *("--optimize", "False", "--time_limit", "2.5", "--workers", "8"),
+            *("--relabel_solver", "cpsat", "--cpsat_workers", "4"),
+            *("--cpsat_deterministic", "true", "--per_time_randomization", "true"),
+        ],
     )
     flagged = EmbeddingWorkflow(**common)._build_solver()
     assert (flagged.optimize, flagged.time_limit, flagged.workers) == (False, 2.5, 8)
+    assert (flagged.relabel_solver, flagged.cpsat_workers) == ("cpsat", 4)
+    assert (flagged.cpsat_deterministic, flagged.per_time_randomization) == (True, True)

@@ -15,7 +15,10 @@ from __future__ import annotations
 import os
 import signal
 
-from embasi_qiskit_integration.circuit_generator.sqdrift import SqdriftBuildResult
+from embasi_qiskit_integration.circuit_generator.sqdrift import (
+    SqdriftBuildResult,
+    _randomization_seed,
+)
 
 
 def build_chunk(spec, combos, rand_range):
@@ -24,7 +27,9 @@ def build_chunk(spec, combos, rand_range):
     result = SqdriftBuildResult(optimize_requested=spec.optimize)
     for evolution_time, n_groups in combos:
         for randomization in rand_range:
-            seed = spec.seed + randomization
+            seed = _randomization_seed(
+                spec.seed, randomization, evolution_time, spec.per_time_randomization
+            )
             if spec_fail == "all" or seed in fail:
                 if os.environ.get("EQI_TEST_FAIL_MODE", "segv") == "segv":
                     os.kill(os.getpid(), signal.SIGSEGV)

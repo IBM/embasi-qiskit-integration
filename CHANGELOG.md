@@ -24,16 +24,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `metadata["permutation"]` so the reference determinant is prepared in the
   matching order — relabeling is therefore transparent to `SQDSolver` callers, and
   the SQD energy is unchanged while the circuits get shorter.
-- `canonical_permutation` (default **False**) selects how the mode permutation is
-  obtained. The default applies the MILP solver's own ordering in one pass chain.
-  Setting it True derives the permutation from a fixed candidate set instead
-  (`canonicalize_permutation`), costing a second pass-manager run per randomization
-  but making a seeded build reproducible — which the default is not, because the
-  excitation-span model is degenerate and HiGHS is not a pure function of it
-  (solving one model repeatedly in a single process returned one optimum five times
-  and then a different one; depths 382 vs 368). Since the permutation is undone on
-  the counts, that instability reaches the pooled distribution. Also exposed as
-  `SQDSolver(canonical_permutation=...)`.
+- Relabel permutation cache: the excitation-span model depends only on a draw's
+  sampled excitations, not on `time`, so its permutation is cached by a content hash
+  of the model (in memory, and for a sharded build in a directory shared by the
+  workers, with a per-model lock). A `time` sweep solves each draw once instead of
+  once per time, and all of a draw's circuits share one permutation.
+  `relabel_cache_dir` keeps that directory for reuse across builds. The worker pool
+  is capped at the number of distinct draws when relabeling.
+- CP-SAT relabel backend: `relabel_solver="cpsat"` (default `"highs"`) solves the
+  same default objective with OR-Tools CP-SAT, with `cpsat_workers` (default 8)
+  threads per solve and `cpsat_deterministic` (default False) for reproducible
+  interleaved search. On 8 threads it gives far shallower circuits than HiGHS above
+  ~16 modes (2-qubit depth at 64 modes: 448 with HiGHS at 60 s, 232 with CP-SAT at
+  5 s). `ortools` joins the `relabel` extra. Exposed on `build_sqdrift_circuits`,
+  `SQDSolver`, the `solve` CLI and `scripts/embedding_workflow.py`.
+- `per_time_randomization` (default False) seeds each evolution time's qDRIFT draws
+  from a hash of `(seed, i, time)` instead of sharing `seed + i` across times.
+
 - Parallel SqDRIFT generation: `build_sqdrift_circuits(workers=N)` (and
   `SQDSolver(workers=N)` / `--workers`) shards each combination's randomizations
   into contiguous seed-chunks across processes, byte-identical to the sequential
@@ -105,6 +112,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `solve` would sample.
 
 ### Changed
+- `time_limit` per relabel solve now defaults to 60 s (was 10 s), for both backends.
 - **Behaviour:** `build_sqdrift_circuits` now relabels the modes by default
   (`optimize=True` when the `relabel` extra is present), matching the reference
   step, so the generated circuits differ from before — shorter, and sampling in a
@@ -127,6 +135,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `seed_simulator=42`); pass `--seed 42` to reproduce earlier output.
 
 ### Removed
+- `canonical_permutation` and `canonicalize_permutation`: the permutation is now the
+  solver's, cached per draw; use `relabel_solver="cpsat"` with
+  `cpsat_deterministic=True` where reproducibility across builds matters.
 - Three definitions that were never called anywhere: `circuit_run.layout.plot_layout`
   (a gate-map debugging aid that would have raised `ImportError`, since matplotlib is
   not a dependency), `circuit_run.counts.counts_from_pub_result` (a one-line wrapper

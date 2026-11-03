@@ -857,8 +857,15 @@ class EmbeddingWorkflow(BaseSettings):
     # Circuit construction.  optimize: relabel modes per circuit (`relabel` extra;
     # ~time_limit s each, worth it on hardware, not under Aer).  workers: same result
     # if <= allocated cores.
+    # relabel_solver: "highs" MILP or "cpsat" (OR-Tools; cpsat_workers threads per
+    # solve, multiplying with workers).  per_time_randomization: independent draws per
+    # evolution time instead of shared ones.
     optimize: bool = True
-    time_limit: float = 10.0
+    time_limit: float = 60.0
+    relabel_solver: Literal["highs", "cpsat"] = "highs"
+    cpsat_workers: int = 8
+    cpsat_deterministic: bool = False
+    per_time_randomization: bool = False
     workers: int = 1
 
     # ---------------- main ---------------- #
@@ -1579,6 +1586,10 @@ class EmbeddingWorkflow(BaseSettings):
             num_randomizations=self.num_randomizations,
             optimize=self.optimize,
             time_limit=self.time_limit,
+            relabel_solver=self.relabel_solver,
+            cpsat_workers=self.cpsat_workers,
+            cpsat_deterministic=self.cpsat_deterministic,
+            per_time_randomization=self.per_time_randomization,
             workers=self.workers,
             spin_sq=self.target_s2,
         )

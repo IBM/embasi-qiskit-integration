@@ -319,8 +319,11 @@ class SQDSolver(ActiveSpaceSolver):
         max_iterations: int = 5,
         seed: int | None = None,
         optimize: bool | None = True,
-        time_limit: float = 10.0,
-        canonical_permutation: bool = False,
+        time_limit: float = 60.0,
+        relabel_solver: str = "highs",
+        cpsat_workers: int = 8,
+        cpsat_deterministic: bool = False,
+        per_time_randomization: bool = False,
         workers: int = 1,
         symmetrize_spin: bool | None = None,
         spin_sq: float | None = None,
@@ -339,10 +342,11 @@ class SQDSolver(ActiveSpaceSolver):
         self.seed = seed
         self.optimize = relabel_available() if optimize is None else optimize
         self.time_limit = time_limit
-        # Forwarded to the generator: False (default) uses the MILP solver's own
-        # permutation, True derives a reproducible one at the cost of a second
-        # pass-manager run per randomization. See build_sqdrift_circuits.
-        self.canonical_permutation = canonical_permutation
+        # Relabel backend and qDRIFT seeding, forwarded to build_sqdrift_circuits.
+        self.relabel_solver = relabel_solver
+        self.cpsat_workers = cpsat_workers
+        self.cpsat_deterministic = cpsat_deterministic
+        self.per_time_randomization = per_time_randomization
         self.workers = workers
         # None -> run_sqd derives it from the sector (an open shell must not merge the
         # alpha/beta CI pools).  Forwarded verbatim so an explicit choice still wins.
@@ -388,6 +392,8 @@ class SQDSolver(ActiveSpaceSolver):
             seed=self.seed,
             fcidump_sha=ham.meta.get("sha"),
             optimize=self.optimize,
+            relabel_solver=self.relabel_solver if self.optimize else None,
+            per_time_randomization=self.per_time_randomization,
             n_permuted=sum(1 for p in self._permutations if p is not None),
             n_reseeded_circuits=len(self._reseeded),
             reseeded_circuits=list(self._reseeded),
@@ -444,7 +450,10 @@ class SQDSolver(ActiveSpaceSolver):
             include_initial_state=False,
             optimize=self.optimize,
             time_limit=self.time_limit,
-            canonical_permutation=self.canonical_permutation,
+            relabel_solver=self.relabel_solver,
+            cpsat_workers=self.cpsat_workers,
+            cpsat_deterministic=self.cpsat_deterministic,
+            per_time_randomization=self.per_time_randomization,
             workers=self.workers,
         )
         self._permutations = list(result.permutations)
