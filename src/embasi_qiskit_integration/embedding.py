@@ -847,18 +847,28 @@ class EmbeddingWorkflow(BaseSettings):
     # configuration recovery can span -- too short and the subspace misses
     # configurations (measured on a nitrile CAS(6,6): 1.0 -> 35 distinct bitstrings and
     # +3.5 mHa, 3.0 -> 56 and exact).
-    # Both are sweep axes: the ensemble is built over time x num_groups (e.g.
-    # --evolution_time 1,2,3 --num_groups 10,15,20) and every circuit is pooled into one
-    # SQD run.  A scalar means a one-point axis.
-    evolution_time: FloatSweep = [1.0]
-    num_groups: IntSweep = [15]
+    # Both are sweep axes: the ensemble is built over time x num_groups (default
+    # 1,2,3 x 10) and every circuit is pooled into one SQD run.  A scalar means a
+    # one-point axis (e.g. --evolution_time 1.0 --num_groups 15).
+    evolution_time: FloatSweep = [1.0, 2.0, 3.0]
+    num_groups: IntSweep = [10]
     # For method="qdrift": random circuits per (time, num_groups) combination.
     num_randomizations: int = 500
     # Circuit construction.  optimize: relabel modes per circuit (`relabel` extra;
     # ~time_limit s each, worth it on hardware, not under Aer).  workers: same result
     # if <= allocated cores.
+    # relabel_solver: "cpsat" (OR-Tools, default; cpsat_workers threads per solve,
+    # multiplying with workers) or "highs" MILP.  per_time_randomization: independent draws per
+    # evolution time instead of shared ones.  relabel_cache: one permutation per sampled
+    # model (False: solve every circuit).  highs_deterministic: one HiGHS thread per solve.
     optimize: bool = True
     time_limit: float = 10.0
+    relabel_solver: Literal["highs", "cpsat"] = "cpsat"
+    cpsat_workers: int = 1
+    cpsat_deterministic: bool = False
+    per_time_randomization: bool = False
+    relabel_cache: bool = True
+    highs_deterministic: bool = False
     workers: int = 1
 
     # ---------------- main ---------------- #
@@ -1579,6 +1589,12 @@ class EmbeddingWorkflow(BaseSettings):
             num_randomizations=self.num_randomizations,
             optimize=self.optimize,
             time_limit=self.time_limit,
+            relabel_solver=self.relabel_solver,
+            cpsat_workers=self.cpsat_workers,
+            cpsat_deterministic=self.cpsat_deterministic,
+            per_time_randomization=self.per_time_randomization,
+            relabel_cache=self.relabel_cache,
+            highs_deterministic=self.highs_deterministic,
             workers=self.workers,
             spin_sq=self.target_s2,
         )

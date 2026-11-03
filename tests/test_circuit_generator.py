@@ -210,7 +210,9 @@ def test_sqdrift_rejects_empty_sweep_axes(n2_ham):
 def test_sqdrift_exact_spans_ci_space(n2_ham):
     """The exact-evolution ansatz samples many determinants at the right
     Hamming weights (this is what feeds SQD)."""
-    circuits = build_sqdrift_circuits(n2_ham, method="exact", time=1.0, optimize=False)
+    circuits = build_sqdrift_circuits(
+        n2_ham, method="exact", time=1.0, include_initial_state=True, optimize=False
+    )
     tqc = transpile(circuits[0], AerSimulator(), optimization_level=0)
     counts = AerSampler().sample(tqc, shots=20_000, seed=1)
     norb = n2_ham.norb
@@ -307,7 +309,7 @@ def test_canonicalize_handles_non_contiguous_group_labels():
 
     ``num_groups()`` is the largest label + 1, so a gap in the labels makes it
     disagree with the count of labels actually present. Reading the weights from
-    upstream's ``group_weights()`` (which reports 0.0 for an unused label) keeps
+    upstream's ``group_coeff_means`` (which reports 0.0 for an unused label) keeps
     this working; recomputing them with ``np.add.at`` + ``np.unique`` raised
     ``ValueError`` on the length mismatch.
     """
@@ -341,12 +343,14 @@ def test_filter_trivial_is_separate_from_filter_diagonal_terms(n2_ham):
     the option reaches the pass.
     """
     # optimize=False: this test compares gate signatures, and mode relabeling would
-    # change them for reasons unrelated to the two filters under test.
+    # change them for reasons unrelated to the two filters under test. The reference
+    # state is baked in, since filter_trivial can only see the occupation through it.
     kwargs = {
         "method": "qdrift",
         "num_groups": 10,
         "num_randomizations": 1,
         "seed": 42,
+        "include_initial_state": True,
         "optimize": False,
     }
 
@@ -401,10 +405,10 @@ def test_filter_trivial_defaults_to_where_occupation_is_visible(n2_ham):
 @requires_fermions
 def test_sqdrift_records_initial_state_flag(n2_ham):
     """The metadata flag tells the run stage whether a prep is still needed."""
-    baked = build_sqdrift_circuits(n2_ham, method="exact", optimize=False)
-    bare = build_sqdrift_circuits(
-        n2_ham, method="exact", include_initial_state=False, optimize=False
+    baked = build_sqdrift_circuits(
+        n2_ham, method="exact", include_initial_state=True, optimize=False
     )
+    bare = build_sqdrift_circuits(n2_ham, method="exact", optimize=False)
     assert baked[0].metadata["initial_state_included"] is True
     assert bare[0].metadata["initial_state_included"] is False
 
@@ -430,7 +434,9 @@ def test_bare_core_plus_hf_prep_equals_initialize_modes(n2_ham):
         resolve_initial_state,
     )
 
-    baked = build_sqdrift_circuits(n2_ham, method="exact", time=1.0, seed=42, optimize=False)[0]
+    baked = build_sqdrift_circuits(
+        n2_ham, method="exact", time=1.0, seed=42, include_initial_state=True, optimize=False
+    )[0]
     core = build_sqdrift_circuits(
         n2_ham,
         method="exact",
@@ -471,6 +477,17 @@ requires_relabel = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_permutation_cache():
+    """The permutation cache is process-wide and keyed by the model, not the test, so a
+    draw solved by an earlier test would otherwise turn a later test's solve into a hit."""
+    from embasi_qiskit_integration.circuit_generator import relabel
+
+    relabel._PERMUTATION_CACHE.clear()
+    yield
+    relabel._PERMUTATION_CACHE.clear()
+
+
 @requires_fermions
 @requires_relabel
 def test_optimize_produces_permutations_and_shortens_circuits(n2_ham):
@@ -503,62 +520,6 @@ def test_optimize_produces_permutations_and_shortens_circuits(n2_ham):
 
     # The whole reason to relabel: the ensemble gets cheaper to run.
     assert sum(qc.depth() for qc in optimized) < sum(qc.depth() for qc in plain)
-
-
-@requires_fermions
-@requires_relabel
-def test_optimize_permutation_is_reproducible(n2_ham):
-    """``canonical_permutation=True`` makes a seeded draw yield the same permutation.
-
-    This does not hold for the raw solver output, which is what the default uses:
-    the excitation-span MILP is degenerate and HiGHS is not a pure function of the
-    model -- solving one model repeatedly in a single process was observed to return
-    one optimum five times and then a different one (depths 382 vs 368). Since the
-    permutation has to be undone on the sampled counts, that instability reaches the
-    pooled distribution, so the flag exists to remove it.
-    """
-    kwargs = {
-        "method": "qdrift",
-        "time": 1.0,
-        "num_groups": 10,
-        "num_randomizations": 2,
-        "seed": 42,
-        "include_initial_state": False,
-        "canonical_permutation": True,
-    }
-    runs = [build_sqdrift_circuits(n2_ham, **kwargs).permutations for _ in range(3)]
-    assert runs[0] == runs[1] == runs[2]
-
-
-@requires_fermions
-@requires_relabel
-def test_canonicalize_permutation_is_independent_of_the_solver_pick():
-    """Canonicalization must not depend on which optimum the solver happened to return.
-
-    Two solver picks observed for one real draw refined to different objective
-    values, so a search seeded from the pick is start-dependent. Canonicalizing from
-    a fixed candidate set removes that: wildly different inputs must all produce the
-    same permutation for the same excitation set.
-    """
-    from embasi_qiskit_integration.circuit_generator.sqdrift import (
-        _excitation_spans,
-        canonicalize_permutation,
-    )
-
-    excitations = [(0, 3), (1, 4), (2, 5), (0, 1, 4, 5), (2, 3, 4, 5)]
-    starts = [
-        [0, 1, 2, 3, 4, 5],
-        [5, 4, 3, 2, 1, 0],
-        [3, 0, 5, 1, 4, 2],
-        [1, 3, 5, 0, 2, 4],
-    ]
-    canonical = [canonicalize_permutation(start, excitations) for start in starts]
-    assert len({tuple(p) for p in canonical}) == 1
-
-    # And it is a real improvement, not just a stable arbitrary answer.
-    result = canonical[0]
-    assert sorted(result) == list(range(6))
-    assert _excitation_spans(result, excitations) <= _excitation_spans(starts[0], excitations)
 
 
 @requires_fermions
@@ -609,8 +570,7 @@ def test_workers_produce_identical_circuits_to_sequential(n2_ham):
     Each randomization is an independently seeded draw, so a contiguous slice built
     in a worker must equal the same slice built in-process -- including its
     permutation, since that is applied to the sampled counts. Uses ``optimize=False``
-    to keep the test quick; the relabel path is covered by the reproducibility test
-    above.
+    to keep the test quick; the relabel path is covered in ``test_sqdrift_relabel``.
     """
     kwargs = {
         "method": "qdrift",
@@ -951,10 +911,9 @@ def test_default_optimize_solves_once_per_randomization(n2_ham):
     That single-solve shape (qDRIFT then a solving ``RelabelModes``) is what makes a
     circuit comparable with any other implementation of the same recipe. It is
     asserted by counting solver constructions rather than by circuit equality,
-    because the solver is not deterministic on this MILP (see
-    ``test_optimize_permutation_is_reproducible``): two runs of *identical* code can
-    return different equal-objective optima, so a gate-for-gate assertion would be
-    flaky through no fault of the code.
+    because the solver is not deterministic on this MILP: two runs of *identical*
+    code can return different equal-objective optima, so a gate-for-gate assertion
+    would be flaky through no fault of the code.
     """
     from embasi_qiskit_integration.circuit_generator import sqdrift as sqdrift_module
 
@@ -981,44 +940,8 @@ def test_default_optimize_solves_once_per_randomization(n2_ham):
 
 
 @requires_fermions
-@requires_relabel
-def test_canonical_permutation_costs_an_extra_solve_pass(n2_ham):
-    """``canonical_permutation=True`` adds a probe pass per randomization.
-
-    The probe is what learns *whether* the draw can be relabeled at all; the
-    permutation is then canonicalized and applied without a solver, so the second
-    pass-manager run constructs no adapter.
-    """
-    from embasi_qiskit_integration.circuit_generator import sqdrift as sqdrift_module
-
-    constructed = []
-    real_adapter = sqdrift_module.NativeHighsSolverAdapter
-
-    def _counting_adapter(*args, **kwargs):
-        constructed.append(1)
-        return real_adapter(*args, **kwargs)
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(sqdrift_module, "NativeHighsSolverAdapter", _counting_adapter)
-        result = build_sqdrift_circuits(
-            n2_ham,
-            method="qdrift",
-            time=1.0,
-            num_groups=10,
-            num_randomizations=2,
-            seed=42,
-            include_initial_state=False,
-            canonical_permutation=True,
-        )
-
-    # Still one solve per draw (the probe), and the circuits are relabeled.
-    assert len(constructed) == 2
-    assert result.num_permutations_found == 2
-
-
-@requires_fermions
 def test_group_weights_match_the_explicit_reduction_when_labels_are_contiguous():
-    """The tie-break weight uses the explicit reduction, not ``group_weights()``.
+    """The tie-break weight uses the explicit reduction, not ``group_coeff_means``.
 
     The weight breaks ties in the canonical group order, so which formula computes it
     decides which physical group a seeded qDRIFT draw lands on. The explicit
@@ -1051,7 +974,7 @@ def test_group_weights_fall_back_when_labels_are_non_contiguous():
 
     ``num_groups()`` is the largest label + 1, so the per-label sums and the
     ``np.unique`` counts differ in length and the division raises ``ValueError``.
-    That case -- and only that case -- falls back to ``group_weights()``, so the
+    That case -- and only that case -- falls back to ``group_coeff_means``, so the
     fallback can never change an ordering the reduction could have produced.
     """
     import numpy as np

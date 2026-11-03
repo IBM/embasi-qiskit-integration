@@ -310,8 +310,8 @@ class SQDSolver(ActiveSpaceSolver):
         shots: int = 1_000,
         ansatz: str = "sqdrift",
         method: str = "qdrift",
-        evolution_time: float | Sequence[float] = 1.0,
-        num_groups: int | Sequence[int] = 15,
+        evolution_time: float | Sequence[float] = (1.0, 2.0, 3.0),
+        num_groups: int | Sequence[int] = (10,),
         num_randomizations: int = 500,
         initial_state_bitstring: str | None = None,
         samples_per_batch: int = 300,
@@ -320,7 +320,12 @@ class SQDSolver(ActiveSpaceSolver):
         seed: int | None = None,
         optimize: bool | None = True,
         time_limit: float = 10.0,
-        canonical_permutation: bool = False,
+        relabel_solver: str = "cpsat",
+        cpsat_workers: int = 1,
+        cpsat_deterministic: bool = False,
+        per_time_randomization: bool = False,
+        relabel_cache: bool = True,
+        highs_deterministic: bool = False,
         workers: int = 1,
         symmetrize_spin: bool | None = None,
         spin_sq: float | None = None,
@@ -339,10 +344,13 @@ class SQDSolver(ActiveSpaceSolver):
         self.seed = seed
         self.optimize = relabel_available() if optimize is None else optimize
         self.time_limit = time_limit
-        # Forwarded to the generator: False (default) uses the MILP solver's own
-        # permutation, True derives a reproducible one at the cost of a second
-        # pass-manager run per randomization. See build_sqdrift_circuits.
-        self.canonical_permutation = canonical_permutation
+        # Relabel backend and qDRIFT seeding, forwarded to build_sqdrift_circuits.
+        self.relabel_solver = relabel_solver
+        self.cpsat_workers = cpsat_workers
+        self.cpsat_deterministic = cpsat_deterministic
+        self.per_time_randomization = per_time_randomization
+        self.relabel_cache = relabel_cache
+        self.highs_deterministic = highs_deterministic
         self.workers = workers
         # None -> run_sqd derives it from the sector (an open shell must not merge the
         # alpha/beta CI pools).  Forwarded verbatim so an explicit choice still wins.
@@ -388,6 +396,8 @@ class SQDSolver(ActiveSpaceSolver):
             seed=self.seed,
             fcidump_sha=ham.meta.get("sha"),
             optimize=self.optimize,
+            relabel_solver=self.relabel_solver if self.optimize else None,
+            per_time_randomization=self.per_time_randomization,
             n_permuted=sum(1 for p in self._permutations if p is not None),
             n_reseeded_circuits=len(self._reseeded),
             reseeded_circuits=list(self._reseeded),
@@ -430,9 +440,8 @@ class SQDSolver(ActiveSpaceSolver):
 
         # Bare evolution circuits: the reference determinant is chosen here, at
         # run time, rather than baked in by the generator.
-        # The sweep is the caller's evolution_time x num_groups (one point by default),
-        # never the generator's own (1, 2, 3) x 15 default, so a solve's ensemble size
-        # is always what the caller configured.
+        # The sweep is always this solver's evolution_time x num_groups, passed
+        # explicitly, so a solve's ensemble size is what the caller configured.
         result = build_sqdrift_circuits(
             ham,
             method=self.method,
@@ -444,7 +453,12 @@ class SQDSolver(ActiveSpaceSolver):
             include_initial_state=False,
             optimize=self.optimize,
             time_limit=self.time_limit,
-            canonical_permutation=self.canonical_permutation,
+            relabel_solver=self.relabel_solver,
+            cpsat_workers=self.cpsat_workers,
+            cpsat_deterministic=self.cpsat_deterministic,
+            per_time_randomization=self.per_time_randomization,
+            relabel_cache=self.relabel_cache,
+            highs_deterministic=self.highs_deterministic,
             workers=self.workers,
         )
         self._permutations = list(result.permutations)

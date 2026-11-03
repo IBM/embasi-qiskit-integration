@@ -51,14 +51,25 @@ class SolveCommand(BaseSettings):
     shots: int = 1_000  # per circuit for SQD
     seed: int = 42
     optimize: bool | None = None
-    time_limit: float = 10.0  # per-solve wall-clock limit for the relabel MILP
+    time_limit: float = 10.0  # per-solve wall-clock limit for the relabel solve (0 = none)
+    # Relabel backend: HiGHS MILP, or OR-Tools CP-SAT (shallower circuits above ~16 modes
+    # when given threads; cpsat_workers multiplies with workers).
+    relabel_solver: Literal["highs", "cpsat"] = "cpsat"
+    cpsat_workers: int = 1
+    cpsat_deterministic: bool = False  # reproducible CP-SAT (interleaved, weaker search)
+    # Seed each evolution time's draws independently instead of sharing them.
+    per_time_randomization: bool = False
+    # relabel_cache: reuse one permutation per sampled model (False: solve every circuit).
+    # highs_deterministic: pin each HiGHS solve to one thread.
+    relabel_cache: bool = True
+    highs_deterministic: bool = False
     # Processes used to build the circuit ensemble. 0 means one per CPU.
     workers: int = 1
     # SQD solver parameters
     sqd_method: Literal["exact", "qdrift"] = "qdrift"
     # Sweep axes: the ensemble spans time x num_groups, pooled into one SQD run.
-    evolution_time: FloatSweep = [1.0]
-    num_groups: IntSweep = [15]
+    evolution_time: FloatSweep = [1.0, 2.0, 3.0]
+    num_groups: IntSweep = [10]
     num_randomizations: int = 500  # for method="qdrift", random circuits per combination
     measure_twirling: bool = True
     # Idle-qubit decoherence suppression; off by default (it lengthens the schedule).
@@ -116,6 +127,12 @@ class SolveCommand(BaseSettings):
             seed=self.seed,
             optimize=self.optimize,
             time_limit=self.time_limit,
+            relabel_solver=self.relabel_solver,
+            cpsat_workers=self.cpsat_workers,
+            cpsat_deterministic=self.cpsat_deterministic,
+            per_time_randomization=self.per_time_randomization,
+            relabel_cache=self.relabel_cache,
+            highs_deterministic=self.highs_deterministic,
             workers=self.workers,
             method=self.sqd_method,
             evolution_time=self.evolution_time,

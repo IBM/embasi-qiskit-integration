@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- `qiskit-fermions` moves from 0.1.x to `>=0.3.1,<0.4`. Since 0.2 the preset
+  Jordan–Wigner `Evolution` synthesis no longer simplifies its image, so the SqDRIFT
+  pass manager wraps it in `simplify(jordan_wigner)` (otherwise `method="exact"` fails
+  `PauliEvolutionGate`'s complex-coefficient check). The relabel excitation gather maps
+  each gate's local mode indices through its `qargs`, as `RelabelModes` now does, and
+  the non-contiguous group-weight fallback uses `grouping.group_coeff_means` (the
+  removed `FermionOperator.group_weights()` replacement). Circuits and permutations
+  are bit-identical to 0.1.0 for the same seed (N2 CAS(8o,10e), optimize off, HiGHS
+  and CP-SAT).
+
 ### Added
 - Initial open-source release of `embasi-qiskit-integration`, coupling EmbASI
   projection-based embedding with the Qiskit SQD stack.
@@ -24,16 +35,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `metadata["permutation"]` so the reference determinant is prepared in the
   matching order — relabeling is therefore transparent to `SQDSolver` callers, and
   the SQD energy is unchanged while the circuits get shorter.
-- `canonical_permutation` (default **False**) selects how the mode permutation is
-  obtained. The default applies the MILP solver's own ordering in one pass chain.
-  Setting it True derives the permutation from a fixed candidate set instead
-  (`canonicalize_permutation`), costing a second pass-manager run per randomization
-  but making a seeded build reproducible — which the default is not, because the
-  excitation-span model is degenerate and HiGHS is not a pure function of it
-  (solving one model repeatedly in a single process returned one optimum five times
-  and then a different one; depths 382 vs 368). Since the permutation is undone on
-  the counts, that instability reaches the pooled distribution. Also exposed as
-  `SQDSolver(canonical_permutation=...)`.
+- Relabel permutation cache: the excitation-span model depends only on a draw's
+  sampled excitations, not on `time`, so its permutation is cached by a content hash
+  of the model (in memory, and for a sharded build in a directory shared by the
+  workers, with a per-model lock). A `time` sweep solves each draw once instead of
+  once per time, and all of a draw's circuits share one permutation.
+  `relabel_cache_dir` keeps that directory for reuse across builds. The worker pool
+  is capped at the number of distinct draws when relabeling.
+- CP-SAT relabel backend: `relabel_solver="cpsat"` (the default; `"highs"` keeps the
+  MILP) solves the default objective with OR-Tools CP-SAT, with `cpsat_workers` (default 1)
+  threads per solve and `cpsat_deterministic` (default False) for reproducible
+  interleaved search. On 8 threads it gives far shallower circuits than HiGHS above
+  ~16 modes (2-qubit depth at 64 modes: 448 with HiGHS at 60 s, 232 with CP-SAT at
+  5 s). `ortools` joins the `relabel` extra. Exposed on `build_sqdrift_circuits`,
+  `SQDSolver`, the `solve` CLI and `scripts/embedding_workflow.py`.
+- `per_time_randomization` (default False) seeds each evolution time's qDRIFT draws
+  from a hash of `(seed, i, time)` instead of sharing `seed + i` across times.
+- `relabel_cache` (default True) and `highs_deterministic` (default False) switch
+  the permutation cache off and pin each HiGHS solve to one thread, for reproducing
+  builds made before either change.
+
 - Parallel SqDRIFT generation: `build_sqdrift_circuits(workers=N)` (and
   `SQDSolver(workers=N)` / `--workers`) shards each combination's randomizations
   into contiguous seed-chunks across processes, byte-identical to the sequential
@@ -105,9 +126,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `solve` would sample.
 
 ### Changed
+- **SqDRIFT defaults, every layer** (`build_sqdrift_circuits`, `SQDSolver`, the
+  `solve` CLI, `scripts/embedding_workflow.py`): the sweep is `evolution_time`
+  `[1, 2, 3]` x `num_groups` `[10]` x 500 randomizations (was `1.0` x `15` x
+  500 for the solver layers, `[1, 2, 3]` x `15` x 500 for the builder), so a default
+  run builds **1500 circuits** (was 500) with shallower circuits. Relabeling uses
+  CP-SAT on one thread (`relabel_solver="cpsat"`, `cpsat_workers=1`; was HiGHS), still
+  at 10 s per solve. HiGHS is no longer pinned to one thread (`highs_deterministic=False`). A bare
+  `build_sqdrift_circuits` emits the evolution without the HF reference
+  (`include_initial_state=False`, was True; `SQDSolver` already did), which also
+  turns `filter_trivial` off by default. To rerun an earlier result, pass the
+  previous values explicitly: `--evolution_time 1.0 --num_groups 15
+  --relabel_solver highs --highs_deterministic true --relabel_cache false`.
 - **Behaviour:** `build_sqdrift_circuits` now relabels the modes by default
-  (`optimize=True` when the `relabel` extra is present), matching the reference
-  step, so the generated circuits differ from before — shorter, and sampling in a
+  (`optimize=True` when the `relabel` extra is present), so the generated circuits
+  differ from before — shorter, and sampling in a
   permuted mode order. `SQDSolver` un-permutes transparently, but code that samples
   `build_sqdrift_circuits` output directly must apply `unpermute_counts_list` (or
   pass `optimize=False` for the previous circuits). The gate-for-gate equivalence
@@ -127,6 +160,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `seed_simulator=42`); pass `--seed 42` to reproduce earlier output.
 
 ### Removed
+- `canonical_permutation` and `canonicalize_permutation`: the permutation is now the
+  solver's, cached per draw; use `relabel_solver="cpsat"` with
+  `cpsat_deterministic=True` where reproducibility across builds matters.
 - Three definitions that were never called anywhere: `circuit_run.layout.plot_layout`
   (a gate-map debugging aid that would have raised `ImportError`, since matplotlib is
   not a dependency), `circuit_run.counts.counts_from_pub_result` (a one-line wrapper

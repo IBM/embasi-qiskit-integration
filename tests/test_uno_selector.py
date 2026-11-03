@@ -201,8 +201,8 @@ def test_sqd_takes_the_spin_target_and_evolution_time(monkeypatch):
     assert solver.evolution_time == [3.0]  # a scalar is a one-point sweep
 
     default = EmbeddingWorkflow(**common, selector="uno")._build_solver()
-    assert default.spin_sq is None and default.evolution_time == [1.0]  # unchanged defaults
-    assert default.num_groups == [15]
+    assert default.spin_sq is None and default.evolution_time == [1.0, 2.0, 3.0]
+    assert default.num_groups == [10]
 
     # The sweep axes take lists from the command line.
     monkeypatch.setattr(

@@ -65,7 +65,7 @@ def _group_weights(operator: Any) -> np.ndarray:
     ``|coeff|`` within a group, divided by that group's term count.
 
     It is computed with an explicit ``np.add.at`` / ``np.unique`` reduction rather
-    than read from ``operator.group_weights()``, because the resulting *ordering*
+    than read from ``grouping.group_coeff_means``, because the resulting *ordering*
     has to be reproducible across implementations -- this weight is the tie-breaker
     in :func:`_canonicalize_group_order`'s sort key, so a different-but-equivalent
     weight vector silently permutes the groups a seeded qDRIFT draw lands on.
@@ -73,7 +73,7 @@ def _group_weights(operator: Any) -> np.ndarray:
     The reduction has one failure mode: ``num_groups()`` is the largest label plus
     one, so with a non-contiguous label set the per-label sums and the
     ``np.unique`` counts differ in length and the division raises ``ValueError``
-    (verified). That case falls back to ``group_weights()``, which reports ``0.0``
+    (verified). That case falls back to ``group_coeff_means``, which reports ``0.0``
     for an unused label. The fallback only triggers where the explicit reduction
     cannot produce an answer at all, so it never changes an ordering that the
     reduction could have computed.
@@ -85,7 +85,9 @@ def _group_weights(operator: Any) -> np.ndarray:
     if counts.size == weights.size:
         weights /= counts
         return weights
-    return np.asarray(operator.group_weights())
+    from qiskit_fermions.operators.terms.grouping import group_coeff_means
+
+    return np.asarray(group_coeff_means(operator))
 
 
 def _canonicalize_group_order(operator: Any) -> Any:
@@ -118,7 +120,7 @@ def _canonicalize_group_order(operator: Any) -> Any:
 
     weights = _group_weights(operator)
 
-    # Both ``group_weights()`` and ``split_out_groups()`` are indexed by raw group
+    # Both ``_group_weights`` and ``split_out_groups()`` are indexed by raw group
     # label and length ``num_groups()``, so they line up; unused labels appear as
     # an empty sub-operator with weight 0.0.
     split = operator.split_out_groups()
