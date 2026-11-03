@@ -42,8 +42,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   once per time, and all of a draw's circuits share one permutation.
   `relabel_cache_dir` keeps that directory for reuse across builds. The worker pool
   is capped at the number of distinct draws when relabeling.
-- CP-SAT relabel backend: `relabel_solver="cpsat"` (default `"highs"`) solves the
-  same default objective with OR-Tools CP-SAT, with `cpsat_workers` (default 8)
+- CP-SAT relabel backend: `relabel_solver="cpsat"` (the default; `"highs"` keeps the
+  MILP) solves the default objective with OR-Tools CP-SAT, with `cpsat_workers` (default 1)
   threads per solve and `cpsat_deterministic` (default False) for reproducible
   interleaved search. On 8 threads it gives far shallower circuits than HiGHS above
   ~16 modes (2-qubit depth at 64 modes: 448 with HiGHS at 60 s, 232 with CP-SAT at
@@ -128,15 +128,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 - **SqDRIFT defaults, every layer** (`build_sqdrift_circuits`, `SQDSolver`, the
   `solve` CLI, `scripts/embedding_workflow.py`): the sweep is `evolution_time`
-  `[1, 2, 3]` x `num_groups` `[10, 15, 20]` x 500 randomizations (was `1.0` x `15` x
+  `[1, 2, 3]` x `num_groups` `[10]` x 500 randomizations (was `1.0` x `15` x
   500 for the solver layers, `[1, 2, 3]` x `15` x 500 for the builder), so a default
-  run builds **4500 circuits** (was 500). `time_limit` per relabel solve is 60 s (was
-  10 s). HiGHS is no longer pinned to one thread (`highs_deterministic=False`). A bare
+  run builds **1500 circuits** (was 500) with shallower circuits. Relabeling uses
+  CP-SAT on one thread (`relabel_solver="cpsat"`, `cpsat_workers=1`; was HiGHS), still
+  at 10 s per solve. HiGHS is no longer pinned to one thread (`highs_deterministic=False`). A bare
   `build_sqdrift_circuits` emits the evolution without the HF reference
   (`include_initial_state=False`, was True; `SQDSolver` already did), which also
   turns `filter_trivial` off by default. To rerun an earlier result, pass the
-  previous values explicitly: `--evolution_time 1.0 --num_groups 15 --time_limit 10
-  --highs_deterministic true --relabel_cache false`.
+  previous values explicitly: `--evolution_time 1.0 --num_groups 15
+  --relabel_solver highs --highs_deterministic true --relabel_cache false`.
 - **Behaviour:** `build_sqdrift_circuits` now relabels the modes by default
   (`optimize=True` when the `relabel` extra is present), so the generated circuits
   differ from before — shorter, and sampling in a

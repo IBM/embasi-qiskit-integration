@@ -232,7 +232,7 @@ is accepted by both `solve` and `scripts/embedding_workflow.py`:
 ```bash
 uv run embasi-qiskit-integration solve <jobdir> --sqd_method exact    # one full-evolution circuit per time
 uv run embasi-qiskit-integration solve <jobdir> --sqd_method qdrift \
-    --num_randomizations 500 --num_groups 10,15,20 --evolution_time 1,2,3  # swept ensemble (default)
+    --num_randomizations 500 --num_groups 10 --evolution_time 1,2,3  # swept ensemble (default)
 uv run embasi-qiskit-integration solve <jobdir> --sqd_method qdrift \
     --num_randomizations 100 --num_groups 15 --evolution_time 1.0     # one (time, num_groups) point
 ```
@@ -246,12 +246,12 @@ uv run embasi-qiskit-integration solve <jobdir> --sqd_method qdrift \
   which at a fixed total budget is substantially more accurate than a single deep circuit.
 
 The qDRIFT knobs only bite under `--sqd_method qdrift`: `--num_randomizations` (default
-**500**) is the ensemble size, `--num_groups` (default **10,15,20**) the length of the
+**500**) is the ensemble size, `--num_groups` (default **10**) the length of the
 randomized product inside each circuit, and `--evolution_time` (default **1,2,3**) the
 evolution time. `--evolution_time` and `--num_groups` are lists (`1,2,3`, `'[1, 2, 3]'`
 or a repeated flag; a single value is a one-point list) and are swept as a cartesian
-product. With the defaults a bare `--shots 1000` run submits **4500 circuits** (3 × 3 ×
-500) and builds 1500 relabel solves (the three times share each draw) — narrow the
+product. With the defaults a bare `--shots 1000` run submits **1500 circuits** (3 × 1 ×
+500) and builds 500 relabel solves (the three times share each draw) — narrow the
 sweep, e.g. `--evolution_time 1.0 --num_groups 15 --num_randomizations 100`, before
 pointing it at real hardware.
 
@@ -460,8 +460,9 @@ model is solved by one worker while the others wait for it;
 solves (safe to delete). When a time limit leaves the optimum unproven, the first
 permutation found is kept for every time.
 
-Each solve is capped at `time_limit` seconds (default 60) and with HiGHS typically
-runs to it, so relabeling dominates an SQD solve. Under noiseless Aer it buys
+Each solve is capped at `time_limit` seconds (default 10); above ~16 modes neither
+backend proves the optimum and the solve runs to the limit, so relabeling dominates an
+SQD solve. Under noiseless Aer it buys
 nothing — on N2 CAS(8o,10e), 40 circuits took 405 s with it and 5 s without (at a
 10 s limit), at the same energy — so pass `--optimize False` there, and keep it on
 for hardware. HiGHS picks its own threading; `highs_deterministic=True` pins each
@@ -474,7 +475,8 @@ from `(seed, i, time)`, so every time is its own sample (more independent circui
 and no cross-time cache hits). It changes the seeds even for a single-time run. The
 default `False` keeps the `seed + i` draws.
 
-**`relabel_solver="cpsat"`** solves the same default objective with OR-Tools CP-SAT.
+**`relabel_solver="cpsat"`** (the default; `"highs"` is the MILP through pyomo +
+HiGHS) solves the default objective with OR-Tools CP-SAT.
 At about 16 modes it proves the optimum in under a second, where HiGHS needs 30–60 s
 to match it. Above that neither solver proves the optimum within a minute, and
 CP-SAT's edge comes from its parallel search: on 8 threads it gives far shallower
@@ -488,9 +490,9 @@ relabeling, real qDRIFT draws (`num_groups=20`), mean of 3:
 | 64    | 1547       | 813       | 448        | 632                  | 232                  |
 | 120   | 2706       | 1485      | 736        | 688                  | 271                  |
 
-`cpsat_workers` (default 8) is its thread count per solve, and multiplies with
-`workers`, so give CP-SAT its threads by lowering `workers` (to about cores /
-`cpsat_workers`). With `workers` near the core count each solve effectively runs on
+`cpsat_workers` (default 1) is its thread count per solve, and multiplies with
+`workers`. On a large active space give CP-SAT more threads, lowering `workers` to
+about cores / `cpsat_workers`. With `workers` near the core count each solve effectively runs on
 one thread, where CP-SAT has no advantage.
 
 ```python

@@ -159,8 +159,8 @@ def test_workflow_forwards_circuit_construction_flags(monkeypatch):
     common = {"solver": "sqd", "sampler": "aer", "aer_method": "statevector"}
     monkeypatch.setattr(sys, "argv", ["prog"])
     default = EmbeddingWorkflow(**common)._build_solver()
-    assert (default.optimize, default.time_limit, default.workers) == (True, 60.0, 1)
-    assert (default.relabel_solver, default.cpsat_workers) == ("highs", 8)
+    assert (default.optimize, default.time_limit, default.workers) == (True, 10.0, 1)
+    assert (default.relabel_solver, default.cpsat_workers) == ("cpsat", 1)
     assert (default.cpsat_deterministic, default.per_time_randomization) == (False, False)
     assert (default.relabel_cache, default.highs_deterministic) == (True, False)
 

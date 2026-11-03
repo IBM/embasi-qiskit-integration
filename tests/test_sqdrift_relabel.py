@@ -506,13 +506,13 @@ def test_cpsat_without_ortools_is_refused(monkeypatch, n2_ham):
     with pytest.raises(ValueError, match="unknown relabel_solver"):
         build_sqdrift_circuits(n2_ham, relabel_solver="gurobi")
     with pytest.raises(ValueError, match="cpsat_workers"):
-        build_sqdrift_circuits(n2_ham, cpsat_workers=0)
+        build_sqdrift_circuits(n2_ham, relabel_solver="highs", cpsat_workers=0)
 
 
 def test_defaults():
     """Every layer defaults to the same SqDRIFT generation settings: the full sweep (3
-    times x 3 group counts x 500), 60 s per relabel solve on HiGHS with its own
-    threading, cached permutations, shared draws, and bare circuits from the builder."""
+    times x one group count of 10 x 500), 10 s per relabel solve on single-threaded
+    CP-SAT, HiGHS (when chosen) with its own threading, cached permutations, shared draws, and bare circuits from the builder."""
     import inspect
 
     from embasi_qiskit_integration.circuit_generator.relabel import NativeHighsSolverAdapter
@@ -522,20 +522,20 @@ def test_defaults():
 
     builder = inspect.signature(build_sqdrift_circuits).parameters
     assert tuple(builder["time"].default) == (1.0, 2.0, 3.0)
-    assert tuple(builder["num_groups"].default) == (10, 15, 20)
+    assert tuple(builder["num_groups"].default) == (10,)
     assert builder["seed"].default == 42
     assert builder["include_initial_state"].default is False
     assert builder["filter_trivial"].default is None  # follows include_initial_state
 
     solver = inspect.signature(SQDSolver.__init__).parameters
     assert tuple(solver["evolution_time"].default) == (1.0, 2.0, 3.0)
-    assert tuple(solver["num_groups"].default) == (10, 15, 20)
+    assert tuple(solver["num_groups"].default) == (10,)
 
     for params in (builder, solver):
         assert params["num_randomizations"].default == 500
-        assert params["time_limit"].default == 60.0
-        assert params["relabel_solver"].default == "highs"
-        assert params["cpsat_workers"].default == 8
+        assert params["time_limit"].default == 10.0
+        assert params["relabel_solver"].default == "cpsat"
+        assert params["cpsat_workers"].default == 1
         assert params["cpsat_deterministic"].default is False
         assert params["per_time_randomization"].default is False
         assert params["relabel_cache"].default is True
@@ -544,11 +544,11 @@ def test_defaults():
     for model in (SolveCommand, EmbeddingWorkflow):
         fields = model.model_fields
         assert fields["evolution_time"].default == [1.0, 2.0, 3.0]
-        assert fields["num_groups"].default == [10, 15, 20]
+        assert fields["num_groups"].default == [10]
         assert fields["num_randomizations"].default == 500
-        assert fields["time_limit"].default == 60.0
-        assert fields["relabel_solver"].default == "highs"
-        assert fields["cpsat_workers"].default == 8
+        assert fields["time_limit"].default == 10.0
+        assert fields["relabel_solver"].default == "cpsat"
+        assert fields["cpsat_workers"].default == 1
         assert fields["cpsat_deterministic"].default is False
         assert fields["per_time_randomization"].default is False
         assert fields["relabel_cache"].default is True

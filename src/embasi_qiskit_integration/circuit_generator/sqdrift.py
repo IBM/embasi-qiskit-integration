@@ -136,7 +136,7 @@ def build_sqdrift_circuits(
     ham: EmbeddedHamiltonian,
     *,
     method: str = "qdrift",
-    num_groups: int | Sequence[int] = (10, 15, 20),
+    num_groups: int | Sequence[int] = (10,),
     num_randomizations: int = 500,
     time: float | Sequence[float] = (1.0, 2.0, 3.0),
     filter_diagonal_terms: bool = True,
@@ -146,9 +146,9 @@ def build_sqdrift_circuits(
     measure: bool = True,
     include_initial_state: bool = False,
     optimize: bool = True,
-    time_limit: float = 60.0,
-    relabel_solver: str = "highs",
-    cpsat_workers: int = 8,
+    time_limit: float = 10.0,
+    relabel_solver: str = "cpsat",
+    cpsat_workers: int = 1,
     cpsat_deterministic: bool = False,
     per_time_randomization: bool = False,
     relabel_cache_dir: str | Path | None = None,
@@ -163,11 +163,12 @@ def build_sqdrift_circuits(
     the reference state (``metadata["initial_state_included"]`` is False), unless
     ``include_initial_state=True`` bakes the HF reference in.
 
-    Defaults are ``time`` ``[1.0, 2.0, 3.0]``, ``num_groups`` ``[10, 15, 20]``,
-    ``num_randomizations`` 500, ``seed`` 42, ``optimize`` True, ``time_limit`` 60 s,
-    so a bare ``method="qdrift"`` call produces **4500 circuits** (3 times x 3
-    group-counts x 500 randomizations). With shared draws the three times cost one
-    relabel solve per draw, but each group count is its own draw. Narrow the axes for
+    Defaults are ``time`` ``[1.0, 2.0, 3.0]``, ``num_groups`` ``[10]``,
+    ``num_randomizations`` 500, ``seed`` 42, ``optimize`` True, ``relabel_solver``
+    ``"cpsat"`` on one thread, ``time_limit`` 10 s, so a bare ``method="qdrift"`` call
+    produces **1500 circuits** (3 times x 500 randomizations) at a shallow depth. With
+    shared draws the three times cost one relabel solve per draw; each extra group
+    count is its own draw. Narrow the axes for
     a smaller budget; ``SQDSolver`` (and the CLI and embedding workflow) use the same
     defaults and pass their own ``evolution_time`` x ``num_groups`` sweep through.
 
@@ -234,19 +235,20 @@ def build_sqdrift_circuits(
             cached by that model's content: a draw shared across times is solved
             once and gets the same permutation at every time.
         time_limit: wall-clock limit (seconds) per relabel solve, for either
-            ``relabel_solver`` (``0`` = no limit; default 60, as in ``SQDSolver``
+            ``relabel_solver`` (``0`` = no limit; default 10, as in ``SQDSolver``
             and the CLIs). A draw whose solve finds no feasible permutation in time
             is kept unpermuted. It is part of
             the cache key, since it can change the answer.
-        relabel_solver: ``"highs"`` (default; the MILP through pyomo + HiGHS) or
-            ``"cpsat"`` (the same default objective solved with OR-Tools CP-SAT).
+        relabel_solver: ``"cpsat"`` (default; the default objective solved with
+            OR-Tools CP-SAT) or ``"highs"`` (the MILP through pyomo + HiGHS).
             CP-SAT proves the optimum in under a second at ~16 modes; above that
             neither proves it within a minute, and CP-SAT's parallel search
             (``cpsat_workers``) gives far shallower circuits than HiGHS in the same
             time limit. On a single thread it is no better than HiGHS.
-        cpsat_workers: CP-SAT search threads per solve (default 8). They multiply
-            with ``workers``; CP-SAT's advantage comes from this parallel search, so
-            lower ``workers`` (to about cores / ``cpsat_workers``) rather than this.
+        cpsat_workers: CP-SAT search threads per solve (default 1). They multiply
+            with ``workers``; CP-SAT's advantage above ~16 modes comes from parallel
+            search, so on a large active space raise this (and lower ``workers`` to
+            about cores / ``cpsat_workers``).
         cpsat_deterministic: make ``relabel_solver="cpsat"`` reproducible run to run
             (interleaved search). With several ``cpsat_workers`` CP-SAT's workers
             race, so a model with several equally good orderings returns a different
@@ -440,8 +442,8 @@ class _BuildSpec:
     include_initial_state: bool
     optimize: bool
     time_limit: float
-    relabel_solver: str = "highs"
-    cpsat_workers: int = 8
+    relabel_solver: str = "cpsat"
+    cpsat_workers: int = 1
     cpsat_deterministic: bool = False
     per_time_randomization: bool = False
     relabel_cache_dir: str | None = None
