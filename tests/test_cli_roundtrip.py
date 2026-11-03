@@ -109,6 +109,8 @@ def test_documented_cli_flags_are_accepted(tmp_path):
         ["--cpsat_workers", "4"],
         ["--cpsat_deterministic", "true"],
         ["--per_time_randomization", "true"],
+        ["--relabel_cache", "false"],
+        ["--highs_deterministic", "true"],
         ["--workers", "0"],
         ["--shots", "1000"],
         ["--seed", "24"],

@@ -144,7 +144,7 @@ def build_sqdrift_circuits(
     atol: float = 1e-16,
     seed: int | None = 42,
     measure: bool = True,
-    include_initial_state: bool = True,
+    include_initial_state: bool = False,
     optimize: bool = True,
     time_limit: float = 60.0,
     relabel_solver: str = "highs",
@@ -152,13 +152,16 @@ def build_sqdrift_circuits(
     cpsat_deterministic: bool = False,
     per_time_randomization: bool = False,
     relabel_cache_dir: str | Path | None = None,
+    relabel_cache: bool = True,
+    highs_deterministic: bool = False,
     workers: int = 1,
 ) -> SqdriftBuildResult:
     """Build SqDRIFT sampling circuits for ``ham``.
 
     Each circuit is a :class:`qiskit.QuantumCircuit` on ``2 * ham.norb`` qubits
-    carrying the Hamiltonian time-evolution, preceded by the HF reference unless
-    ``include_initial_state=False``.
+    carrying the Hamiltonian time-evolution from the vacuum; the run stage prepends
+    the reference state (``metadata["initial_state_included"]`` is False), unless
+    ``include_initial_state=True`` bakes the HF reference in.
 
     Defaults are ``time`` ``[1.0, 2.0, 3.0]``, ``num_groups`` ``[10, 15, 20]``,
     ``num_randomizations`` 500, ``seed`` 42, ``optimize`` True, ``time_limit`` 60 s,
@@ -210,8 +213,8 @@ def build_sqdrift_circuits(
             ``None`` leaves everything unseeded (non-reproducible), and disables
             sharding since the draws are then not addressable by index.
         measure: append ``measure_all()`` to each circuit.
-        include_initial_state: prepare the HF reference inside the circuit
-            (default). ``False`` emits the bare evolution, leaving the reference
+        include_initial_state: prepare the HF reference inside the circuit.
+            ``False`` (default) emits the bare evolution, leaving the reference
             state to the run stage; either way the choice is recorded in
             ``metadata["initial_state_included"]``.
         optimize: append ``RelabelModes`` to the pass chain (default True),
@@ -262,6 +265,14 @@ def build_sqdrift_circuits(
             and across repeated builds. ``None`` (default) uses a temporary
             directory for a sharded build (removed afterwards) and the in-process
             cache only for a sequential one. Safe to delete.
+        relabel_cache: cache each model's permutation (default True). ``False`` solves
+            every circuit afresh, as without the cache: circuits of one draw at
+            different times may then get different (tied) permutations, and a
+            sharded build is not capped at the distinct-draw count.
+        highs_deterministic: pin each HiGHS solve to one thread with its concurrent
+            MIP mode off (default False: HiGHS picks its own threading). Pinning
+            narrows, but does not remove, run-to-run variation in which tied optimum
+            HiGHS returns. Inert with ``relabel_solver="cpsat"``.
         workers: processes to shard the randomizations across. ``1`` (default)
             builds in-process. Higher values split each combination's
             randomizations into contiguous seed-chunks, one per worker, and build
@@ -339,6 +350,8 @@ def build_sqdrift_circuits(
         cpsat_deterministic=bool(cpsat_deterministic),
         per_time_randomization=bool(per_time_randomization),
         relabel_cache_dir=None if relabel_cache_dir is None else str(relabel_cache_dir),
+        relabel_cache=bool(relabel_cache),
+        highs_deterministic=bool(highs_deterministic),
     )
 
     if method == "exact":
@@ -367,7 +380,7 @@ def build_sqdrift_circuits(
         combos, rand_range = tasks[0]
         return _build_chunk(spec, combos, rand_range)
 
-    if spec.optimize and spec.relabel_cache_dir is None:
+    if spec.optimize and spec.relabel_cache and spec.relabel_cache_dir is None:
         # Workers solving the same draw (one per time) share their permutations
         # through this directory, so each distinct model is solved once.
         with tempfile.TemporaryDirectory(prefix="sqdrift-relabel-") as cache_dir:
@@ -432,6 +445,8 @@ class _BuildSpec:
     cpsat_deterministic: bool = False
     per_time_randomization: bool = False
     relabel_cache_dir: str | None = None
+    relabel_cache: bool = True
+    highs_deterministic: bool = False
 
 
 def _plan_tasks(
@@ -503,7 +518,7 @@ def _build_parallel(
     """
     build_fn = build_fn or _build_chunk
     effective_workers = min(_resolve_workers(workers), len(tasks))
-    if spec.optimize:
+    if spec.optimize and spec.relabel_cache:
         # With relabeling the solves dominate and each distinct draw is solved once
         # (the permutation cache and its lock): a worker beyond the draw count would
         # only wait on another's solve.
@@ -776,11 +791,14 @@ def _build_chunk(
         """The caching ``RelabelModes`` for one draw (see :mod:`.relabel`)."""
         return make_caching_relabel_modes(
             backend=spec.relabel_solver,
-            solver=NativeHighsSolverAdapter(time_limit=spec.time_limit),
+            solver=NativeHighsSolverAdapter(
+                time_limit=spec.time_limit, deterministic=spec.highs_deterministic
+            ),
             time_limit=spec.time_limit,
             cpsat_workers=spec.cpsat_workers,
             cpsat_deterministic=spec.cpsat_deterministic,
             cache_dir=spec.relabel_cache_dir,
+            cache=spec.relabel_cache,
         )
 
     def _build_one(n_groups: int, draw_seed: int | None, evolution_time: float) -> Any:

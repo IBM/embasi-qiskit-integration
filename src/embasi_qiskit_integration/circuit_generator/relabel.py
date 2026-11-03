@@ -92,7 +92,7 @@ class NativeHighsSolverAdapter:
     whole batch.
     """
 
-    def __init__(self, time_limit: float | None = None, deterministic: bool = True) -> None:
+    def __init__(self, time_limit: float | None = None, deterministic: bool = False) -> None:
         """Configure each solve.
 
         Args:
@@ -100,15 +100,14 @@ class NativeHighsSolverAdapter:
                 means no limit. A solve that hits it without a feasible point yields
                 no permutation, and the circuit is kept unpermuted.
             deterministic: pin HiGHS to a single thread and disable its concurrent
-                MIP mode (default). The excitation-span MILP is highly degenerate,
-                so which optimum comes back is not determined by the model alone;
-                pinning the threads removes the load-dependent part of that. It
-                does not make HiGHS a pure function of its input (repeated solves
-                of one model in one process were seen to differ), which is why the
-                permutation is cached per model (:func:`make_caching_relabel_modes`)
-                rather than re-solved for every circuit that shares it.
-
-                Set False to let HiGHS parallelize an individual solve.
+                MIP mode. Off by default (HiGHS chooses its own threading). The
+                excitation-span MILP is highly degenerate, so which optimum comes back
+                is not determined by the model alone; pinning the threads removes the
+                load-dependent part of that. It does not make HiGHS a pure function of
+                its input (repeated solves of one model in one process were seen to
+                differ), which is why the permutation is cached per model
+                (:func:`make_caching_relabel_modes`) rather than re-solved for every
+                circuit that shares it.
         """
         self._time_limit = time_limit
         self._deterministic = deterministic
@@ -418,6 +417,7 @@ def _caching_relabel_modes_class() -> type:
             cpsat_workers: int = 8,
             cpsat_deterministic: bool = False,
             cache_dir: str | Path | None = None,
+            cache: bool = True,
             **kwargs: Any,
         ) -> None:
             if backend not in RELABEL_SOLVERS:
@@ -431,7 +431,8 @@ def _caching_relabel_modes_class() -> type:
             self.time_limit = float(time_limit)
             self.cpsat_workers = int(cpsat_workers)
             self.cpsat_deterministic = bool(cpsat_deterministic)
-            self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+            self.cache = bool(cache)
+            self.cache_dir = Path(cache_dir) if (cache and cache_dir is not None) else None
 
         def _spec(self) -> dict[str, Any]:
             """The solver identity that enters the cache key."""
@@ -442,6 +443,8 @@ def _caching_relabel_modes_class() -> type:
                 spec["ortools"] = importlib.metadata.version("ortools")
             else:
                 spec["solver"] = type(self.solver).__name__
+                # The adapter's threading can change which tied optimum comes back.
+                spec["solver_deterministic"] = bool(getattr(self.solver, "_deterministic", False))
                 spec["objective"] = self._model_kwargs.get("objective", "multi")
                 spec["mix_delta"] = float(self._model_kwargs.get("mix_delta", 0.1))
             return spec
@@ -453,6 +456,21 @@ def _caching_relabel_modes_class() -> type:
 
             excitations, num_modes = _gather_excitations(dag)
             i2, i4 = _model_terms(excitations)
+            if not self.cache:
+                # Solve every circuit afresh: nothing is read from or written to a cache.
+                if self.backend == "highs":
+                    return super().find_permutation(dag)
+                permutation, _ = _solve_cpsat(
+                    i2,
+                    i4,
+                    num_modes,
+                    time_limit=self.time_limit,
+                    workers=self.cpsat_workers,
+                    deterministic=self.cpsat_deterministic,
+                )
+                if permutation is None or not _is_permutation(permutation, num_modes):
+                    return None, None
+                return list(permutation), None
             key = _excitation_key(i2, i4, num_modes, self._spec())
 
             cached = _PERMUTATION_CACHE.get(key)
@@ -505,7 +523,8 @@ def make_caching_relabel_modes(**kwargs: Any) -> Any:
     (``"highs"`` or ``"cpsat"``), ``time_limit`` (seconds per solve, ``0`` = none; part of
     the cache key), ``cpsat_workers`` (CP-SAT threads per solve), ``cpsat_deterministic``
     (reproducible interleaved CP-SAT search), ``cache_dir`` (disk cache shared across
-    processes; ``None`` keeps it in memory). Any other keyword goes to the model builder
-    (HiGHS only).
+    processes; ``None`` keeps it in memory), ``cache`` (``False`` solves every circuit
+    afresh, bypassing both caches). Any other keyword goes to the model builder (HiGHS
+    only).
     """
     return _caching_relabel_modes_class()(**kwargs)

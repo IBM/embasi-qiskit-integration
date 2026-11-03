@@ -40,6 +40,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `SQDSolver`, the `solve` CLI and `scripts/embedding_workflow.py`.
 - `per_time_randomization` (default False) seeds each evolution time's qDRIFT draws
   from a hash of `(seed, i, time)` instead of sharing `seed + i` across times.
+- `relabel_cache` (default True) and `highs_deterministic` (default False) switch
+  the permutation cache off and pin each HiGHS solve to one thread, for reproducing
+  builds made before either change.
 
 - Parallel SqDRIFT generation: `build_sqdrift_circuits(workers=N)` (and
   `SQDSolver(workers=N)` / `--workers`) shards each combination's randomizations
@@ -112,14 +115,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `solve` would sample.
 
 ### Changed
-- `build_sqdrift_circuits` defaults to the full sweep, `num_groups` `[10, 15, 20]`
-  (was 15) and `time_limit` 60 s (was 10 s), so a bare `method="qdrift"` call builds
-  4500 circuits (was 1500). `SQDSolver`, the `solve` CLI and
-  `scripts/embedding_workflow.py` keep their one-point sweep (`evolution_time` 1.0,
-  `num_groups` 15) and `time_limit` 10 s, so runs driven through them are unchanged.
+- **SqDRIFT defaults, every layer** (`build_sqdrift_circuits`, `SQDSolver`, the
+  `solve` CLI, `scripts/embedding_workflow.py`): the sweep is `evolution_time`
+  `[1, 2, 3]` x `num_groups` `[10, 15, 20]` x 500 randomizations (was `1.0` x `15` x
+  500 for the solver layers, `[1, 2, 3]` x `15` x 500 for the builder), so a default
+  run builds **4500 circuits** (was 500). `time_limit` per relabel solve is 60 s (was
+  10 s). HiGHS is no longer pinned to one thread (`highs_deterministic=False`). A bare
+  `build_sqdrift_circuits` emits the evolution without the HF reference
+  (`include_initial_state=False`, was True; `SQDSolver` already did), which also
+  turns `filter_trivial` off by default. To rerun an earlier result, pass the
+  previous values explicitly: `--evolution_time 1.0 --num_groups 15 --time_limit 10
+  --highs_deterministic true --relabel_cache false`.
 - **Behaviour:** `build_sqdrift_circuits` now relabels the modes by default
-  (`optimize=True` when the `relabel` extra is present), matching the reference
-  step, so the generated circuits differ from before — shorter, and sampling in a
+  (`optimize=True` when the `relabel` extra is present), so the generated circuits
+  differ from before — shorter, and sampling in a
   permuted mode order. `SQDSolver` un-permutes transparently, but code that samples
   `build_sqdrift_circuits` output directly must apply `unpermute_counts_list` (or
   pass `optimize=False` for the previous circuits). The gate-for-gate equivalence

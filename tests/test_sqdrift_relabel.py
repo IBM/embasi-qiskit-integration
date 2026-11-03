@@ -510,39 +510,135 @@ def test_cpsat_without_ortools_is_refused(monkeypatch, n2_ham):
 
 
 def test_defaults():
-    """The generator's own defaults are the full sweep (3 times x 3 group counts x 500,
-    60 s per solve); the solver layers keep their one-point sweep and 10 s limit, which
-    runs driven by SQDSolver, the solve CLI and the embedding workflow rely on."""
+    """Every layer defaults to the same SqDRIFT generation settings: the full sweep (3
+    times x 3 group counts x 500), 60 s per relabel solve on HiGHS with its own
+    threading, cached permutations, shared draws, and bare circuits from the builder."""
     import inspect
 
+    from embasi_qiskit_integration.circuit_generator.relabel import NativeHighsSolverAdapter
     from embasi_qiskit_integration.cli import SolveCommand
     from embasi_qiskit_integration.embedding import EmbeddingWorkflow
     from embasi_qiskit_integration.solvers import SQDSolver
 
     builder = inspect.signature(build_sqdrift_circuits).parameters
-    assert builder["time"].default == (1.0, 2.0, 3.0)
+    assert tuple(builder["time"].default) == (1.0, 2.0, 3.0)
     assert tuple(builder["num_groups"].default) == (10, 15, 20)
-    assert builder["num_randomizations"].default == 500
     assert builder["seed"].default == 42
-    assert builder["time_limit"].default == 60.0
+    assert builder["include_initial_state"].default is False
+    assert builder["filter_trivial"].default is None  # follows include_initial_state
 
     solver = inspect.signature(SQDSolver.__init__).parameters
-    assert solver["evolution_time"].default == 1.0
-    assert solver["num_groups"].default == 15
-    assert solver["num_randomizations"].default == 500
-    assert solver["time_limit"].default == 10.0
-    for model in (SolveCommand, EmbeddingWorkflow):
-        fields = model.model_fields
-        assert fields["time_limit"].default == 10.0
-        assert fields["evolution_time"].default == [1.0]
-        assert fields["num_groups"].default == [15]
-        assert fields["num_randomizations"].default == 500
+    assert tuple(solver["evolution_time"].default) == (1.0, 2.0, 3.0)
+    assert tuple(solver["num_groups"].default) == (10, 15, 20)
 
     for params in (builder, solver):
+        assert params["num_randomizations"].default == 500
+        assert params["time_limit"].default == 60.0
         assert params["relabel_solver"].default == "highs"
         assert params["cpsat_workers"].default == 8
         assert params["cpsat_deterministic"].default is False
         assert params["per_time_randomization"].default is False
+        assert params["relabel_cache"].default is True
+        assert params["highs_deterministic"].default is False
+
+    for model in (SolveCommand, EmbeddingWorkflow):
+        fields = model.model_fields
+        assert fields["evolution_time"].default == [1.0, 2.0, 3.0]
+        assert fields["num_groups"].default == [10, 15, 20]
+        assert fields["num_randomizations"].default == 500
+        assert fields["time_limit"].default == 60.0
+        assert fields["relabel_solver"].default == "highs"
+        assert fields["cpsat_workers"].default == 8
+        assert fields["cpsat_deterministic"].default is False
+        assert fields["per_time_randomization"].default is False
+        assert fields["relabel_cache"].default is True
+        assert fields["highs_deterministic"].default is False
+
+    adapter = inspect.signature(NativeHighsSolverAdapter.__init__).parameters
+    assert adapter["deterministic"].default is False
+
+
+@requires_relabel
+def test_highs_deterministic_reaches_the_adapter_and_the_cache_key(monkeypatch, n2_ham):
+    """highs_deterministic pins the adapter's threads, and keys its own cache entry."""
+    from embasi_qiskit_integration.circuit_generator import sqdrift
+
+    seen = []
+    real = sqdrift.NativeHighsSolverAdapter
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("deterministic"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sqdrift, "NativeHighsSolverAdapter", spy)
+    for flag in (False, True):
+        build_sqdrift_circuits(n2_ham, **{**_SWEEP, "time": 1.0}, highs_deterministic=flag)
+    assert set(seen) == {False, True}
+
+    def spec(deterministic: bool) -> dict:
+        return make_caching_relabel_modes(
+            solver=NativeHighsSolverAdapter(deterministic=deterministic)
+        )._spec()
+
+    assert spec(True) != spec(False)
+
+
+@requires_relabel
+def test_relabel_cache_off_solves_every_circuit(monkeypatch, n2_ham, tmp_path):
+    """relabel_cache=False: one solve per circuit, nothing cached in memory or on disk."""
+    calls = _counting(monkeypatch)
+    result = build_sqdrift_circuits(
+        n2_ham, **_SWEEP, relabel_cache=False, relabel_cache_dir=tmp_path
+    )
+    assert len(calls) == 6
+    assert relabel._PERMUTATION_CACHE == {}
+    assert list(tmp_path.iterdir()) == []
+    assert all(p is not None for p in result.permutations)
+
+
+@requires_cpsat
+def test_relabel_cache_off_also_applies_to_cpsat(monkeypatch):
+    """The cpsat backend honours cache=False too."""
+    calls = _counting(monkeypatch)
+    dag = _dag(8, _sparse_excitations(8))
+    relabel_pass = make_caching_relabel_modes(backend="cpsat", cpsat_workers=2, cache=False)
+    first = relabel_pass.find_permutation(dag)[0]
+    second = relabel_pass.find_permutation(dag)[0]
+    assert len(calls) == 2 and first is not None and second is not None
+    assert relabel._PERMUTATION_CACHE == {}
+
+
+def test_worker_cap_is_off_without_the_cache(monkeypatch):
+    """Without the cache every circuit is its own solve, so only the task cap applies."""
+    from concurrent.futures import Future
+
+    from embasi_qiskit_integration.circuit_generator import sqdrift
+    from embasi_qiskit_integration.circuit_generator.sqdrift import (
+        SqdriftBuildResult,
+        _build_parallel,
+    )
+
+    seen: dict[str, int] = {}
+
+    class FakePool:
+        def __init__(self, max_workers, **_):
+            seen["max_workers"] = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def submit(self, *_):
+            future: Future = Future()
+            future.set_result(SqdriftBuildResult())
+            return future
+
+    monkeypatch.setattr(sqdrift, "ProcessPoolExecutor", FakePool)
+    tasks = _plan_tasks([1.0, 2.0, 3.0], [20], 2, 8, 42)
+    _build_parallel(_spec(relabel_cache=False), tasks, 8)
+    assert seen["max_workers"] == 6
 
 
 # Through the builder -------------------------------------------------------------------

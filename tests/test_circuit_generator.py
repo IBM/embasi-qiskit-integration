@@ -210,7 +210,9 @@ def test_sqdrift_rejects_empty_sweep_axes(n2_ham):
 def test_sqdrift_exact_spans_ci_space(n2_ham):
     """The exact-evolution ansatz samples many determinants at the right
     Hamming weights (this is what feeds SQD)."""
-    circuits = build_sqdrift_circuits(n2_ham, method="exact", time=1.0, optimize=False)
+    circuits = build_sqdrift_circuits(
+        n2_ham, method="exact", time=1.0, include_initial_state=True, optimize=False
+    )
     tqc = transpile(circuits[0], AerSimulator(), optimization_level=0)
     counts = AerSampler().sample(tqc, shots=20_000, seed=1)
     norb = n2_ham.norb
@@ -341,12 +343,14 @@ def test_filter_trivial_is_separate_from_filter_diagonal_terms(n2_ham):
     the option reaches the pass.
     """
     # optimize=False: this test compares gate signatures, and mode relabeling would
-    # change them for reasons unrelated to the two filters under test.
+    # change them for reasons unrelated to the two filters under test. The reference
+    # state is baked in, since filter_trivial can only see the occupation through it.
     kwargs = {
         "method": "qdrift",
         "num_groups": 10,
         "num_randomizations": 1,
         "seed": 42,
+        "include_initial_state": True,
         "optimize": False,
     }
 
@@ -401,10 +405,10 @@ def test_filter_trivial_defaults_to_where_occupation_is_visible(n2_ham):
 @requires_fermions
 def test_sqdrift_records_initial_state_flag(n2_ham):
     """The metadata flag tells the run stage whether a prep is still needed."""
-    baked = build_sqdrift_circuits(n2_ham, method="exact", optimize=False)
-    bare = build_sqdrift_circuits(
-        n2_ham, method="exact", include_initial_state=False, optimize=False
+    baked = build_sqdrift_circuits(
+        n2_ham, method="exact", include_initial_state=True, optimize=False
     )
+    bare = build_sqdrift_circuits(n2_ham, method="exact", optimize=False)
     assert baked[0].metadata["initial_state_included"] is True
     assert bare[0].metadata["initial_state_included"] is False
 
@@ -430,7 +434,9 @@ def test_bare_core_plus_hf_prep_equals_initialize_modes(n2_ham):
         resolve_initial_state,
     )
 
-    baked = build_sqdrift_circuits(n2_ham, method="exact", time=1.0, seed=42, optimize=False)[0]
+    baked = build_sqdrift_circuits(
+        n2_ham, method="exact", time=1.0, seed=42, include_initial_state=True, optimize=False
+    )[0]
     core = build_sqdrift_circuits(
         n2_ham,
         method="exact",

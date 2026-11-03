@@ -232,9 +232,9 @@ is accepted by both `solve` and `scripts/embedding_workflow.py`:
 ```bash
 uv run embasi-qiskit-integration solve <jobdir> --sqd_method exact    # one full-evolution circuit per time
 uv run embasi-qiskit-integration solve <jobdir> --sqd_method qdrift \
-    --num_randomizations 500 --num_groups 15 --evolution_time 1.0     # randomized ensemble (default)
+    --num_randomizations 500 --num_groups 10,15,20 --evolution_time 1,2,3  # swept ensemble (default)
 uv run embasi-qiskit-integration solve <jobdir> --sqd_method qdrift \
-    --num_randomizations 100 --num_groups 10,15,20 --evolution_time 1,2,3  # swept and pooled
+    --num_randomizations 100 --num_groups 15 --evolution_time 1.0     # one (time, num_groups) point
 ```
 
 - `exact` synthesises **one** exact time-evolution circuit per `--evolution_time`. Deepest
@@ -246,13 +246,14 @@ uv run embasi-qiskit-integration solve <jobdir> --sqd_method qdrift \
   which at a fixed total budget is substantially more accurate than a single deep circuit.
 
 The qDRIFT knobs only bite under `--sqd_method qdrift`: `--num_randomizations` (default
-**500**) is the ensemble size, `--num_groups` (default **15**) the length of the
-randomized product inside each circuit, and `--evolution_time` (default **1.0**) the
+**500**) is the ensemble size, `--num_groups` (default **10,15,20**) the length of the
+randomized product inside each circuit, and `--evolution_time` (default **1,2,3**) the
 evolution time. `--evolution_time` and `--num_groups` are lists (`1,2,3`, `'[1, 2, 3]'`
 or a repeated flag; a single value is a one-point list) and are swept as a cartesian
-product. Since the default is `qdrift` at 500 randomizations, a bare
-`--shots 1000` run submits 500 circuits — cut `--num_randomizations` before pointing it
-at real hardware.
+product. With the defaults a bare `--shots 1000` run submits **4500 circuits** (3 × 3 ×
+500) and builds 1500 relabel solves (the three times share each draw) — narrow the
+sweep, e.g. `--evolution_time 1.0 --num_groups 15 --num_randomizations 100`, before
+pointing it at real hardware.
 
 **Error suppression (runtime sampler only).** `--measure_twirling` defaults to
 **true** here — unlike bare `SamplerV2`, because a bare `solve` targets hardware
@@ -459,13 +460,14 @@ model is solved by one worker while the others wait for it;
 solves (safe to delete). When a time limit leaves the optimum unproven, the first
 permutation found is kept for every time.
 
-Each solve is capped at `time_limit` seconds — 10 for `SQDSolver`, the `solve` CLI
-and `scripts/embedding_workflow.py`; 60 for a bare `build_sqdrift_circuits` — and with
-HiGHS typically runs to it, so relabeling dominates an SQD solve. Under noiseless Aer
-it buys nothing — on N2 CAS(8o,10e), 40 circuits took 405 s with it and 5 s without,
-at the same energy — so pass `--optimize False` there, and keep it on for hardware.
-On larger active spaces `--time_limit 60` gives HiGHS room to find shallower
-orderings.
+Each solve is capped at `time_limit` seconds (default 60) and with HiGHS typically
+runs to it, so relabeling dominates an SQD solve. Under noiseless Aer it buys
+nothing — on N2 CAS(8o,10e), 40 circuits took 405 s with it and 5 s without (at a
+10 s limit), at the same energy — so pass `--optimize False` there, and keep it on
+for hardware. HiGHS picks its own threading; `highs_deterministic=True` pins each
+solve to one thread, which narrows (but does not remove) the run-to-run variation in
+which tied optimum it returns. `relabel_cache=False` turns the permutation cache off
+and solves every circuit afresh.
 
 **`per_time_randomization=True`** draws each time independently, from a seed hashed
 from `(seed, i, time)`, so every time is its own sample (more independent circuits,

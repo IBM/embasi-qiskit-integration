@@ -310,8 +310,8 @@ class SQDSolver(ActiveSpaceSolver):
         shots: int = 1_000,
         ansatz: str = "sqdrift",
         method: str = "qdrift",
-        evolution_time: float | Sequence[float] = 1.0,
-        num_groups: int | Sequence[int] = 15,
+        evolution_time: float | Sequence[float] = (1.0, 2.0, 3.0),
+        num_groups: int | Sequence[int] = (10, 15, 20),
         num_randomizations: int = 500,
         initial_state_bitstring: str | None = None,
         samples_per_batch: int = 300,
@@ -319,11 +319,13 @@ class SQDSolver(ActiveSpaceSolver):
         max_iterations: int = 5,
         seed: int | None = None,
         optimize: bool | None = True,
-        time_limit: float = 10.0,
+        time_limit: float = 60.0,
         relabel_solver: str = "highs",
         cpsat_workers: int = 8,
         cpsat_deterministic: bool = False,
         per_time_randomization: bool = False,
+        relabel_cache: bool = True,
+        highs_deterministic: bool = False,
         workers: int = 1,
         symmetrize_spin: bool | None = None,
         spin_sq: float | None = None,
@@ -347,6 +349,8 @@ class SQDSolver(ActiveSpaceSolver):
         self.cpsat_workers = cpsat_workers
         self.cpsat_deterministic = cpsat_deterministic
         self.per_time_randomization = per_time_randomization
+        self.relabel_cache = relabel_cache
+        self.highs_deterministic = highs_deterministic
         self.workers = workers
         # None -> run_sqd derives it from the sector (an open shell must not merge the
         # alpha/beta CI pools).  Forwarded verbatim so an explicit choice still wins.
@@ -454,6 +458,8 @@ class SQDSolver(ActiveSpaceSolver):
             cpsat_workers=self.cpsat_workers,
             cpsat_deterministic=self.cpsat_deterministic,
             per_time_randomization=self.per_time_randomization,
+            relabel_cache=self.relabel_cache,
+            highs_deterministic=self.highs_deterministic,
             workers=self.workers,
         )
         self._permutations = list(result.permutations)

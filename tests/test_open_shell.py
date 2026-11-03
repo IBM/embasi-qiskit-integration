@@ -283,6 +283,7 @@ def test_sqd_reports_spin_square_and_the_sector_minimum(ham_factory):
     solver = SQDSolver(
         build_sampler("aer"),
         shots=40000,
+        evolution_time=1.0,
         num_groups=60,
         seed=3,
         optimize=False,
@@ -307,6 +308,7 @@ def test_spin_sq_target_is_recorded(ham_factory):
     solver = SQDSolver(
         build_sampler("aer"),
         shots=40000,
+        evolution_time=1.0,
         num_groups=60,
         seed=3,
         optimize=False,
@@ -348,6 +350,7 @@ def test_sqd_returns_a_spin_resolved_rdm_pair_matching_fci(ham_factory, nelec):
     result = SQDSolver(
         build_sampler("aer"),
         shots=40000,
+        evolution_time=1.0,
         num_groups=60,
         seed=3,
         optimize=False,
