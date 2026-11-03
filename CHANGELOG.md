@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- `qiskit-fermions` moves from 0.1.x to `>=0.3.1,<0.4`. Since 0.2 the preset
+  Jordan–Wigner `Evolution` synthesis no longer simplifies its image, so the SqDRIFT
+  pass manager wraps it in `simplify(jordan_wigner)` (otherwise `method="exact"` fails
+  `PauliEvolutionGate`'s complex-coefficient check). The relabel excitation gather maps
+  each gate's local mode indices through its `qargs`, as `RelabelModes` now does, and
+  the non-contiguous group-weight fallback uses `grouping.group_coeff_means` (the
+  removed `FermionOperator.group_weights()` replacement). Circuits and permutations
+  are bit-identical to 0.1.0 for the same seed (N2 CAS(8o,10e), optimize off, HiGHS
+  and CP-SAT).
+
 ### Added
 - Initial open-source release of `embasi-qiskit-integration`, coupling EmbASI
   projection-based embedding with the Qiskit SQD stack.

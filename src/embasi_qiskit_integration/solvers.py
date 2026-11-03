@@ -440,9 +440,8 @@ class SQDSolver(ActiveSpaceSolver):
 
         # Bare evolution circuits: the reference determinant is chosen here, at
         # run time, rather than baked in by the generator.
-        # The sweep is the caller's evolution_time x num_groups (one point by default),
-        # never the generator's own (1, 2, 3) x 15 default, so a solve's ensemble size
-        # is always what the caller configured.
+        # The sweep is always this solver's evolution_time x num_groups, passed
+        # explicitly, so a solve's ensemble size is what the caller configured.
         result = build_sqdrift_circuits(
             ham,
             method=self.method,

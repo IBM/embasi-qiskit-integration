@@ -37,7 +37,7 @@ else is an extra:
 | Extra | Installs | Needed for |
 |---|---|---|
 | `quantum` | `qiskit`, `qiskit-aer`, `qiskit-addon-sqd`, `ffsim` | `SQDSolver`, Aer sampling |
-| `fermions` | `qiskit-fermions>=0.1,<0.2` | building SqDRIFT circuits (any non-mock SQD run) |
+| `fermions` | `qiskit-fermions>=0.3.1,<0.4` | building SqDRIFT circuits (any non-mock SQD run) |
 | `relabel` | `pyomo`, `highspy`, `ortools` | [mode relabeling](#mode-relabeling-optimize); **required by `SQDSolver`'s default `optimize=True`** |
 | `hardware` | `qiskit-ibm-runtime`, `samplomatic` | `--sampler runtime`, readout characterisation |
 | `embed` | EmbASI (from git, `qm-code-adapter` branch) + `ase`, `asi4py`, `mpi4py`, `scalapack4py` | `scripts/embedding_workflow.py`, the EmbASI-marked tests |

@@ -309,7 +309,7 @@ def test_canonicalize_handles_non_contiguous_group_labels():
 
     ``num_groups()`` is the largest label + 1, so a gap in the labels makes it
     disagree with the count of labels actually present. Reading the weights from
-    upstream's ``group_weights()`` (which reports 0.0 for an unused label) keeps
+    upstream's ``group_coeff_means`` (which reports 0.0 for an unused label) keeps
     this working; recomputing them with ``np.add.at`` + ``np.unique`` raised
     ``ValueError`` on the length mismatch.
     """
@@ -941,7 +941,7 @@ def test_default_optimize_solves_once_per_randomization(n2_ham):
 
 @requires_fermions
 def test_group_weights_match_the_explicit_reduction_when_labels_are_contiguous():
-    """The tie-break weight uses the explicit reduction, not ``group_weights()``.
+    """The tie-break weight uses the explicit reduction, not ``group_coeff_means``.
 
     The weight breaks ties in the canonical group order, so which formula computes it
     decides which physical group a seeded qDRIFT draw lands on. The explicit
@@ -974,7 +974,7 @@ def test_group_weights_fall_back_when_labels_are_non_contiguous():
 
     ``num_groups()`` is the largest label + 1, so the per-label sums and the
     ``np.unique`` counts differ in length and the division raises ``ValueError``.
-    That case -- and only that case -- falls back to ``group_weights()``, so the
+    That case -- and only that case -- falls back to ``group_coeff_means``, so the
     fallback can never change an ordering the reduction could have produced.
     """
     import numpy as np

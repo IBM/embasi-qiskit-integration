@@ -140,8 +140,9 @@ def _gather_excitations(dag: Any) -> tuple[list[tuple[int, ...]], int]:
     """Return the excitations ``RelabelModes`` hands to its model builder, and ``num_modes``.
 
     Mirrors ``RelabelModes.find_permutation`` of the pinned qiskit-fermions: one tuple of
-    mode indices per term of every ``Evolution`` gate, in DAG storage order (the operator's
-    own indices; the qDRIFT ``Evolution`` gates act on the whole register).
+    mode indices per term of every ``Evolution`` gate, in DAG storage order. An operator's
+    mode indices are local to its gate, so they are mapped through the node's ``qargs``
+    onto the register's modes, which the model is defined over.
     """
     from qiskit_fermions.circuit.library import Evolution
     from qiskit_fermions.operators import FermionOperator
@@ -156,10 +157,11 @@ def _gather_excitations(dag: Any) -> tuple[list[tuple[int, ...]], int]:
                 "The excitation-span model assumes fermionic mode excitations defined by "
                 f"`FermionOperator` instances; got an Evolution of {type(hamil)}."
             )
+        global_modes = [dag.find_bit(qubit).index for qubit in node.qargs]
         modes = hamil.get_modes()
         boundaries = list(hamil.get_boundaries())
         for start, stop in zip(boundaries, boundaries[1:], strict=False):
-            gathered.append(tuple(int(m) for m in modes[start:stop]))
+            gathered.append(tuple(int(global_modes[m]) for m in modes[start:stop]))
     return gathered, dag.num_qubits()
 
 

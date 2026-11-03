@@ -168,8 +168,8 @@ def build_sqdrift_circuits(
     so a bare ``method="qdrift"`` call produces **4500 circuits** (3 times x 3
     group-counts x 500 randomizations). With shared draws the three times cost one
     relabel solve per draw, but each group count is its own draw. Narrow the axes for
-    a smaller budget; ``SQDSolver`` does exactly that, pinning one
-    ``(time, num_groups)`` pair, its own ``num_randomizations`` and ``time_limit``.
+    a smaller budget; ``SQDSolver`` (and the CLI and embedding workflow) use the same
+    defaults and pass their own ``evolution_time`` x ``num_groups`` sweep through.
 
     Args:
         method: ``"exact"`` (one full-evolution circuit per ``time``) or
@@ -234,9 +234,9 @@ def build_sqdrift_circuits(
             cached by that model's content: a draw shared across times is solved
             once and gets the same permutation at every time.
         time_limit: wall-clock limit (seconds) per relabel solve, for either
-            ``relabel_solver`` (``0`` = no limit; default 60; ``SQDSolver`` and the
-            CLIs default to 10). A draw whose solve
-            finds no feasible permutation in time is kept unpermuted. It is part of
+            ``relabel_solver`` (``0`` = no limit; default 60, as in ``SQDSolver``
+            and the CLIs). A draw whose solve finds no feasible permutation in time
+            is kept unpermuted. It is part of
             the cache key, since it can change the answer.
         relabel_solver: ``"highs"`` (default; the MILP through pyomo + HiGHS) or
             ``"cpsat"`` (the same default objective solved with OR-Tools CP-SAT).
@@ -771,9 +771,18 @@ def _build_chunk(
 
     def _pass_manager(draw_seed: int | None) -> Any:
         """A preset JW pass manager, seeded when ``draw_seed`` is given."""
+        from qiskit_fermions.mappers.library import jordan_wigner
+        from qiskit_fermions.transpiler.passes.synthesis.evolution import (
+            MapperFnEvolutionSynthesis,
+            simplify,
+        )
+
         if draw_seed is None:
-            return generate_preset_jw_pass_manager()
-        return generate_preset_jw_pass_manager(seed_transpiler=draw_seed)
+            pm = generate_preset_jw_pass_manager()
+        else:
+            pm = generate_preset_jw_pass_manager(seed_transpiler=draw_seed)
+        pm.synthesis.methods["Evolution"] = MapperFnEvolutionSynthesis(simplify(jordan_wigner))
+        return pm
 
     def _sampling_passes(n_groups: int, draw_seed: int | None) -> list:
         """The qDRIFT sampling stage (no relabeling).
