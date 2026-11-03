@@ -112,7 +112,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `solve` would sample.
 
 ### Changed
-- `time_limit` per relabel solve now defaults to 60 s (was 10 s), for both backends.
+- `build_sqdrift_circuits` defaults to the full sweep, `num_groups` `[10, 15, 20]`
+  (was 15) and `time_limit` 60 s (was 10 s), so a bare `method="qdrift"` call builds
+  4500 circuits (was 1500). `SQDSolver`, the `solve` CLI and
+  `scripts/embedding_workflow.py` keep their one-point sweep (`evolution_time` 1.0,
+  `num_groups` 15) and `time_limit` 10 s, so runs driven through them are unchanged.
 - **Behaviour:** `build_sqdrift_circuits` now relabels the modes by default
   (`optimize=True` when the `relabel` extra is present), matching the reference
   step, so the generated circuits differ from before — shorter, and sampling in a

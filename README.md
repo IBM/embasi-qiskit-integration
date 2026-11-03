@@ -459,11 +459,13 @@ model is solved by one worker while the others wait for it;
 solves (safe to delete). When a time limit leaves the optimum unproven, the first
 permutation found is kept for every time.
 
-Each solve is capped at `time_limit` seconds (default 60) and with HiGHS typically
-runs to it, so relabeling dominates an SQD solve. Under noiseless Aer it buys
-nothing — on N2 CAS(8o,10e), 40 circuits took 405 s with it and 5 s without (at the
-previous 10 s limit), at the same energy — so pass `--optimize False` there, and keep
-it on for hardware.
+Each solve is capped at `time_limit` seconds — 10 for `SQDSolver`, the `solve` CLI
+and `scripts/embedding_workflow.py`; 60 for a bare `build_sqdrift_circuits` — and with
+HiGHS typically runs to it, so relabeling dominates an SQD solve. Under noiseless Aer
+it buys nothing — on N2 CAS(8o,10e), 40 circuits took 405 s with it and 5 s without,
+at the same energy — so pass `--optimize False` there, and keep it on for hardware.
+On larger active spaces `--time_limit 60` gives HiGHS room to find shallower
+orderings.
 
 **`per_time_randomization=True`** draws each time independently, from a seed hashed
 from `(seed, i, time)`, so every time is its own sample (more independent circuits,

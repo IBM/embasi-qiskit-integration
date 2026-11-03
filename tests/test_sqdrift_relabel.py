@@ -510,14 +510,35 @@ def test_cpsat_without_ortools_is_refused(monkeypatch, n2_ham):
 
 
 def test_defaults():
-    """The relabel defaults: HiGHS, 60 s per solve, shared draws, 8 CP-SAT threads."""
+    """The generator's own defaults are the full sweep (3 times x 3 group counts x 500,
+    60 s per solve); the solver layers keep their one-point sweep and 10 s limit, which
+    runs driven by SQDSolver, the solve CLI and the embedding workflow rely on."""
     import inspect
 
+    from embasi_qiskit_integration.cli import SolveCommand
+    from embasi_qiskit_integration.embedding import EmbeddingWorkflow
     from embasi_qiskit_integration.solvers import SQDSolver
 
-    for fn in (build_sqdrift_circuits, SQDSolver.__init__):
-        params = inspect.signature(fn).parameters
-        assert params["time_limit"].default == 60.0
+    builder = inspect.signature(build_sqdrift_circuits).parameters
+    assert builder["time"].default == (1.0, 2.0, 3.0)
+    assert tuple(builder["num_groups"].default) == (10, 15, 20)
+    assert builder["num_randomizations"].default == 500
+    assert builder["seed"].default == 42
+    assert builder["time_limit"].default == 60.0
+
+    solver = inspect.signature(SQDSolver.__init__).parameters
+    assert solver["evolution_time"].default == 1.0
+    assert solver["num_groups"].default == 15
+    assert solver["num_randomizations"].default == 500
+    assert solver["time_limit"].default == 10.0
+    for model in (SolveCommand, EmbeddingWorkflow):
+        fields = model.model_fields
+        assert fields["time_limit"].default == 10.0
+        assert fields["evolution_time"].default == [1.0]
+        assert fields["num_groups"].default == [15]
+        assert fields["num_randomizations"].default == 500
+
+    for params in (builder, solver):
         assert params["relabel_solver"].default == "highs"
         assert params["cpsat_workers"].default == 8
         assert params["cpsat_deterministic"].default is False

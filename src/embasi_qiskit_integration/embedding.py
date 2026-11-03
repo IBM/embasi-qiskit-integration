@@ -861,7 +861,7 @@ class EmbeddingWorkflow(BaseSettings):
     # solve, multiplying with workers).  per_time_randomization: independent draws per
     # evolution time instead of shared ones.
     optimize: bool = True
-    time_limit: float = 60.0
+    time_limit: float = 10.0
     relabel_solver: Literal["highs", "cpsat"] = "highs"
     cpsat_workers: int = 8
     cpsat_deterministic: bool = False

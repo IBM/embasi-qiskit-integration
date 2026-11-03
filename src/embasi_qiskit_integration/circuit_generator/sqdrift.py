@@ -136,7 +136,7 @@ def build_sqdrift_circuits(
     ham: EmbeddedHamiltonian,
     *,
     method: str = "qdrift",
-    num_groups: int | Sequence[int] = 15,
+    num_groups: int | Sequence[int] = (10, 15, 20),
     num_randomizations: int = 500,
     time: float | Sequence[float] = (1.0, 2.0, 3.0),
     filter_diagonal_terms: bool = True,
@@ -160,13 +160,13 @@ def build_sqdrift_circuits(
     carrying the Hamiltonian time-evolution, preceded by the HF reference unless
     ``include_initial_state=False``.
 
-    Defaults are ``time`` ``[1.0, 2.0, 3.0]``, ``num_groups`` ``15``,
-    ``num_randomizations`` 500, ``seed`` 42, ``optimize`` True, so a bare
-    ``method="qdrift"`` call produces **1500 circuits** (3 times x 1 group-count x
-    500 randomizations). Widen ``num_groups`` to a sequence to sweep it as well --
-    ``(10, 15, 20)`` would give 4500. Narrow the axes for a smaller budget instead;
-    ``SQDSolver`` does exactly that,
-    pinning one ``(time, num_groups)`` pair and its own ``num_randomizations``.
+    Defaults are ``time`` ``[1.0, 2.0, 3.0]``, ``num_groups`` ``[10, 15, 20]``,
+    ``num_randomizations`` 500, ``seed`` 42, ``optimize`` True, ``time_limit`` 60 s,
+    so a bare ``method="qdrift"`` call produces **4500 circuits** (3 times x 3
+    group-counts x 500 randomizations). With shared draws the three times cost one
+    relabel solve per draw, but each group count is its own draw. Narrow the axes for
+    a smaller budget; ``SQDSolver`` does exactly that, pinning one
+    ``(time, num_groups)`` pair, its own ``num_randomizations`` and ``time_limit``.
 
     Args:
         method: ``"exact"`` (one full-evolution circuit per ``time``) or
@@ -231,7 +231,8 @@ def build_sqdrift_circuits(
             cached by that model's content: a draw shared across times is solved
             once and gets the same permutation at every time.
         time_limit: wall-clock limit (seconds) per relabel solve, for either
-            ``relabel_solver`` (``0`` = no limit; default 60). A draw whose solve
+            ``relabel_solver`` (``0`` = no limit; default 60; ``SQDSolver`` and the
+            CLIs default to 10). A draw whose solve
             finds no feasible permutation in time is kept unpermuted. It is part of
             the cache key, since it can change the answer.
         relabel_solver: ``"highs"`` (default; the MILP through pyomo + HiGHS) or

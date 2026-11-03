@@ -319,7 +319,7 @@ class SQDSolver(ActiveSpaceSolver):
         max_iterations: int = 5,
         seed: int | None = None,
         optimize: bool | None = True,
-        time_limit: float = 60.0,
+        time_limit: float = 10.0,
         relabel_solver: str = "highs",
         cpsat_workers: int = 8,
         cpsat_deterministic: bool = False,

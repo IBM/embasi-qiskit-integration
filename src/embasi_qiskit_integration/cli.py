@@ -51,7 +51,7 @@ class SolveCommand(BaseSettings):
     shots: int = 1_000  # per circuit for SQD
     seed: int = 42
     optimize: bool | None = None
-    time_limit: float = 60.0  # per-solve wall-clock limit for the relabel solve (0 = none)
+    time_limit: float = 10.0  # per-solve wall-clock limit for the relabel solve (0 = none)
     # Relabel backend: HiGHS MILP, or OR-Tools CP-SAT (shallower circuits above ~16 modes
     # when given threads; cpsat_workers multiplies with workers).
     relabel_solver: Literal["highs", "cpsat"] = "highs"
