@@ -11,7 +11,7 @@ that turns the reordered (region-1-first) ASE ``atoms`` and the workflow setting
 the two EmbASI calculators plus the matching :class:`~.base.AOIntegrals`.  It is the
 only code that knows how to construct and configure a particular QM program.
 
-Only ``pyscf`` is registered today.  A new code registers itself with
+A new code registers itself with
 :func:`register_backend`; :func:`make_backend` refuses an unknown name with the list of
 what is available, rather than falling back to PySCF.
 """
@@ -52,15 +52,22 @@ _REGISTRY: dict[str, BackendBuilder] = {}
 # is never accepted and silently ignored.
 # Each backend declares its own through `register_backend(backend_only_settings=...)`.
 _BACKEND_ONLY_SETTINGS: dict[str, dict[str, Any]] = {}
+# Backends that accept another backend's own settings (a variant of the same QM code).
+_SETTINGS_FAMILY: dict[str, str] = {}
 
 
 def register_backend(
-    name: str, *, backend_only_settings: dict[str, Any] | None = None
+    name: str,
+    *,
+    backend_only_settings: dict[str, Any] | None = None,
+    settings_of: str | None = None,
 ) -> Callable[[BackendBuilder], BackendBuilder]:
     """Decorator registering ``build(atoms, charge, cfg) -> QMBackend`` under ``name``.
 
     ``backend_only_settings`` maps settings only this backend understands to their
-    "unset" value; any other backend will refuse them when set.
+    "unset" value; any other backend will refuse them when set.  ``settings_of`` names a
+    backend whose own settings this one also accepts (a variant driving the same QM
+    code, e.g. ``pyscf-callback`` of ``pyscf``).
     """
 
     def decorator(build: BackendBuilder) -> BackendBuilder:
@@ -69,6 +76,8 @@ def register_backend(
         _REGISTRY[name] = build
         if backend_only_settings is not None:
             _BACKEND_ONLY_SETTINGS[name] = dict(backend_only_settings)
+        if settings_of is not None:
+            _SETTINGS_FAMILY[name] = settings_of
         return build
 
     return decorator
@@ -89,7 +98,7 @@ def check_backend_settings(name: str, cfg: Any) -> None:
     """Raise if ``cfg`` sets an option that belongs to a backend other than ``name``."""
     _ensure_builtin_backends()  # so the built-ins' settings are registered
     for owner, settings in _BACKEND_ONLY_SETTINGS.items():
-        if owner == name:
+        if owner == name or _SETTINGS_FAMILY.get(name) == owner:
             continue
         for key, unset in settings.items():
             value = getattr(cfg, key, unset)

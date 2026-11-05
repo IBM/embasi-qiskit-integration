@@ -26,6 +26,7 @@ from embasi_qiskit_integration.backends.base import (
     CAP_MINAO_PROJECTOR,
     DensityArg,
 )
+from embasi_qiskit_integration.backends.callback import CallbackIntegrals, LayerEvaluator
 from embasi_qiskit_integration.backends.registry import QMBackend, register_backend
 
 
@@ -390,24 +391,16 @@ class PySCFIntegrals(PySCFBasis):
 # --------------------------------------------------------------------------- #
 # Calculator construction (``--qm_code pyscf``)
 # --------------------------------------------------------------------------- #
-@register_backend(
-    "pyscf",
-    backend_only_settings={
-        "scf_newton": False,
-        "init_guess": None,
-        "init_guess_breaksym": None,
-        "density_fit": False,
-        "df_auxbasis": None,
-    },
-)
-def build_pyscf_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
-    """PySCF ``Mole`` + KS/UKS calculators for EmbASI, and the integrals over them.
+def _pyscf_mean_fields(atoms: Any, charge: int, cfg: Any) -> tuple[Any, Any, Any]:
+    """``(mol, mf_ll, mf_hl)`` for ``atoms``, configured from the workflow settings.
 
     ``atoms`` must already be in the region-1-first order ``ProjectionEmbedding`` needs,
-    so the ``Mole``'s atom indices line up with ``active_atoms``.
+    so the ``Mole``'s atom indices line up with ``active_atoms``.  Shared by the direct
+    (``pyscf``) and the callback (``pyscf-callback``) backends so the two run on
+    identical calculators.
     """
     import pyscf
-    from pyscf.pbc.tools.pyscf_ase import PySCF, ase_atoms_to_pyscf
+    from pyscf.pbc.tools.pyscf_ase import ase_atoms_to_pyscf
 
     mol = pyscf.M(
         atom=ase_atoms_to_pyscf(atoms),
@@ -440,7 +433,24 @@ def build_pyscf_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
     # Read with a default so drivers whose settings predate the flag are unaffected.
     if getattr(cfg, "scf_newton", False):
         mf_ll = mf_ll.newton()
+    return mol, mf_ll, mf_hl
 
+
+@register_backend(
+    "pyscf",
+    backend_only_settings={
+        "scf_newton": False,
+        "init_guess": None,
+        "init_guess_breaksym": None,
+        "density_fit": False,
+        "df_auxbasis": None,
+    },
+)
+def build_pyscf_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
+    """PySCF ``Mole`` + KS/UKS calculators for EmbASI, and the integrals over them."""
+    from pyscf.pbc.tools.pyscf_ase import PySCF
+
+    _mol, mf_ll, mf_hl = _pyscf_mean_fields(atoms, charge, cfg)
     # PySCFIntegrals wraps the *same* mf_hl/mf_ll objects handed to
     # calc_base_hl/calc_base_ll, so veff_ll undoes exactly what EmbASI folded into
     # F_emb (which is built from the A_LL blocks -- see the h_emb property) and
@@ -454,3 +464,83 @@ def build_pyscf_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
         calc_hl=PySCF(method=mf_hl),
         integrals=PySCFIntegrals(mf_hl, mf_ll, density_fit=density_fit),
     )
+
+
+# --------------------------------------------------------------------------- #
+# PySCF through EmbASI's callback/matrix path (``--qm_code pyscf-callback``)
+# --------------------------------------------------------------------------- #
+class _PySCFEri:
+    """The ERI hook a callback backend needs, served by PySCF's ``ao2mo``."""
+
+    def __init__(self, ints: PySCFIntegrals):
+        self._ints = ints
+
+    def eri_mo(self, mo_coeff: np.ndarray) -> np.ndarray:
+        return self._ints.eri_mo(mo_coeff)
+
+    def eri_mo_mixed(self, mo_a: np.ndarray, mo_b: np.ndarray) -> np.ndarray:
+        return self._ints.eri_mo_mixed(mo_a, mo_b)
+
+
+class PySCFCallbackIntegrals(CallbackIntegrals):
+    """:class:`CallbackIntegrals` over PySCF, plus PySCF's AVAS projector.
+
+    Every one- and two-body mean-field quantity comes back through EmbASI's
+    run/extract path (``AtomsEmbed.run_noscf``); only the 4-index ERIs and the MINAO
+    cross overlap are PySCF-specific hooks, since no Hamiltonian evaluation yields them.
+    """
+
+    def __init__(self, *args: Any, basis: PySCFBasis, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._pyscf_basis = basis
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return super().capabilities | {CAP_MINAO_PROJECTOR}
+
+    def valence_ao_projector(self, ao_labels, atoms=None, minao: str = "minao") -> np.ndarray:
+        return self._pyscf_basis.valence_ao_projector(ao_labels, atoms=atoms, minao=minao)
+
+
+@register_backend("pyscf-callback", settings_of="pyscf")
+def build_pyscf_callback_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
+    """The PySCF calculators of ``pyscf``, with integrals from EmbASI layer evaluations.
+
+    Meant as the reference implementation of the generic callback route: it must agree
+    with ``pyscf`` to round-off, and any other code EmbASI can drive gets the same
+    treatment by supplying its own calculators (and, optionally, an ERI hook).
+    """
+    from pyscf.pbc.tools.pyscf_ase import PySCF
+
+    mol, mf_ll, mf_hl = _pyscf_mean_fields(atoms, charge, cfg)
+    calc_ll, calc_hl = PySCF(method=mf_ll), PySCF(method=mf_hl)
+    # The exchange evaluator: an unrestricted HF on the same Mole, so one evaluation at
+    # (d, 0) separates J from K.  Never handed to ProjectionEmbedding.
+    calc_hf = PySCF(method=mol.UHF())
+    ll_spin = is_spin_resolved(mf_ll)
+    density_fit: bool | str = getattr(cfg, "df_auxbasis", None) or getattr(
+        cfg, "density_fit", False
+    )
+    direct = PySCFIntegrals(mf_hl, mf_ll, density_fit=density_fit)
+    basis = PySCFBasis(mol)
+    ints = PySCFCallbackIntegrals(
+        LayerEvaluator(atoms, calc_ll, n_spin=2 if ll_spin else 1, label="cb_ll"),
+        LayerEvaluator(atoms, calc_hl, n_spin=2 if is_spin_resolved(mf_hl) else 1, label="cb_hl"),
+        LayerEvaluator(atoms, calc_hf, n_spin=2, label="cb_hf"),
+        nao=int(mol.nao),
+        basis_atoms=basis.ao_atom_map(),
+        ao_labels=basis.ao_labels(),
+        describe={
+            **basis.describe(),
+            "xc_hl": str(getattr(mf_hl, "xc", None)),
+            "density_fit": str(density_fit),
+        },
+        ll_spin_resolved=ll_spin,
+        eri_provider=_PySCFEri(direct),
+        # In-process: an evaluation is one PySCF Fock build, cheap enough for an SCF loop.
+        cheap_evaluations=True,
+        scf_status=pyscf_layer_scf_status,
+        hl_status=direct.hl_scf_status,
+        basis=basis,
+    )
+    return QMBackend(name="pyscf-callback", calc_ll=calc_ll, calc_hl=calc_hl, integrals=ints)

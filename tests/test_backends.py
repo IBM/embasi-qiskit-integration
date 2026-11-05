@@ -333,14 +333,25 @@ def test_scf_guard_honours_a_backend_status():
 # --------------------------------------------------------------------------- #
 # Registry / --qm_code (Stage 2)
 # --------------------------------------------------------------------------- #
-def test_only_pyscf_is_registered_and_is_the_default():
+def test_pyscf_is_the_default_backend():
     from embasi_qiskit_integration.backends.registry import (
         DEFAULT_QM_CODE,
         available_backends,
     )
 
     assert DEFAULT_QM_CODE == "pyscf"
-    assert available_backends() == ["pyscf"]
+    assert DEFAULT_QM_CODE in available_backends()
+
+
+def test_qm_code_literal_matches_the_registry():
+    """``--qm_code`` and the registry list the same codes, so neither can drift."""
+    import typing
+
+    from embasi_qiskit_integration.backends.registry import available_backends
+    from embasi_qiskit_integration.embedding import EmbeddingWorkflow
+
+    literal = typing.get_args(EmbeddingWorkflow.model_fields["qm_code"].annotation)
+    assert sorted(literal) == available_backends()
 
 
 def test_make_backend_refuses_an_unknown_code():

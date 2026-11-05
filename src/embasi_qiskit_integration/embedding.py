@@ -648,7 +648,7 @@ class EmbeddingWorkflow(BaseSettings):
     active_atoms: list[int] = [1, 5]  # O and its hydroxyl H -> the OH fragment
     # QM code behind the embedding (see `embasi_qiskit_integration.backends`).  Only
     # "pyscf" is implemented; the PySCF-only SCF controls below are rejected for any other.
-    qm_code: Literal["pyscf"] = "pyscf"
+    qm_code: Literal["pyscf", "pyscf-callback"] = "pyscf"
     basis: str = "sto-3g"  # matches the EmbASI developers' example
     xc_ll: str = "PBE"
     # HF high level -> the WF-in-DFT path (the SQD integration this package is
