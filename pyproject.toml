@@ -37,6 +37,9 @@ embed    = ["embasi @ git+https://github.com/tamm-cci/EmbASI.git@qm-code-adapter
 # one, so on a cluster with its own MPI this would shadow it and mismatch its mpirun.
 mpi      = ["mpich; sys_platform == 'linux'"]
 chem     = ["rdkit>=2023.9"]         # SMILES-derived charge in molecule/geometry.py (optional)
+# Readers for SIESTA's binary matrices (.HSX/.DM). sisl is MPL-2.0; SIESTA itself (GPL-3.0)
+# is only ever run as an external program, never imported -- see backends/siesta.py.
+siesta   = ["sisl>=0.15"]
 dev      = ["pytest>=7", "pytest-cov", "ruff==0.15.20", "mypy>=2.2,<2.4", "pre-commit", "rdkit>=2023.9"]
 # Every runtime extra in one shot (excludes `dev` tooling).
 all      = ["embasi-qiskit-integration[quantum,fermions,relabel,hardware,embed]"]

@@ -86,6 +86,7 @@ def register_backend(
 def _ensure_builtin_backends() -> None:
     # Imported lazily so that `backends` stays importable without PySCF/ASE on the path.
     import embasi_qiskit_integration.backends.pyscf  # noqa: F401
+    import embasi_qiskit_integration.backends.siesta  # noqa: F401
 
 
 def available_backends() -> list[str]:

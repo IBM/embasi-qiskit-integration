@@ -357,8 +357,8 @@ def test_qm_code_literal_matches_the_registry():
 def test_make_backend_refuses_an_unknown_code():
     from embasi_qiskit_integration.backends.registry import make_backend
 
-    with pytest.raises(NotImplementedError, match="'siesta' is not available.*pyscf"):
-        make_backend("siesta", atoms=None, charge=0, cfg=SimpleNamespace())
+    with pytest.raises(NotImplementedError, match="'no-such-code' is not available.*pyscf"):
+        make_backend("no-such-code", atoms=None, charge=0, cfg=SimpleNamespace())
 
 
 def test_pyscf_only_settings_are_refused_for_another_backend():
@@ -444,7 +444,7 @@ def test_qm_code_setting_accepts_only_implemented_backends(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["prog"])
     assert EmbeddingWorkflow(_cli_parse_args=False).qm_code == "pyscf"
     with pytest.raises(ValidationError, match="qm_code"):
-        EmbeddingWorkflow(_cli_parse_args=False, qm_code="siesta")
+        EmbeddingWorkflow(_cli_parse_args=False, qm_code="no-such-code")
 
 
 # --------------------------------------------------------------------------- #

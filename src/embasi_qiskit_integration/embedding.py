@@ -646,9 +646,14 @@ class EmbeddingWorkflow(BaseSettings):
     s26_index: int = 22  # methanol dimer in the s26 set
     n_atoms: int | None = 6  # first N atoms -> monomer; None for the dimer
     active_atoms: list[int] = [1, 5]  # O and its hydroxyl H -> the OH fragment
-    # QM code behind the embedding (see `embasi_qiskit_integration.backends`).  Only
-    # "pyscf" is implemented; the PySCF-only SCF controls below are rejected for any other.
-    qm_code: Literal["pyscf", "pyscf-callback"] = "pyscf"
+    # QM code behind the embedding (see `embasi_qiskit_integration.backends`).  "pyscf"
+    # (default) calls PySCF directly; "pyscf-callback" runs the same calculators through the
+    # generic EmbASI-callback route; "siesta" is DFT-in-DFT only and waits on an EmbASI
+    # adapter.  Each backend's own options are refused for the others.
+    qm_code: Literal["pyscf", "pyscf-callback", "siesta"] = "pyscf"
+    # --qm_code siesta only: NAO basis size and real-space mesh cutoff (Ry).
+    siesta_basis: str = "DZP"
+    siesta_mesh_cutoff: float = 200.0
     basis: str = "sto-3g"  # matches the EmbASI developers' example
     xc_ll: str = "PBE"
     # HF high level -> the WF-in-DFT path (the SQD integration this package is
