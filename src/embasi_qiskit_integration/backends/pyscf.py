@@ -5,8 +5,8 @@
 
 The only module allowed to build or reach into PySCF ``Mole`` / SCF objects for the
 QM system itself: :func:`build_pyscf_backend` (registered as ``--qm_code pyscf``)
-constructs the calculators, andeverything else talks to :class:`PySCFIntegrals` through the
-:class:`~embasi_qiskit_integration.backends.base.AOIntegrals` protocol.
+constructs the calculators, and everything else talks to :class:`PySCFIntegrals`
+through the :class:`~embasi_qiskit_integration.backends.base.AOIntegrals` protocol.
 """
 
 from __future__ import annotations

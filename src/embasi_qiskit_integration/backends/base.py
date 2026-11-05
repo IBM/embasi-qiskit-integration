@@ -94,7 +94,12 @@ class AOBasis(Protocol):
         """AO indices matching any of ``labels`` (``"Fe 3d"``, ``"C 2p"``, ...)."""
 
     def describe(self) -> dict[str, Any]:
-        """JSON-serialisable identity of the system and method, for state fingerprints."""
+        """Identity of the system and method, for state fingerprints.
+
+        Keys read by the fingerprint: ``basis``, ``natm``, ``charge``, ``spin``,
+        ``atom_coords`` (an ``(natm, 3)`` array, hashed rather than stored),
+        ``atom_symbols``, and optionally ``xc_hl`` / ``density_fit``.
+        """
 
 
 class AOIntegrals(AOBasis, Protocol):
