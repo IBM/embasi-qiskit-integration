@@ -51,7 +51,16 @@ def pyscf_layer_scf_status(layer: Any) -> dict[str, Any] | None:
         "max_cycle": getattr(mf, "max_cycle", 1),
         "e_tot": getattr(mf, "e_tot", None),
         "conv_tol": getattr(mf, "conv_tol", None),
+        "hint": _PYSCF_SCF_HINT,
     }
+
+
+# Remedies for a stalled SCF that only exist on the PySCF backend (`--scf_newton` is
+# refused for any other `--qm_code`).
+_PYSCF_SCF_HINT = (
+    "Try --scf_newton True (second-order SCF, for stalls at small HOMO-LUMO gaps) "
+    "or a larger --scf_max_cycle."
+)
 
 
 def pyscf_layer_footing(layer: Any) -> tuple[np.ndarray, float]:
@@ -381,7 +390,16 @@ class PySCFIntegrals(PySCFBasis):
 # --------------------------------------------------------------------------- #
 # Calculator construction (``--qm_code pyscf``)
 # --------------------------------------------------------------------------- #
-@register_backend("pyscf")
+@register_backend(
+    "pyscf",
+    backend_only_settings={
+        "scf_newton": False,
+        "init_guess": None,
+        "init_guess_breaksym": None,
+        "density_fit": False,
+        "df_auxbasis": None,
+    },
+)
 def build_pyscf_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
     """PySCF ``Mole`` + KS/UKS calculators for EmbASI, and the integrals over them.
 

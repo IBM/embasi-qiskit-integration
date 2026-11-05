@@ -35,10 +35,14 @@ PKG = Path(__file__).resolve().parents[1] / "src" / "embasi_qiskit_integration"
 # truncation, DIIS, ao2mo.restore on a given tensor) is backend-neutral and allowed
 # anywhere.  What is not allowed outside `backends/` is building or querying the QM
 # system itself: Mole/SCF construction, AO integrals, density fitting.
-_FORBIDDEN_MODULES = {"pyscf.gto", "pyscf.scf", "pyscf.dft", "pyscf.df", "pyscf.pbc"}
+_FORBIDDEN_MODULES = ("pyscf.gto", "pyscf.scf", "pyscf.dft", "pyscf.df", "pyscf.pbc")
 # (`ao_labels` / `search_ao_label` are protocol methods on the backend now, so they are
 # not in this list; the Mole-only spellings are.)
 _FORBIDDEN_ATTRS = {"intor", "intor_symmetric", "aoslice_by_atom", "get_veff", "get_hcore"}
+# PySCF QM objects, however they are reached: `adapter.ints.mol`, an aliased
+# `ints = adapter.ints; ints.mf_ll`, or `layer.atoms.calc.mol`.  Nothing outside
+# `backends/` has a legitimate attribute by these names.
+_FORBIDDEN_HANDLES = {"mol", "mf", "mf_ll"}
 # Modules where PySCF is the subject, not the QM code: solver-side custom-integral RHF
 # (`solvers._rhf_from_integrals` seeds LUCJ from bare h1/h2) and the geometry helper
 # the scripts use to build a Mole for themselves.
@@ -70,27 +74,73 @@ def test_pending_exemptions_still_exist():
         )
 
 
+def _is_forbidden_module(name: str) -> bool:
+    return name == "pyscf" or any(
+        name == mod or name.startswith(mod + ".") for mod in _FORBIDDEN_MODULES
+    )
+
+
+def _offences(rel: str, tree: ast.AST) -> list[str]:
+    """Every PySCF QM-code access in ``tree`` (the scan the guard test applies)."""
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            # `from pyscf import scf` reaches the forbidden module through the imported
+            # name; `from pyscf import lib` is the math library and stays allowed.
+            names = [node.module] if node.module != "pyscf" else []
+            names += [f"{node.module}.{a.name}" for a in node.names]
+            if any(_is_forbidden_module(n) and n != "pyscf" for n in names):
+                out.append(f"{rel}:{node.lineno} from {node.module} import ...")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if _is_forbidden_module(alias.name):
+                    out.append(f"{rel}:{node.lineno} import {alias.name}")
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _FORBIDDEN_ATTRS or node.attr in _FORBIDDEN_HANDLES:
+                out.append(f"{rel}:{node.lineno} .{node.attr}")
+            # The PySCF SCF object behind an EmbASI layer.
+            elif node.attr == "method" and isinstance(node.value, ast.Attribute):
+                if node.value.attr == "calc":
+                    out.append(f"{rel}:{node.lineno} .calc.method")
+    return out
+
+
 def test_no_pyscf_qm_code_access_outside_backends():
-    offences = []
-    for rel, tree in _package_modules():
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module:
-                mod = node.module
-                names = {f"{mod}.{a.name}" for a in node.names} | {mod}
-                if names & _FORBIDDEN_MODULES:
-                    offences.append(f"{rel}:{node.lineno} from {mod} import ...")
-            elif isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name in _FORBIDDEN_MODULES or alias.name == "pyscf":
-                        offences.append(f"{rel}:{node.lineno} import {alias.name}")
-            elif isinstance(node, ast.Attribute):
-                if node.attr in _FORBIDDEN_ATTRS:
-                    offences.append(f"{rel}:{node.lineno} .{node.attr}")
-                # `<x>.ints.mol` / `<x>.ints.mf` / `.mf_ll` / `atoms.calc.mol`
-                if node.attr in {"mol", "mf", "mf_ll"} and isinstance(node.value, ast.Attribute):
-                    if node.value.attr in {"ints", "calc"}:
-                        offences.append(f"{rel}:{node.lineno} .{node.value.attr}.{node.attr}")
+    offences = [o for rel, tree in _package_modules() for o in _offences(rel, tree)]
     assert not offences, "PySCF QM-code access outside backends/:\n" + "\n".join(offences)
+
+
+def test_guard_catches_aliased_and_submodule_access():
+    """The scan flags each pattern it exists to stop, including the indirect spellings.
+
+    ``reference_protocol`` on ``main`` read ``ints = adapter.ints; ints.mf_ll.energy_elec``,
+    which an ``.ints.mf_ll`` chain match never sees.
+    """
+    cases = {
+        "ints = adapter.ints\nints.mf_ll.energy_elec(dm)": ".mf_ll",
+        "basis.mol.nao": ".mol",
+        "layer.atoms.calc.method.converged": ".calc.method",
+        "layer.atoms.calc.mol": ".mol",
+        "from pyscf.scf.uhf import UHF": "from pyscf.scf.uhf",
+        "import pyscf.scf.hf": "import pyscf.scf.hf",
+        "import pyscf": "import pyscf",
+        "from pyscf import gto": "from pyscf import",
+        "from pyscf.pbc.tools.pyscf_ase import PySCF": "from pyscf.pbc.tools",
+        "x.intor('int1e_ovlp')": ".intor",
+    }
+    for src, expected in cases.items():
+        found = _offences("probe.py", ast.parse(src))
+        assert any(expected in f for f in found), f"guard missed {src!r}: {found}"
+    # PySCF as a math library on plain arrays stays allowed.
+    for src in (
+        "from pyscf import lib",
+        "from pyscf import ao2mo",
+        "from pyscf.fci import selected_ci",
+        "from pyscf.mcscf.apc import Chooser",
+        "from pyscf.tools import fcidump",
+        "self.method = method",
+    ):
+        assert not _offences("probe.py", ast.parse(src)), src
 
 
 # --------------------------------------------------------------------------- #
@@ -328,3 +378,124 @@ def test_qm_code_setting_accepts_only_implemented_backends(monkeypatch):
     assert EmbeddingWorkflow(_cli_parse_args=False).qm_code == "pyscf"
     with pytest.raises(ValidationError, match="qm_code"):
         EmbeddingWorkflow(_cli_parse_args=False, qm_code="siesta")
+
+
+# --------------------------------------------------------------------------- #
+# Protocol enforcement: PySCF fallbacks are for stand-ins only
+# --------------------------------------------------------------------------- #
+class _RealBackendWithoutSpinVeff:
+    """A backend that declares capabilities (so it is not a stand-in) but omits methods."""
+
+    capabilities = frozenset({"hcore", "arbitrary_dm_veff", "exact_exchange", "eri"})
+
+    def veff_ll(self, dm):  # the spin-averaged potential
+        return np.zeros((2, 2))
+
+
+def test_backend_method_falls_back_only_for_stand_ins():
+    from embasi_qiskit_integration.backends.base import backend_method
+
+    def fallback(*_):
+        return "pyscf"
+
+    assert backend_method(SimpleNamespace(), "describe", fallback) is fallback
+    assert backend_method(SimpleNamespace(), "describe") is None
+    with pytest.raises(MissingCapabilityError, match="does not implement describe"):
+        backend_method(_RealBackendWithoutSpinVeff(), "describe", fallback)
+
+
+def _spin_adapter(ints):
+    from embasi_qiskit_integration.projection_embedding_adapter import (
+        ProjectionEmbeddingAdapter,
+    )
+
+    ad = ProjectionEmbeddingAdapter.__new__(ProjectionEmbeddingAdapter)
+    ad.ints = ints
+    ad._dm_a_spin = (np.eye(2), np.zeros((2, 2)))
+    return ad
+
+
+def test_missing_veff_ll_spin_fails_instead_of_spin_averaging():
+    """A real backend without veff_ll_spin must not get the channel mean (0.42 Ha off)."""
+    with pytest.raises(MissingCapabilityError, match="veff_ll_spin"):
+        _spin_adapter(_RealBackendWithoutSpinVeff())._veff_ll_channel(0)
+
+
+def test_stand_in_without_veff_ll_spin_still_uses_the_mean():
+    class _Stub:
+        def veff_ll(self, dm):
+            return np.full((2, 2), 7.0)
+
+    ad = _spin_adapter(_Stub())
+    ad._dm_a = np.eye(2)
+    np.testing.assert_array_equal(ad._veff_ll_channel(1), np.full((2, 2), 7.0))
+
+
+def test_real_backend_without_scf_status_or_footing_fails():
+    ad = _spin_adapter(_RealBackendWithoutSpinVeff())
+    with pytest.raises(MissingCapabilityError, match="layer_scf_status"):
+        ad._layer_scf_status(SimpleNamespace())
+    ad.p = SimpleNamespace(A_LL=SimpleNamespace())
+    with pytest.raises(MissingCapabilityError, match="layer_footing"):
+        ad._a_fragment_footing()
+
+
+# --------------------------------------------------------------------------- #
+# Capability gates on h_emb, the footing and the K-based rankings
+# --------------------------------------------------------------------------- #
+def test_h_emb_and_footing_refuse_a_backend_without_hcore():
+    ad = _spin_adapter(_DFTOnlyBackend())
+    ad._fock = np.eye(2)
+    with pytest.raises(MissingCapabilityError, match="h_emb needs the 'hcore'"):
+        _ = ad.h_emb
+    with pytest.raises(MissingCapabilityError, match="spin-0 embedded one-body.*'hcore'"):
+        ad._veff_ll_channel(0)
+    with pytest.raises(MissingCapabilityError, match="footing rebase needs the 'hcore'"):
+        ad._a_fragment_footing()
+
+
+def test_k_based_rankings_are_gated_on_exact_exchange():
+    """Every ``ints.get_k`` call in the adapter sits behind an exact_exchange check."""
+    src = (PKG / "projection_embedding_adapter.py").read_text()
+    lines = src.splitlines()
+    calls = [i for i, line in enumerate(lines) if "self.ints.get_k(" in line]
+    assert calls, "expected get_k callers"
+    for i in calls:
+        window = "\n".join(lines[max(0, i - 3) : i])
+        assert "require_capability(self.ints, CAP_EXACT_EXCHANGE" in window, lines[i]
+
+
+# --------------------------------------------------------------------------- #
+# SCF hint is backend-specific; settings are declared by the backend itself
+# --------------------------------------------------------------------------- #
+def test_scf_hint_names_pyscf_flags_only_for_pyscf():
+    from embasi_qiskit_integration.projection_embedding_adapter import _require_scf_converged
+
+    with pytest.raises(RuntimeError) as exc:
+        _require_scf_converged(SimpleNamespace(), "x", {"converged": False, "max_cycle": 3})
+    assert "--scf_newton" not in str(exc.value) and "--scf_max_cycle" in str(exc.value)
+    layer = SimpleNamespace(
+        atoms=SimpleNamespace(
+            calc=SimpleNamespace(method=SimpleNamespace(converged=False, max_cycle=3))
+        )
+    )
+    with pytest.raises(RuntimeError, match="--scf_newton"):
+        _require_scf_converged(layer, "x")
+
+
+def test_pyscf_declares_its_own_backend_only_settings():
+    from embasi_qiskit_integration.backends import registry
+
+    registry.available_backends()
+    assert set(registry._BACKEND_ONLY_SETTINGS["pyscf"]) == {
+        "scf_newton",
+        "init_guess",
+        "init_guess_breaksym",
+        "density_fit",
+        "df_auxbasis",
+    }
+
+
+def test_fingerprint_does_not_read_private_backend_state():
+    src = (PKG / "projection_embedding_adapter.py").read_text()
+    assert "_density_fit" not in src

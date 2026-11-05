@@ -223,10 +223,15 @@ from embasi_qiskit_integration.backends.base import (
     AOIntegrals,
     DensityArg,
     MissingCapabilityError,
+    backend_method,
     require_capability,
 )
 from embasi_qiskit_integration.backends.fhiaims import FHIaimsIntegrals
-from embasi_qiskit_integration.backends.pyscf import PySCFIntegrals, pyscf_layer_scf_status
+from embasi_qiskit_integration.backends.pyscf import (
+    PySCFIntegrals,
+    pyscf_layer_footing,
+    pyscf_layer_scf_status,
+)
 from embasi_qiskit_integration.contract import EmbeddedHamiltonian, SolverResult
 
 __all__ = [
@@ -533,7 +538,9 @@ def _require_scf_converged(layer: Any, what: str, status: Any = _PYSCF_STATUS) -
     ``status`` is the backend's :meth:`~embasi_qiskit_integration.backends.base.
     AOIntegrals.layer_scf_status` for ``layer``; left at its default the PySCF reading
     is used.  A ``None`` status (the backend exposes no convergence flag) and a
-    non-SCF evaluation (``max_cycle <= 0``) pass through unchanged.
+    non-SCF evaluation (``max_cycle <= 0``) pass through unchanged.  The status may
+    carry a ``hint`` naming that backend's own remedies; without one the message only
+    suggests the backend-neutral ``--scf_max_cycle``.
     """
     if status is _PYSCF_STATUS:
         status = pyscf_layer_scf_status(layer)
@@ -542,11 +549,10 @@ def _require_scf_converged(layer: Any, what: str, status: Any = _PYSCF_STATUS) -
     if not status["converged"]:
         e_tot = status.get("e_tot")
         energy = f"{e_tot:.8f} Ha" if e_tot is not None else "unknown"
+        hint = status.get("hint") or "Try a larger --scf_max_cycle."
         raise RuntimeError(
             f"The {what} did not converge in {status.get('max_cycle')} cycles (E = {energy}); "
-            "EmbASI would continue from the input density. Try --scf_newton True "
-            "(second-order SCF, for stalls at small HOMO-LUMO gaps) or a larger "
-            "--scf_max_cycle."
+            f"EmbASI would continue from the input density. {hint}"
         )
 
 
@@ -905,12 +911,19 @@ class ProjectionEmbeddingAdapter:
         for capability in (CAP_HCORE, CAP_ARBITRARY_DM_VEFF, CAP_EXACT_EXCHANGE, CAP_ERI):
             require_capability(self.ints, capability, what)
 
+    def _require_h_emb_capabilities(self, what: str) -> None:
+        """``h_emb`` (and everything built on it) needs a bare ``hcore`` and ``veff_ll(dm)``.
+
+        Checked where the operator is formed, so ``export_state``, the energy assembly
+        and the per-spin channels fail up front on a backend that cannot supply them,
+        rather than with an ``AttributeError`` deep inside.
+        """
+        for capability in (CAP_HCORE, CAP_ARBITRARY_DM_VEFF):
+            require_capability(self.ints, capability, what)
+
     def _layer_scf_status(self, layer: Any) -> dict[str, Any] | None:
         """The backend's SCF status for an EmbASI layer (PySCF reading for a stand-in)."""
-        status = getattr(self.ints, "layer_scf_status", None)
-        if callable(status):
-            return status(layer)
-        return pyscf_layer_scf_status(layer)
+        return backend_method(self.ints, "layer_scf_status", pyscf_layer_scf_status)(layer)
 
     def state_fingerprint(self) -> dict[str, Any]:
         """Identify the adapter a snapshot may be restored into.
@@ -922,15 +935,15 @@ class ProjectionEmbeddingAdapter:
         """
         # The backend's own identity (system + method); a stand-in without `describe`
         # contributes only the method fields, as None.
-        describe = getattr(self.ints, "describe", None)
-        system: dict[str, Any] = describe() if callable(describe) else {}
+        describe = backend_method(self.ints, "describe")
+        system: dict[str, Any] = describe() if describe is not None else {}
         fingerprint: dict[str, Any] = {
             "nao": int(np.asarray(self.ints.overlap()).shape[-1]),
             "projection": str(getattr(self.p, "projection", None)),
             "unrestricted": bool(self.unrestricted),
             "mu": float(self.mu),
             "xc_hl": system.get("xc_hl", "None"),
-            "density_fit": system.get("density_fit", str(getattr(self.ints, "_density_fit", None))),
+            "density_fit": system.get("density_fit", "None"),
             # Subsystem A's own spin, as SPADE assigned it.  Neither `unrestricted` (a bool)
             # nor `mol.spin` (the supersystem's) captures it, so without this a doublet
             # snapshot and a singlet adapter are indistinguishable.  None when no A_spin.
@@ -982,8 +995,8 @@ class ProjectionEmbeddingAdapter:
             A JSON-serialisable mapping; every value may be ``None`` when the
             underlying object does not expose it.
         """
-        hl_status = getattr(self.ints, "hl_scf_status", None)
-        hl: dict[str, Any] = hl_status() if callable(hl_status) else {}
+        hl_status = backend_method(self.ints, "hl_scf_status")
+        hl: dict[str, Any] = hl_status() if hl_status is not None else {}
         diagnostics: dict[str, Any] = {
             "a_ll_no_scf": getattr(self.p.A_LL, "no_scf", None),
             "mf_hl_converged": hl.get("converged"),
@@ -1663,6 +1676,7 @@ class ProjectionEmbeddingAdapter:
         coincide) and so survives any test that does not vary the two levels
         independently.
         """
+        self._require_h_emb_capabilities("h_emb")
         return self._fock_arr - self.ints.veff_ll(self._dm_a_for_veff)
 
     @property
@@ -1727,11 +1741,16 @@ class ProjectionEmbeddingAdapter:
         integrals then count again: the downfolded Hamiltonian is no longer spin-free and
         the energy is off by an exchange-sized amount (0.42 Ha on a nitrile triplet).  It
         vanishes on an unpolarised A, which is why closed-shell checks never saw it.
-        Falls back to the mean when no per-spin density or backend support exists.
+        Falls back to the mean only when there is no per-spin density, or for a test
+        stand-in without ``veff_ll_spin``.  A real backend that leaves the method out
+        fails here instead of silently getting the spin average.
         """
+        self._require_h_emb_capabilities(f"the spin-{ispin} embedded one-body operator")
         pair = getattr(self, "_dm_a_spin", None)
-        if pair is not None and hasattr(self.ints, "veff_ll_spin"):
-            return self.ints.veff_ll_spin(pair)[ispin]
+        if pair is not None:
+            veff_ll_spin = backend_method(self.ints, "veff_ll_spin")
+            if veff_ll_spin is not None:
+                return veff_ll_spin(pair)[ispin]
         return self.ints.veff_ll(self._dm_a_for_veff)
 
     # ---------------- orbital construction ---------------- #
@@ -2042,6 +2061,7 @@ class ProjectionEmbeddingAdapter:
             )
         else:
             dm_a = 2.0 * c_full[:, :n_occ] @ c_full[:, :n_occ].T
+        require_capability(self.ints, CAP_EXACT_EXCHANGE, "the APC active-space ranking")
         k_ao = self.ints.get_k(dm_a)
         f_diag = np.einsum("pi,pq,qi->i", c_full, fock, c_full)
         k_diag = np.einsum("pi,pq,qi->i", c_full, k_ao, c_full)
@@ -2665,6 +2685,7 @@ class ProjectionEmbeddingAdapter:
             # `apc_pair_coefficients` halves its exchange diagonal, calibrated to the
             # restricted `K[2 C C^T]`.  Same-spin exchange is `K[dm_s]`, so pass twice it:
             # identical to the restricted input on a closed shell, and correct otherwise.
+            require_capability(self.ints, CAP_EXACT_EXCHANGE, "the per-spin APC ranking")
             k_ao = 2.0 * self.ints.get_k(c_occ @ c_occ.T)
             f_diag = np.einsum("pi,pq,qi->i", c_full, pair[ispin], c_full)
             k_diag = np.einsum("pi,pq,qi->i", slots, k_ao, slots)
@@ -2887,6 +2908,7 @@ class ProjectionEmbeddingAdapter:
         if fill == "avas":
             entropy = weight.copy()
         else:
+            require_capability(self.ints, CAP_EXACT_EXCHANGE, "the UNO APC-entropy fill")
             k_diag = np.einsum("pi,pq,qi->i", c_no, self.ints.get_k(dm_total), c_no)
             dbl, emp = np.flatnonzero(pattern == 2), np.flatnonzero(pattern == 0)
             s_occ, s_virt = apc_orbital_entropies(
@@ -3661,11 +3683,10 @@ class ProjectionEmbeddingAdapter:
         A backend-agnostic A-fragment ``h_core`` / ``energy_nuc`` on EmbASI would
         remove the reach-through entirely.
         """
-        layer_footing = getattr(self.ints, "layer_footing", None)
-        if not callable(layer_footing):
-            from embasi_qiskit_integration.backends.pyscf import pyscf_layer_footing
-
-            layer_footing = pyscf_layer_footing
+        # The rebase is a difference of two h_core frames; without a bare h_core there is
+        # nothing to rebase against.
+        require_capability(self.ints, CAP_HCORE, "the A-fragment footing rebase")
+        layer_footing = backend_method(self.ints, "layer_footing", pyscf_layer_footing)
         try:
             hcore_a, enuc_a = layer_footing(self.p.A_LL)
         except AttributeError as exc:  # pragma: no cover - non-PySCF / upstream change

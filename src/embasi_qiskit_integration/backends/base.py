@@ -69,6 +69,26 @@ def require_capability(backend: Any, capability: str, what: str) -> None:
     )
 
 
+def backend_method(backend: Any, name: str, fallback: Any = None) -> Any:
+    """``backend.<name>``, or ``fallback`` for a test stand-in that does not implement it.
+
+    The fallback is only for stand-ins, i.e. objects that declare no ``capabilities``
+    (the same rule :func:`require_capability` uses).  A real backend declares its
+    capabilities, and if it leaves out a protocol method it gets an error here instead
+    of silently getting PySCF's behaviour, or a spin average where a per-channel
+    potential was needed.  ``None`` as the result tells the caller to use its stand-in path.
+    """
+    method = getattr(backend, name, None)
+    if callable(method):
+        return method
+    if getattr(backend, "capabilities", None) is None:
+        return fallback
+    raise MissingCapabilityError(
+        f"the {type(backend).__name__} backend declares capabilities but does not "
+        f"implement {name}() of the AOIntegrals protocol"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Protocols
 # --------------------------------------------------------------------------- #

@@ -50,15 +50,8 @@ _REGISTRY: dict[str, BackendBuilder] = {}
 # Settings that only mean something to one backend, with the value that leaves them
 # unset.  `make_backend` rejects a non-default value for any other backend, so a flag
 # is never accepted and silently ignored.
-_BACKEND_ONLY_SETTINGS: dict[str, dict[str, Any]] = {
-    "pyscf": {
-        "scf_newton": False,
-        "init_guess": None,
-        "init_guess_breaksym": None,
-        "density_fit": False,
-        "df_auxbasis": None,
-    },
-}
+# Each backend declares its own through `register_backend(backend_only_settings=...)`.
+_BACKEND_ONLY_SETTINGS: dict[str, dict[str, Any]] = {}
 
 
 def register_backend(
@@ -94,6 +87,7 @@ def available_backends() -> list[str]:
 
 def check_backend_settings(name: str, cfg: Any) -> None:
     """Raise if ``cfg`` sets an option that belongs to a backend other than ``name``."""
+    _ensure_builtin_backends()  # so the built-ins' settings are registered
     for owner, settings in _BACKEND_ONLY_SETTINGS.items():
         if owner == name:
             continue
