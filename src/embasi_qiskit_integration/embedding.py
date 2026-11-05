@@ -407,18 +407,22 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
     )
 
 
-def avas_valence_ao(mol, frag_ao, labels=None) -> np.ndarray:
+def avas_valence_ao(basis, frag_ao, labels=None) -> np.ndarray:
     """Fragment AO indices the ``avas`` UNO fill projects onto.
 
-    ``labels`` are PySCF AVAS-style AO labels (``"Fe 3d"``, ``"C 2p"``, ...) matched with
-    ``mol.search_ao_label`` and restricted to ``frag_ao``; ``None`` takes the fragment's p
-    shells, which suits main-group pi/sigma bonds but not a transition metal's d shell.
+    ``basis`` is the QM backend (or a PySCF ``Mole``).  ``labels`` are AVAS-style AO
+    labels (``"Fe 3d"``, ``"C 2p"``, ...) matched with the backend's ``search_ao_label``
+    and restricted to ``frag_ao``; ``None`` takes the fragment's p shells, which suits
+    main-group pi/sigma bonds but not a transition metal's d shell.
     """
+    from embasi_qiskit_integration.backends.base import as_ao_basis
+
+    basis = as_ao_basis(basis)
     frag_ao = np.asarray(frag_ao, dtype=int)
-    ao_labels = mol.ao_labels(fmt=False)
+    ao_labels = basis.ao_labels()
     if not labels:
         return np.array([i for i in frag_ao if ao_labels[i][2].endswith("p")], dtype=int)
-    hits = np.asarray(mol.search_ao_label(list(labels)), dtype=int)
+    hits = np.asarray(basis.search_ao_label(list(labels)), dtype=int)
     valence = np.intersect1d(hits, frag_ao)
     if valence.size == 0:
         shells = sorted({" ".join(ao_labels[i][1:3]) for i in frag_ao})
@@ -467,7 +471,7 @@ def build_selector(
     so it returns a third kind of hook the caller invokes directly on ``emb``.
 
     After the atom reorder in ``_build_adapter`` the region-1 (active) atoms
-    occupy the first ``len(active_atoms)`` positions of ``mol``, so the
+    occupy the first ``len(active_atoms)`` positions of the basis, so the
     fragment AO indices come straight from the leading atom slices.
     """
     if cfg.selector == "none":
@@ -482,8 +486,8 @@ def build_selector(
         # for the fill (all of them for apc-fragment, the valence p shells for avas).
         from embasi_qiskit_integration.selectors import fragment_ao_indices
 
-        frag_ao = fragment_ao_indices(emb.ints.mol, list(range(len(cfg.active_atoms))))
-        valence_ao = avas_valence_ao(emb.ints.mol, frag_ao, cfg.avas_ao_labels)
+        frag_ao = fragment_ao_indices(emb.ints, list(range(len(cfg.active_atoms))))
+        valence_ao = avas_valence_ao(emb.ints, frag_ao, cfg.avas_ao_labels)
 
         def _uno_builder(
             emb,
@@ -521,7 +525,7 @@ def build_selector(
         # After the atom reorder the active atoms come first, so the targets are
         # restricted to the fragment's own copies of the labelled AOs.
         ao_projector = avas_ao_projector(
-            emb.ints.mol,
+            emb.ints,
             cfg.avas_ao_labels,
             atoms=range(len(cfg.active_atoms)),
             minao=cfg.avas_minao,
@@ -568,7 +572,7 @@ def build_selector(
         spade_virtual_selector,
     )
 
-    mol = emb.ints.mol
+    basis = emb.ints
     assert emb._s is not None, "run_low_level() must run before _build_selector()"
     overlap = emb._s
     n_active = len(cfg.active_atoms)
@@ -581,7 +585,7 @@ def build_selector(
     groups, start = [], 0
     for sz in sizes:
         positions = list(range(start, start + sz))
-        groups.append(fragment_ao_indices(mol, positions))
+        groups.append(fragment_ao_indices(basis, positions))
         start += sz
 
     if cfg.selector in ("spade", "concentric-cl", "apc-concentric"):
@@ -978,7 +982,7 @@ class EmbeddingWorkflow(BaseSettings):
             raise ValueError("--wf_in_dft_energy reference is single-shot: pass --max_cycles 1")
         if self.n_virtual is None:
             raise ValueError("--wf_in_dft_energy reference needs --n_virtual (and --n_frozen_occ)")
-        frag = fragment_ao_indices(emb.ints.mol, list(range(len(self.active_atoms))))
+        frag = fragment_ao_indices(emb.ints, list(range(len(self.active_atoms))))
         ham, info = reference_wf_in_dft_hamiltonian(
             emb,
             frag,

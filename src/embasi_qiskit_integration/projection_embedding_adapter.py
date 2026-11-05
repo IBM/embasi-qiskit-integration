@@ -79,7 +79,7 @@ Upstream gaps that remain (each marked ``TODO(embasi-api)`` inline):
   ``(pq|rs) = sum_P M^P_pq M^P_rs`` -- so FHI-aims cannot drive the WF-in-DFT half
   and the workflow stays PySCF-only.  See :class:`FHIaimsIntegrals`.
 * **No A-fragment footing (h_core^A / E_nuc^A).**  The WF-path nuclear-frame rebase
-  reaches through ``A_LL.atoms.calc.mol`` to a PySCF ``Mole`` because EmbASI exposes
+  asks the backend for ``layer_footing(A_LL)`` (PySCF: ``A_LL.atoms.calc.mol``) because EmbASI exposes
   no backend-agnostic A-fragment one-electron operator / nuclear repulsion; the
   rebase is therefore PySCF-only.  See :meth:`_a_fragment_footing`.
   **Largely moot since EmbASI's ``9c21cac``**, which sets ``ghosts=0`` on every
@@ -210,12 +210,38 @@ import hashlib
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 import numpy as np
 import scipy.linalg as sla
 
+from embasi_qiskit_integration.backends.base import (
+    CAP_ARBITRARY_DM_VEFF,
+    CAP_ERI,
+    CAP_EXACT_EXCHANGE,
+    CAP_HCORE,
+    AOIntegrals,
+    DensityArg,
+    MissingCapabilityError,
+    require_capability,
+)
+from embasi_qiskit_integration.backends.fhiaims import FHIaimsIntegrals
+from embasi_qiskit_integration.backends.pyscf import PySCFIntegrals, pyscf_layer_scf_status
 from embasi_qiskit_integration.contract import EmbeddedHamiltonian, SolverResult
+
+__all__ = [
+    "AOIntegrals",
+    "DensityArg",
+    "EmbeddedOrbitals",
+    "FHIaimsIntegrals",
+    "MissingCapabilityError",
+    "ProjectionEmbeddingAdapter",
+    "ProjectionEnergy",
+    "PySCFIntegrals",
+    "Selector",
+    "VirtualLocalizer",
+    "projection_energy_from_state",
+]
 
 # Environment orbitals come out of the generalized eigenproblem at ~mu * N_B.
 _ENV_EIGENVALUE_FLOOR = 1.0e3
@@ -239,306 +265,12 @@ _IMAG_TOL = 1.0e-9
 _FROZEN_OVERLAP_TOL = 0.9
 
 
-# A density argument to the `veff_*` accessors: either the spin-summed AO matrix or a
-# genuine `(alpha, beta)` pair.  The pair matters for a KS low level, whose xc is
-# nonlinear in the spin densities -- see `ProjectionEmbeddingAdapter._dm_a_for_veff`.
-DensityArg = np.ndarray | tuple[np.ndarray, np.ndarray]
-
-
 # --------------------------------------------------------------------------- #
 # AO integrals: the quantities EmbASI/ASI does not (yet) hand you
 # --------------------------------------------------------------------------- #
-class AOIntegrals(Protocol):
-    """AO-basis quantities the adapter needs beyond ProjectionEmbedding."""
-
-    def overlap(self) -> np.ndarray: ...
-    def hcore(self) -> np.ndarray: ...
-
-    def veff_hl(self, dm: DensityArg) -> np.ndarray:
-        """Effective potential of the *high-level* calculator, at a 2-occupancy dm.
-
-        Must match ``calc_base_hl``.  Retained for callers that want the
-        high-level mean field explicitly; the :attr:`h_emb` inverse uses
-        :meth:`veff_ll` instead -- see that method.
-
-        ``dm`` may be an ``(alpha, beta)`` pair; see :meth:`veff_ll` for why that
-        matters and what the return must be in that case.
-        """
-
-    def veff_ll(self, dm: DensityArg) -> np.ndarray:
-        """Effective potential of the *low-level* calculator, at a 2-occupancy dm.
-
-        Must match ``calc_base_ll``: it exists only to undo the mean-field
-        contribution EmbASI folded into ``F_emb``.  ``F_emb`` is assembled from
-        the **A_LL** one-electron blocks (see
-        :meth:`ProjectionEmbeddingAdapter._assemble_fock_a_only`), so the mean
-        field baked into it is the *low-level* one, and that is what
-        :attr:`ProjectionEmbeddingAdapter.h_emb` must subtract back off.
-
-        ``dm`` is either a spin-summed ``(nao, nao)`` matrix or an
-        ``(alpha, beta)`` pair -- the adapter passes the pair whenever it has one
-        (:attr:`ProjectionEmbeddingAdapter._dm_a_for_veff`), because an
-        unrestricted KS ``get_veff`` handed a summed matrix silently substitutes
-        ``d/2`` for both channels and loses the spin polarisation.  The **return**
-        is always a single ``(nao, nao)`` operator: a spin-resolved backend must
-        average its two channels, not sum them (a potential is per-electron).
-        """
-
-    def veff_hf(self, dm: np.ndarray) -> np.ndarray:
-        """Hartree-Fock effective potential J[dm] - K[dm]/2, at a 2-occupancy dm.
-
-        Used for the inactive-core downfold, independently of the high level.
-        """
-
-    def get_k(self, dm: np.ndarray) -> np.ndarray:
-        """Bare HF exchange operator K[dm] (no J, no 0.5 factor), at a 2-occupancy dm.
-
-        Used only by the APC active-space ranking (:meth:`ProjectionEmbeddingAdapter.
-        build_orbitals_apc_concentric`), which needs K's diagonal separately from the
-        combined ``veff_hf`` (King & Gagliardi, *J. Chem. Theory Comput.* **2021**, 17,
-        7. eq. 18: ``(ia|ia) ~ 0.5 K_aa``).
-        """
-
-    def veff_uhf(self, dm_a: np.ndarray, dm_b: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-        """Unrestricted HF mean field of a spin-resolved 1-occupancy density pair.
-
-        Returns ``(v_alpha, v_beta, e_two_body)`` where
-        ``v_sigma = J[dm_a + dm_b] - K[dm_sigma]`` and
-        ``e_two_body = 0.5 tr[d J[d]] - 0.5 (tr[dm_a K[dm_a]] + tr[dm_b K[dm_b]])``
-        with ``d = dm_a + dm_b``.
-
-        This is the frozen-core fold the *per-spin* downfold needs, and it is **not**
-        obtainable from :meth:`veff_hf`.  ``veff_hf`` is the restricted ``J - K/2``:
-        correct only when the two channels share an orbital set, because Coulomb is a
-        functional of the total density but **exchange couples like spins only**.
-        Using the spin-averaged form for two genuinely different cores understates the
-        channel splitting -- measured (ERI-only ground truth, 6-31g, valence-like cores
-        overlapping by 0.34) ``max|v_avg - v_alpha| = 1.09 Ha`` and **+0.78 Ha
-        (+492 kcal/mol)** on the CAS total.  It vanishes only as the two cores coincide,
-        which is why a deep-1s frozen core (overlap 0.9999998) hides it at 0.02
-        kcal/mol.
-
-        The energy is returned alongside the potentials rather than left to the caller
-        because the exchange self-interaction does not factor out of
-        ``0.5 tr[d v]``: that expression is only valid for the restricted ``J - K/2``.
-        """
-
-    def eri_mo(self, mo_coeff: np.ndarray) -> np.ndarray:
-        """Chemist-notation (pq|rs), shape (nmo,)*4, for the given MO block."""
-
-    def energy_nuc(self) -> float: ...
-
-
-class PySCFIntegrals:
-    """Backend for the ``examples/PySCF`` path of the qm-code-adapter branch.
-
-    ``density_fit`` selects the two-electron transform in :meth:`eri_mo`:
-
-    - ``False`` (default): the exact dense ``ao2mo`` N^5 transform.  Bit-for-bit
-      what the workflow produced before this option existed.
-    - ``True`` / an auxbasis string: a density-fitted ``(pq|rs)`` via
-      ``pyscf.df.DF``.  This is an *approximation* (the DF/RI error, typically
-      1e-3-1e-4 Ha on valence integrals), traded for O(N^3) storage so the active
-      space can outgrow the few dozen orbitals the dense (nmo)^4 tensor allows.
-      A string is passed straight through as the fitting auxbasis (e.g.
-      ``"cc-pvtz-ri"``); ``True`` lets PySCF pick the default aux for ``mol.basis``.
-
-    ``mf_ll`` is the same object handed to ``calc_base_ll``, and backs
-    :meth:`veff_ll` -- the mean field :attr:`ProjectionEmbeddingAdapter.h_emb`
-    subtracts back off ``F_emb``.  It defaults to ``mf_hl`` so a caller that only
-    has one mean field (the stub adapters in the tests, and the ``xc_hl == xc_ll``
-    case where the two coincide anyway) still constructs; pass the real low-level
-    object whenever the two levels differ, or ``h_emb`` strips the wrong veff.
-    """
-
-    def __init__(self, mf_hl, mf_ll=None, *, density_fit: bool | str = False):
-        self.mf = mf_hl  # the same object passed to calc_base_hl
-        self.mf_ll = mf_hl if mf_ll is None else mf_ll  # the one passed to calc_base_ll
-        self.mol = mf_hl.mol
-        # Integral engine only; never kernel()'d.  `scf.hf.RHF` explicitly, NOT `mol.RHF()`:
-        # on a `spin != 0` Mole the latter dispatches to ROHF, whose `get_veff`/`get_k`
-        # return a `(2, nao, nao)` pair that the downfold and APC ranking cannot contract
-        # against `(nao, nao)` blocks.  Restricted regardless of `mol.spin`.
-        from pyscf import scf as _pyscf_scf
-
-        self._hf = _pyscf_scf.hf.RHF(mf_hl.mol)
-        self._density_fit = density_fit
-        # A pyscf.df.DF, built lazily on the first eri_mo call. PySCF is untyped,
-        # so this is Any rather than a precise DF type.
-        self._df: Any = None
-
-    def overlap(self) -> np.ndarray:
-        return np.asarray(self.mol.intor("int1e_ovlp"))
-
-    def hcore(self) -> np.ndarray:
-        return np.asarray(self.mf.get_hcore())
-
-    @staticmethod
-    def _spin_average(v: np.ndarray) -> np.ndarray:
-        """Collapse a ``(2, nao, nao)`` veff pair to the restricted equivalent.
-
-        A UKS/UHF/ROHF ``get_veff`` returns one matrix per spin channel.  The
-        spin-restricted downfold this adapter performs wants a single ``(nao, nao)``
-        operator, and the correct reduction is the **mean**, not the sum: ``veff`` is a
-        *potential* (a per-electron operator), unlike a density matrix.  Verified on a
-        closed shell, where ``0.5 * (v_alpha + v_beta)`` reproduces the restricted
-        ``get_veff`` exactly while the sum is twice too large -- routing this through
-        ``_as_ao_total`` (which sums, correctly, for densities) would silently double
-        the mean field that ``h_emb`` subtracts back off.
-        """
-        v = np.asarray(v)
-        if v.ndim == 3 and v.shape[0] == 2:
-            return 0.5 * (v[0] + v[1])
-        return v
-
-    @staticmethod
-    def _as_veff_arg(mf, dm: DensityArg) -> np.ndarray:
-        """Shape a density argument for ``mf.get_veff``, collapsing a pair if ``mf`` is restricted.
-
-        An unrestricted ``get_veff`` wants ``(2, nao, nao)`` and reads the two channels
-        as genuine alpha/beta; a *restricted* one wants ``(nao, nao)`` and would read a
-        3-D array as a batch of densities.  So the pair is only passed through when the
-        mean field can interpret it, and summed otherwise -- which is exactly right,
-        since a restricted functional depends on the total density alone.
-        """
-        d = np.asarray(dm[0]) + np.asarray(dm[1]) if isinstance(dm, tuple) else np.asarray(dm)
-        if not isinstance(dm, tuple):
-            return d
-        from pyscf import scf as _scf
-
-        if isinstance(mf, (_scf.uhf.UHF, _scf.rohf.ROHF)):
-            return np.stack([np.asarray(dm[0]), np.asarray(dm[1])])
-        return d
-
-    def veff_hl(self, dm: DensityArg) -> np.ndarray:
-        return self._spin_average(self.mf.get_veff(self.mol, self._as_veff_arg(self.mf, dm)))
-
-    def veff_ll(self, dm: DensityArg) -> np.ndarray:
-        return self._spin_average(self.mf_ll.get_veff(self.mol, self._as_veff_arg(self.mf_ll, dm)))
-
-    def veff_ll_spin(self, dm: tuple[np.ndarray, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-        """Each spin channel's low-level effective potential at an ``(alpha, beta)`` pair.
-
-        The per-channel counterpart of :meth:`veff_ll` (which returns the channel mean):
-        ``v_sigma = J[d_a + d_b] - K[d_sigma]`` for HF, the spin-resolved KS potential
-        otherwise.  A restricted low level has one potential for both channels.
-        """
-        v = np.asarray(self.mf_ll.get_veff(self.mol, self._as_veff_arg(self.mf_ll, dm)))
-        if v.ndim == 3 and v.shape[0] == 2:
-            return v[0], v[1]
-        return v, v
-
-    def veff_hf(self, dm) -> np.ndarray:
-        # `_hf` is the restricted engine (see __init__), so this is normally already
-        # (nao, nao); the reduction guards a spin-resolved `dm` argument, which puts
-        # even RHF.get_veff on its two-channel branch.
-        return self._spin_average(self._hf.get_veff(self.mol, np.asarray(dm)))
-
-    def get_k(self, dm) -> np.ndarray:
-        return self._spin_average(self._hf.get_k(self.mol, np.asarray(dm)))
-
-    def veff_uhf(self, dm_a, dm_b) -> tuple[np.ndarray, np.ndarray, float]:
-        """``(v_alpha, v_beta, e_two_body)`` for a spin-resolved core; see the protocol.
-
-        ``self._hf`` is the restricted *integral engine* (never kernel()'d), and
-        ``get_j``/``get_k`` on it are plain contractions of the AO ERIs with whatever
-        density they are handed -- verified against a direct ``int2e`` contraction.  No
-        spin averaging happens anywhere here; that is what :meth:`veff_hf` does, and what
-        this method exists to avoid.
-
-        Each channel's exchange is fetched in its own call rather than as one stacked
-        ``(2, nao, nao)`` density: the stacked form gives identical numbers (checked) but
-        makes PySCF log ``Incompatible dm dimension. Treat dm as RHF density matrix.`` on
-        every evaluation, which is noise on a per-cycle code path.
-
-        Like :meth:`veff_hf` and :meth:`get_k`, this uses the exact AO ERIs even when
-        the backend was built with ``density_fit``; the DF approximation is applied only
-        in :meth:`eri_mo`/:meth:`eri_mo_mixed`, matching the pre-existing behaviour of
-        the restricted fold rather than introducing a second convention.
-        """
-        d_a = np.asarray(dm_a)
-        d_b = np.asarray(dm_b)
-        d_tot = d_a + d_b
-        j_tot = np.asarray(self._hf.get_j(self.mol, d_tot))
-        k_a = np.asarray(self._hf.get_k(self.mol, d_a))
-        k_b = np.asarray(self._hf.get_k(self.mol, d_b))
-        e_two_body = float(
-            0.5 * np.einsum("ij,ji->", d_tot, j_tot)
-            - 0.5 * (np.einsum("ij,ji->", d_a, k_a) + np.einsum("ij,ji->", d_b, k_b))
-        )
-        return j_tot - k_a, j_tot - k_b, e_two_body
-
-    def eri_mo(self, mo_coeff) -> np.ndarray:
-        """Chemist-notation ``(pq|rs)`` over the given MO block, shape (nmo,)*4.
-
-        Dense by default; density-fitted when the backend was constructed with
-        ``density_fit`` (see the class docstring).  Both return a full unpacked
-        tensor -- the DF path only changes how it is *built*, not its shape, so
-        the downfold and the solver are oblivious to the choice.
-        """
-        from pyscf import ao2mo
-
-        nmo = mo_coeff.shape[1]
-        if not self._density_fit:
-            return ao2mo.restore(1, ao2mo.kernel(self.mol, mo_coeff), nmo)
-
-        # Density-fitted transform: (pq|rs) ~= sum_P (pq|P)(P|rs), O(N^3) storage.
-        if self._df is None:
-            from pyscf import df
-
-            self._df = df.DF(self.mol)
-            if isinstance(self._density_fit, str):
-                self._df.auxbasis = self._density_fit
-            self._df.build()
-        return ao2mo.restore(1, self._df.ao2mo(mo_coeff), nmo)
-
-    def eri_mo_mixed(self, mo_a: np.ndarray, mo_b: np.ndarray) -> np.ndarray:
-        """Mixed-spin ``(p_a q_a | r_b s_b)``, shape ``(nmo,)*4``.
-
-        The ``(aa|bb)`` block of an unrestricted downfold, where the first index pair
-        comes from the alpha orbitals and the second from the beta ones.  Needs the
-        four-orbital-set ``ao2mo.general``, not ``ao2mo.kernel``: the two pairs are
-        different orbital sets, so the result has only 4-fold symmetry
-        (``(pq|rs) == (qp|rs) == (pq|sr)``) and **not** the 8-fold property -- which is
-        why :class:`~embasi_qiskit_integration.contract.EmbeddedHamiltonian` checks it
-        separately.
-        """
-        from pyscf import ao2mo
-
-        nmo = mo_a.shape[1]
-        if mo_b.shape[1] != nmo:
-            raise ValueError(
-                f"alpha and beta blocks must share a dimension; got {nmo} and {mo_b.shape[1]}"
-            )
-        if not self._density_fit:
-            out = ao2mo.general(self.mol, (mo_a, mo_a, mo_b, mo_b), compact=False)
-            return np.asarray(out).reshape(nmo, nmo, nmo, nmo)
-        if self._df is None:
-            from pyscf import df
-
-            self._df = df.DF(self.mol)
-            if isinstance(self._density_fit, str):
-                self._df.auxbasis = self._density_fit
-            self._df.build()
-        out = self._df.ao2mo((mo_a, mo_a, mo_b, mo_b), compact=False)
-        return np.asarray(out).reshape(nmo, nmo, nmo, nmo)
-
-    def energy_nuc(self) -> float:
-        return float(self.mol.energy_nuc())
-
-
-class FHIaimsIntegrals:
-    """FHI-aims path.
-
-    TODO(embasi-api): EmbASI/ASI does not export an RI-LVL three-index ERI tensor
-    (the V^-1/2-contracted M^P_{pq}, so (pq|rs) = sum_P M^P_pq M^P_rs).  It exports
-    density/overlap/Hamiltonian but not the (truncated) ERIs, so this backend
-    cannot be built at all -- FHI-aims can drive only the DFT-in-DFT part of the
-    workflow and WF-in-DFT stays PySCF-only.
-    """
-
-    def __init__(self, *_, **__):
-        raise NotImplementedError("RI-LVL ERI export not available through ASI yet")
+# The protocol and the backends live in `embasi_qiskit_integration.backends` and are
+# re-exported from this module (see the imports at the top) so existing
+# `from ...projection_embedding_adapter import PySCFIntegrals` imports keep working.
 
 
 # --------------------------------------------------------------------------- #
@@ -787,20 +519,31 @@ VirtualLocalizer = Callable[[np.ndarray, int], "tuple[np.ndarray, np.ndarray]"]
 # --------------------------------------------------------------------------- #
 # Adapter
 # --------------------------------------------------------------------------- #
-def _require_scf_converged(layer: Any, what: str) -> None:
-    """Raise if the PySCF SCF behind an EmbASI layer did not converge.
+# Default for `_require_scf_converged(status=...)`: "read it the PySCF way" -- distinct
+# from an explicit ``None`` ("this backend exposes no flag").
+_PYSCF_STATUS = object()
+
+
+def _require_scf_converged(layer: Any, what: str, status: Any = _PYSCF_STATUS) -> None:
+    """Raise if the SCF behind an EmbASI layer did not converge.
 
     EmbASI does not stop on a failed SCF: it continues from the *input* density (with a
-    RuntimeWarning in a long log), so every downstream energy is quietly wrong.  Only
-    PySCF layers are checked (their method object carries ``converged``); other backends
-    pass through unchanged.
+    RuntimeWarning in a long log), so every downstream energy is quietly wrong.
+
+    ``status`` is the backend's :meth:`~embasi_qiskit_integration.backends.base.
+    AOIntegrals.layer_scf_status` for ``layer``; left at its default the PySCF reading
+    is used.  A ``None`` status (the backend exposes no convergence flag) and a
+    non-SCF evaluation (``max_cycle <= 0``) pass through unchanged.
     """
-    mf = getattr(getattr(getattr(layer, "atoms", None), "calc", None), "method", None)
-    if mf is None or not hasattr(mf, "converged") or getattr(mf, "max_cycle", 1) <= 0:
+    if status is _PYSCF_STATUS:
+        status = pyscf_layer_scf_status(layer)
+    if not isinstance(status, dict) or status.get("max_cycle", 1) <= 0:
         return
-    if not mf.converged:
+    if not status["converged"]:
+        e_tot = status.get("e_tot")
+        energy = f"{e_tot:.8f} Ha" if e_tot is not None else "unknown"
         raise RuntimeError(
-            f"The {what} did not converge in {mf.max_cycle} cycles (E = {mf.e_tot:.8f} Ha); "
+            f"The {what} did not converge in {status.get('max_cycle')} cycles (E = {energy}); "
             "EmbASI would continue from the input density. Try --scf_newton True "
             "(second-order SCF, for stalls at small HOMO-LUMO gaps) or a larger "
             "--scf_max_cycle."
@@ -1013,8 +756,9 @@ class ProjectionEmbeddingAdapter:
         # re-evaluates, run_noscf, where "not converged" is expected).  A failed SCF is
         # replaced by the INPUT density there, which silently shifts every energy.
         if dma_in is None and dmb_in is None:
+            layer = getattr(self.p, "AB_LL", None)
             _require_scf_converged(
-                getattr(self.p, "AB_LL", None), "supersystem low-level SCF (AB_LL)"
+                layer, "supersystem low-level SCF (AB_LL)", self._layer_scf_status(layer)
             )
 
         # `_as_ao_matrix` normalises EmbASI's SpinKpointArray to a real (nao, nao) block
@@ -1107,8 +851,9 @@ class ProjectionEmbeddingAdapter:
             emb_pot = self._wrap_density(self._require(self._v_emb_embasi, "v_emb"))
             proj_pot = self._wrap_density(self.p_b)
         self.p.A_HL.run_emb_scf(dm_in=dm_in, emb_pot=emb_pot, proj_pot=proj_pot)
+        layer = getattr(self.p, "A_HL", None)
         _require_scf_converged(
-            getattr(self.p, "A_HL", None), "relaxed subsystem-A HF (A_HL, --relax_hf)"
+            layer, "relaxed subsystem-A HF (A_HL, --relax_hf)", self._layer_scf_status(layer)
         )
 
         # Same assembly as _assemble_fock_a_only's self._fock, but off A_HL's
@@ -1149,6 +894,24 @@ class ProjectionEmbeddingAdapter:
         "_dm_a_spin_init",
     )
 
+    def _require_downfold_capabilities(self, what: str) -> None:
+        """Fail up front if the backend cannot supply what a WF-in-DFT downfold needs.
+
+        ``h_emb`` needs a bare ``hcore`` and the low-level ``veff`` at A's density; the
+        frozen-core fold needs HF J/K; ``h2`` needs AO-basis ERIs for our orbitals.  A
+        backend missing any of them (SIESTA today, CP2K outside its own active space)
+        would otherwise fail deep inside, or -- worse -- succeed on a wrong operator.
+        """
+        for capability in (CAP_HCORE, CAP_ARBITRARY_DM_VEFF, CAP_EXACT_EXCHANGE, CAP_ERI):
+            require_capability(self.ints, capability, what)
+
+    def _layer_scf_status(self, layer: Any) -> dict[str, Any] | None:
+        """The backend's SCF status for an EmbASI layer (PySCF reading for a stand-in)."""
+        status = getattr(self.ints, "layer_scf_status", None)
+        if callable(status):
+            return status(layer)
+        return pyscf_layer_scf_status(layer)
+
     def state_fingerprint(self) -> dict[str, Any]:
         """Identify the adapter a snapshot may be restored into.
 
@@ -1157,15 +920,17 @@ class ProjectionEmbeddingAdapter:
         operator, and a different projection kind or spin treatment changes how
         ``P_B``/``v_emb`` were built.  Compared as a whole by :meth:`restore_state`.
         """
-        mol = getattr(self.ints, "mol", None)
-        mf = getattr(self.ints, "mf", None)
+        # The backend's own identity (system + method); a stand-in without `describe`
+        # contributes only the method fields, as None.
+        describe = getattr(self.ints, "describe", None)
+        system: dict[str, Any] = describe() if callable(describe) else {}
         fingerprint: dict[str, Any] = {
             "nao": int(np.asarray(self.ints.overlap()).shape[-1]),
             "projection": str(getattr(self.p, "projection", None)),
             "unrestricted": bool(self.unrestricted),
             "mu": float(self.mu),
-            "xc_hl": str(getattr(mf, "xc", None)),
-            "density_fit": str(getattr(self.ints, "_density_fit", None)),
+            "xc_hl": system.get("xc_hl", "None"),
+            "density_fit": system.get("density_fit", str(getattr(self.ints, "_density_fit", None))),
             # Subsystem A's own spin, as SPADE assigned it.  Neither `unrestricted` (a bool)
             # nor `mol.spin` (the supersystem's) captures it, so without this a doublet
             # snapshot and a singlet adapter are indistinguishable.  None when no A_spin.
@@ -1186,15 +951,12 @@ class ProjectionEmbeddingAdapter:
             # Before `run_low_level` there is no density to measure; a fingerprint taken
             # then simply omits the field, and two such fingerprints still compare equal.
             fingerprint["a_nelec"] = None
-        if mol is not None:
-            coords = np.round(np.asarray(mol.atom_coords(), dtype=float), 8)
-            fingerprint["basis"] = str(mol.basis)
-            fingerprint["natm"] = int(mol.natm)
-            fingerprint["charge"] = int(mol.charge)
-            fingerprint["spin"] = int(mol.spin)
+        if "atom_coords" in system:
+            coords = np.round(np.asarray(system["atom_coords"], dtype=float), 8)
+            for key in ("basis", "natm", "charge", "spin"):
+                fingerprint[key] = system[key]
             fingerprint["geometry_hash"] = hashlib.sha256(
-                np.ascontiguousarray(coords).tobytes()
-                + str([mol.atom_symbol(i) for i in range(mol.natm)]).encode()
+                np.ascontiguousarray(coords).tobytes() + str(system["atom_symbols"]).encode()
             ).hexdigest()[:16]
         return fingerprint
 
@@ -1212,7 +974,7 @@ class ProjectionEmbeddingAdapter:
         even on a 6-atom sto-3g monomer -- it prints ``SCF not converged.`` and
         continues.  So this reports what is actually available rather than
         synthesising a flag: the two low-level energies the energy assembly reads, and
-        the PySCF high-level mean field's own convergence state.  ``a_ll_no_scf``
+        the high-level mean field's own convergence state (as the backend reports it).  ``a_ll_no_scf``
         distinguishes a genuine SCF from the ``run_noscf`` path
         ``run_low_level_a_only`` uses.
 
@@ -1220,12 +982,13 @@ class ProjectionEmbeddingAdapter:
             A JSON-serialisable mapping; every value may be ``None`` when the
             underlying object does not expose it.
         """
-        mf = getattr(self.ints, "mf", None)
+        hl_status = getattr(self.ints, "hl_scf_status", None)
+        hl: dict[str, Any] = hl_status() if callable(hl_status) else {}
         diagnostics: dict[str, Any] = {
             "a_ll_no_scf": getattr(self.p.A_LL, "no_scf", None),
-            "mf_hl_converged": getattr(mf, "converged", None),
-            "mf_hl_conv_tol": getattr(mf, "conv_tol", None),
-            "mf_hl_max_cycle": getattr(mf, "max_cycle", None),
+            "mf_hl_converged": hl.get("converged"),
+            "mf_hl_conv_tol": hl.get("conv_tol"),
+            "mf_hl_max_cycle": hl.get("max_cycle"),
         }
         try:
             e_low_total, e_low_a = self._low_level_energies()
@@ -3191,6 +2954,7 @@ class ProjectionEmbeddingAdapter:
                 "read the Hamiltonian with hamiltonian.fcidump.read, which carries "
                 "(n_alpha, n_beta) exactly."
             )
+        self._require_downfold_capabilities("the active-space downfold")
         h_emb = self.h_emb
         c_in, c_act = orbitals.c_inactive, orbitals.c_active
 
@@ -3522,6 +3286,7 @@ class ProjectionEmbeddingAdapter:
         # right trace -- so no electron-count check fires -- but the wrong matrix wherever
         # the two cores differ.  Kept as separate halves as well as the sum, since `e_core`
         # below charges each channel's core to its own operator.
+        self._require_downfold_capabilities("the per-spin active-space downfold")
         dm_core_a = alpha.c_inactive @ alpha.c_inactive.T
         dm_core_b = beta.c_inactive @ beta.c_inactive.T
         dm_in = dm_core_a + dm_core_b
@@ -3890,19 +3655,23 @@ class ProjectionEmbeddingAdapter:
         the *mean-field* HF-in-DFT reference (and is the *embedded* energy, carrying
         ``v_emb``/``P_B``), not the bare correlated ``E_high(A)`` the assembly needs.
         Absent an EmbASI-native A-fragment footing, we reach through
-        ``A_LL.atoms.calc.mol`` to a PySCF ``Mole`` -- fine for PySCF, but there is no
+        ``A_LL.atoms.calc.mol`` to a PySCF ``Mole`` (now behind the backend's
+        ``layer_footing``) -- fine for PySCF, but there is no
         equivalent for the FHI-aims/ASI backend, so the WF-path rebase is PySCF-only.
         A backend-agnostic A-fragment ``h_core`` / ``energy_nuc`` on EmbASI would
         remove the reach-through entirely.
         """
+        layer_footing = getattr(self.ints, "layer_footing", None)
+        if not callable(layer_footing):
+            from embasi_qiskit_integration.backends.pyscf import pyscf_layer_footing
+
+            layer_footing = pyscf_layer_footing
         try:
-            mol_a = self.p.A_LL.atoms.calc.mol
-            hcore_a = np.asarray(mol_a.intor("int1e_kin") + mol_a.intor("int1e_nuc"))
-            enuc_a = float(mol_a.energy_nuc())
+            hcore_a, enuc_a = layer_footing(self.p.A_LL)
         except AttributeError as exc:  # pragma: no cover - non-PySCF / upstream change
             raise AttributeError(
-                "cannot reach EmbASI's subsystem-A (ghosted) mol via "
-                "A_LL.atoms.calc.mol to rebase E_high(A) onto E_low(A)'s nuclear "
+                "cannot reach EmbASI's subsystem-A (ghosted) frame through the backend's "
+                "layer_footing(A_LL) to rebase E_high(A) onto E_low(A)'s nuclear "
                 "footing; the projection energy would be ~4 Ha off without it. "
                 "Expose subsys_A_highlvl_totalen or the A-fragment "
                 "h_core/energy_nuc upstream for a backend-agnostic fix."

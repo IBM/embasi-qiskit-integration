@@ -34,6 +34,14 @@ from dataclasses import dataclass
 import numpy as np
 import scipy.linalg as sla
 
+from embasi_qiskit_integration.backends.base import (
+    CAP_ARBITRARY_DM_VEFF,
+    CAP_ENERGY_ELEC,
+    CAP_ERI,
+    CAP_EXACT_EXCHANGE,
+    CAP_HCORE,
+    require_capability,
+)
 from embasi_qiskit_integration.contract import EmbeddedHamiltonian
 from embasi_qiskit_integration.selectors import concentric_localization_selector
 
@@ -58,6 +66,8 @@ def variational_hf_in_dft(ints, dm_a, dm_b, p_b, n_occ_a, *, max_iter=200, conv_
     """
     from pyscf import lib
 
+    for capability in (CAP_HCORE, CAP_EXACT_EXCHANGE, CAP_ARBITRARY_DM_VEFF, CAP_ENERGY_ELEC):
+        require_capability(ints, capability, "the variational HF-in-DFT SCF-in-SCF")
     h = np.asarray(ints.hcore())
     s = np.asarray(ints.overlap())
     e_nuc = ints.energy_nuc()
@@ -67,8 +77,8 @@ def variational_hf_in_dft(ints, dm_a, dm_b, p_b, n_occ_a, *, max_iter=200, conv_
 
     def energy(dm):
         e_hf = np.einsum("ij,ji->", h, dm) + 0.5 * np.einsum("ij,ji->", ints.veff_hf(dm), dm)
-        e_ll_tot = ints.mf_ll.energy_elec(dm=dm + dm_b)[0]
-        e_ll_a = ints.mf_ll.energy_elec(dm=dm)[0]
+        e_ll_tot = ints.energy_elec_ll(dm + dm_b)
+        e_ll_a = ints.energy_elec_ll(dm)
         return float(e_hf + e_ll_tot - e_ll_a + e_nuc)
 
     def fock(dm):
@@ -101,6 +111,7 @@ def reference_wf_in_dft_hamiltonian(
     lowest canonical virtuals of the kept shells (``n_shells`` after shell 0).
     """
     ints = adapter.ints
+    require_capability(ints, CAP_ERI, "the reference WF-in-DFT active-space Hamiltonian")
     s = np.asarray(ints.overlap())
     dm_a0, dm_b = np.asarray(adapter._dm_a), np.asarray(adapter._dm_b)
     p_b = np.asarray(adapter.p_b)
