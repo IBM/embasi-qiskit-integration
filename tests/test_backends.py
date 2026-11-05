@@ -42,7 +42,8 @@ _FORBIDDEN_ATTRS = {"intor", "intor_symmetric", "aoslice_by_atom", "get_veff", "
 # PySCF QM objects, however they are reached: `adapter.ints.mol`, an aliased
 # `ints = adapter.ints; ints.mf_ll`, or `layer.atoms.calc.mol`.  Nothing outside
 # `backends/` has a legitimate attribute by these names.
-_FORBIDDEN_HANDLES = {"mol", "mf", "mf_ll"}
+# `_hf` is PySCFIntegrals' private restricted integral engine.
+_FORBIDDEN_HANDLES = {"mol", "mf", "mf_ll", "mf_hl", "_hf"}
 # Modules where PySCF is the subject, not the QM code: solver-side custom-integral RHF
 # (`solvers._rhf_from_integrals` seeds LUCJ from bare h1/h2) and the geometry helper
 # the scripts use to build a Mole for themselves.
@@ -99,10 +100,34 @@ def _offences(rel: str, tree: ast.AST) -> list[str]:
             if node.attr in _FORBIDDEN_ATTRS or node.attr in _FORBIDDEN_HANDLES:
                 out.append(f"{rel}:{node.lineno} .{node.attr}")
             # The PySCF SCF object behind an EmbASI layer.
-            elif node.attr == "method" and isinstance(node.value, ast.Attribute):
-                if node.value.attr == "calc":
-                    out.append(f"{rel}:{node.lineno} .calc.method")
+            elif node.attr == "method" and _names_attr(node.value, "calc"):
+                out.append(f"{rel}:{node.lineno} .calc.method")
+        elif isinstance(node, ast.Call) and _is_getattr(node):
+            # The string spelling: `getattr(ints, "mol", None)`, `getattr(calc, "method")`.
+            attr = node.args[1].value
+            if attr in _FORBIDDEN_ATTRS or attr in _FORBIDDEN_HANDLES:
+                out.append(f"{rel}:{node.lineno} getattr(..., {attr!r})")
+            elif attr == "method" and _names_attr(node.args[0], "calc"):
+                out.append(f"{rel}:{node.lineno} getattr(<calc>, 'method')")
     return out
+
+
+def _is_getattr(node: ast.Call) -> bool:
+    """``getattr(obj, "<constant>", ...)``."""
+    return (
+        isinstance(node.func, ast.Name)
+        and node.func.id in ("getattr", "hasattr")
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+        and isinstance(node.args[1].value, str)
+    )
+
+
+def _names_attr(node: ast.AST, attr: str) -> bool:
+    """Whether ``node`` reaches ``attr``, as ``x.<attr>`` or ``getattr(x, "<attr>")``."""
+    if isinstance(node, ast.Attribute):
+        return node.attr == attr
+    return isinstance(node, ast.Call) and _is_getattr(node) and node.args[1].value == attr
 
 
 def test_no_pyscf_qm_code_access_outside_backends():
@@ -127,6 +152,14 @@ def test_guard_catches_aliased_and_submodule_access():
         "from pyscf import gto": "from pyscf import",
         "from pyscf.pbc.tools.pyscf_ase import PySCF": "from pyscf.pbc.tools",
         "x.intor('int1e_ovlp')": ".intor",
+        # String / private spellings, invisible to an Attribute-only scan.
+        'getattr(self.ints, "mol", None)': "getattr(..., 'mol')",
+        "hasattr(ints, 'mf_ll')": "getattr(..., 'mf_ll')",
+        "ints.mf_hl.xc": ".mf_hl",
+        "ints._hf.get_k(d)": "._hf",
+        'getattr(getattr(layer, "atoms"), "calc").method': ".calc.method",
+        'getattr(layer.atoms.calc, "method", None)': "getattr(<calc>, 'method')",
+        'getattr(getattr(layer.atoms, "calc"), "method")': "getattr(<calc>, 'method')",
     }
     for src, expected in cases.items():
         found = _offences("probe.py", ast.parse(src))
@@ -139,6 +172,8 @@ def test_guard_catches_aliased_and_submodule_access():
         "from pyscf.mcscf.apc import Chooser",
         "from pyscf.tools import fcidump",
         "self.method = method",
+        'getattr(sampler, "method", None)',
+        'getattr(cfg, "qm_code", "pyscf")',
     ):
         assert not _offences("probe.py", ast.parse(src)), src
 
@@ -324,6 +359,27 @@ def test_pyscf_only_settings_are_refused_for_another_backend():
         check_backend_settings("cp2k", SimpleNamespace(scf_newton=True))
     with pytest.raises(ValueError, match="--df_auxbasis is a pyscf option"):
         check_backend_settings("cp2k", SimpleNamespace(df_auxbasis="cc-pvdz-ri"))
+
+
+def test_make_backend_refuses_integrals_without_capabilities(monkeypatch):
+    """A backend that declares no capabilities would be treated as a stand-in (#1)."""
+    from embasi_qiskit_integration.backends import registry
+
+    registry.available_backends()
+    built = {}
+
+    def build(atoms, charge, cfg):
+        return registry.QMBackend("fake", None, None, built["ints"])
+
+    monkeypatch.setitem(registry._REGISTRY, "fake", build)
+    built["ints"] = SimpleNamespace()  # no capabilities at all
+    with pytest.raises(TypeError, match="without a `capabilities` frozenset"):
+        registry.make_backend("fake", None, 0, SimpleNamespace())
+    built["ints"] = SimpleNamespace(capabilities={"eri"})  # a set, not a frozenset
+    with pytest.raises(TypeError, match="capabilities"):
+        registry.make_backend("fake", None, 0, SimpleNamespace())
+    built["ints"] = SimpleNamespace(capabilities=frozenset())
+    assert registry.make_backend("fake", None, 0, SimpleNamespace()).integrals is built["ints"]
 
 
 def test_register_backend_rejects_a_duplicate_name():

@@ -111,4 +111,13 @@ def make_backend(name: str, atoms: Any, charge: int, cfg: Any) -> QMBackend:
     backend = _REGISTRY[name](atoms, charge, cfg)
     if backend.name != name:
         raise RuntimeError(f"backend {name!r} returned a {backend.name!r} backend")
+    # A real backend must say what it can supply.  Without `capabilities` the adapter
+    # treats the integrals as a test stand-in: capability gates let everything through
+    # and missing protocol methods silently get PySCF's (or a spin-averaged) fallback.
+    caps = getattr(backend.integrals, "capabilities", None)
+    if not isinstance(caps, frozenset):
+        raise TypeError(
+            f"backend {name!r} returned integrals ({type(backend.integrals).__name__}) "
+            f"without a `capabilities` frozenset; every registered backend must declare one"
+        )
     return backend
