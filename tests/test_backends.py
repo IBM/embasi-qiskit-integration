@@ -43,10 +43,10 @@ _FORBIDDEN_ATTRS = {"intor", "intor_symmetric", "aoslice_by_atom", "get_veff", "
 # (`solvers._rhf_from_integrals` seeds LUCJ from bare h1/h2) and the geometry helper
 # the scripts use to build a Mole for themselves.
 _EXEMPT = {"solvers.py", "molecule/geometry.py"}
-# Known, scheduled exceptions: (module, function).  `build_adapter` still constructs the
-# PySCF calculators itself; Stage 2 moves that into `backends/pyscf.py`.  Listed by name
-# so the debt is visible here rather than silently tolerated.
-_PENDING = {("embedding.py", "build_adapter")}
+# Known, scheduled exceptions: (module, function), listed by name so any debt is
+# visible here rather than silently tolerated.  Empty: calculator construction lives in
+# `backends/pyscf.py`.
+_PENDING: set[tuple[str, str]] = set()
 
 
 def _package_modules():
@@ -243,3 +243,88 @@ def test_scf_guard_honours_a_backend_status():
     _require_scf_converged(layer, "x", {"converged": True, "max_cycle": 40})
     _require_scf_converged(layer, "x", {"converged": False, "max_cycle": 0})  # non-SCF
     _require_scf_converged(layer, "x", None)  # backend exposes no flag
+
+
+# --------------------------------------------------------------------------- #
+# Registry / --qm_code (Stage 2)
+# --------------------------------------------------------------------------- #
+def test_only_pyscf_is_registered_and_is_the_default():
+    from embasi_qiskit_integration.backends.registry import (
+        DEFAULT_QM_CODE,
+        available_backends,
+    )
+
+    assert DEFAULT_QM_CODE == "pyscf"
+    assert available_backends() == ["pyscf"]
+
+
+def test_make_backend_refuses_an_unknown_code():
+    from embasi_qiskit_integration.backends.registry import make_backend
+
+    with pytest.raises(NotImplementedError, match="'siesta' is not available.*pyscf"):
+        make_backend("siesta", atoms=None, charge=0, cfg=SimpleNamespace())
+
+
+def test_pyscf_only_settings_are_refused_for_another_backend():
+    from embasi_qiskit_integration.backends.registry import check_backend_settings
+
+    check_backend_settings("pyscf", SimpleNamespace(scf_newton=True, density_fit=True))
+    check_backend_settings("cp2k", SimpleNamespace(scf_newton=False, init_guess=None))
+    with pytest.raises(ValueError, match="--scf_newton is a pyscf option.*--qm_code cp2k"):
+        check_backend_settings("cp2k", SimpleNamespace(scf_newton=True))
+    with pytest.raises(ValueError, match="--df_auxbasis is a pyscf option"):
+        check_backend_settings("cp2k", SimpleNamespace(df_auxbasis="cc-pvdz-ri"))
+
+
+def test_register_backend_rejects_a_duplicate_name():
+    from embasi_qiskit_integration.backends.registry import available_backends, register_backend
+
+    available_backends()  # make sure pyscf is loaded
+    with pytest.raises(ValueError, match="already registered"):
+        register_backend("pyscf")(lambda atoms, charge, cfg: None)
+
+
+def test_pyscf_builder_constructs_matching_calculators_and_integrals():
+    """The builder hands EmbASI and the integrals the SAME mean fields (h_emb relies on it)."""
+    from ase import Atoms
+
+    from embasi_qiskit_integration.backends.registry import make_backend
+
+    atoms = Atoms("OH2", positions=[(0, 0, 0), (0, 0.757, 0.587), (0, -0.757, 0.587)])
+    cfg = SimpleNamespace(
+        basis="sto-3g",
+        spin=0,
+        unrestricted=True,
+        xc_ll="PBE",
+        xc_hl="HF",
+        scf_max_cycle=17,
+        init_guess="atom",
+        init_guess_breaksym=None,
+        scf_newton=False,
+        density_fit=False,
+        df_auxbasis="weigend",
+    )
+    backend = make_backend("pyscf", atoms, 0, cfg)
+    ints = backend.integrals
+    assert backend.name == "pyscf"
+    assert backend.calc_ll.method is ints.mf_ll
+    assert backend.calc_hl.method is ints.mf
+    assert ints.ll_spin_resolved  # unrestricted -> UKS
+    assert ints.mf_ll.xc == "PBE" and ints.mf.xc == "HF"
+    assert ints.mf_ll.max_cycle == ints.mf.max_cycle == 17
+    assert ints.mf_ll.init_guess == "atom"
+    assert ints.describe()["density_fit"] == "weigend"  # auxbasis wins over the bool
+    assert ints.nao == 7
+
+
+def test_qm_code_setting_accepts_only_implemented_backends(monkeypatch):
+    import sys
+
+    from pydantic import ValidationError
+
+    from embasi_qiskit_integration.embedding import EmbeddingWorkflow
+
+    monkeypatch.setattr(sys, "argv", ["prog"])
+    assert EmbeddingWorkflow(_cli_parse_args=False).qm_code == "pyscf"
+    with pytest.raises(ValidationError, match="qm_code"):
+        EmbeddingWorkflow(_cli_parse_args=False, qm_code="siesta")

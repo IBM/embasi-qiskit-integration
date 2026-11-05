@@ -91,10 +91,7 @@ from pydantic_settings import BaseSettings, CliApp, SettingsConfigDict
 from embasi_qiskit_integration._sweep import FloatSweep, IntSweep
 from embasi_qiskit_integration.circuit_run.base import SamplerKind
 from embasi_qiskit_integration.contract import SolverResult
-from embasi_qiskit_integration.projection_embedding_adapter import (
-    ProjectionEmbeddingAdapter,
-    PySCFIntegrals,
-)
+from embasi_qiskit_integration.projection_embedding_adapter import ProjectionEmbeddingAdapter
 
 # Repo root: src/embasi_qiskit_integration/embedding.py -> parents[2] is the
 # project root, whose tests/data holds the frozen mock counts (only read on the
@@ -247,6 +244,8 @@ class EmbeddingSetup(Protocol):
 
     # adapter (build_adapter)
     @property
+    def qm_code(self) -> str: ...
+    @property
     def basis(self) -> str: ...
     @property
     def active_atoms(self) -> list[int]: ...
@@ -321,7 +320,12 @@ def build_atoms(cfg: EmbeddingSetup) -> tuple[Any, int]:
 
 
 def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbeddingAdapter:
-    """Set up ProjectionEmbedding exactly as the EmbASI PySCF example does."""
+    """Set up ProjectionEmbedding on the QM backend named by ``cfg.qm_code``.
+
+    The backend (:mod:`embasi_qiskit_integration.backends`) builds the two calculators
+    and the integrals over them; with the default ``pyscf`` this is exactly the EmbASI
+    PySCF example.
+    """
     # Validate the config before importing EmbASI: the import loads mpi4py, which needs
     # an MPI library, and a bad flag should fail the same way with or without one.
     _check_shell_consistency(cfg.spin, cfg.unrestricted)
@@ -331,9 +335,9 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
         if getattr(cfg, "a_nmos", None) is not None:
             raise ValueError("--uno_n_env and --a_nmos both fix the UNO-SPADE cut; give only one")
 
-    import pyscf
     from embasi.embedding import ProjectionEmbedding
-    from pyscf.pbc.tools.pyscf_ase import PySCF, ase_atoms_to_pyscf
+
+    from embasi_qiskit_integration.backends.registry import DEFAULT_QM_CODE, make_backend
 
     atoms, charge = build_atoms(cfg)
 
@@ -343,52 +347,23 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
         embed_mask[idx] = 1
 
     # ProjectionEmbedding requires embed_mask sorted so that region 1 atoms
-    # come first; reorder atoms to match before building the PySCF Mole so
+    # come first; reorder atoms to match before the backend builds its system so
     # the two stay in sync.
     idx_list = np.argsort(embed_mask)
     sort_embed_mask = np.sort(embed_mask)
     atoms = atoms[idx_list]
 
-    mol = pyscf.M(
-        atom=ase_atoms_to_pyscf(atoms),
-        basis=cfg.basis,
-        charge=charge,
-        spin=cfg.spin,
-    )
-    # A non-zero spin needs an unrestricted low level; PySCF's UKS carries the
-    # spin axis EmbASI already threads through SPADE (n_spins > 1).
-    if cfg.spin != 0 or cfg.unrestricted:
-        mf_ll = mol.UKS(xc=cfg.xc_ll)
-        mf_hl = mol.UKS(xc=cfg.xc_hl)
-    else:
-        mf_ll = mol.KS(xc=cfg.xc_ll)
-        mf_hl = mol.KS(xc=cfg.xc_hl)
-    # EmbASI runs each SCF on these objects (`mf.kernel(dm0=mf.get_init_guess())` when it
-    # has no density of its own), so their cycle cap and guess settings are honoured.
-    for mf in (mf_ll, mf_hl):
-        if cfg.scf_max_cycle is not None:
-            mf.max_cycle = cfg.scf_max_cycle
-        if cfg.init_guess is not None:
-            mf.init_guess = cfg.init_guess
-        if cfg.init_guess_breaksym is not None and hasattr(mf, "init_guess_breaksym"):
-            mf.init_guess_breaksym = cfg.init_guess_breaksym
-    # Second-order (Newton) SCF for the low level.  At stretched bonds the small HOMO-LUMO
-    # gap leaves DIIS circling a converged energy whose orbital gradient never meets
-    # conv_tol_grad, and EmbASI then falls back to the *input* density.  Low level only:
-    # DIIS converges the high-level (embedded HF) SCF in cases where Newton does not.
-    # Read with a default so drivers whose settings predate the flag are unaffected.
-    if getattr(cfg, "scf_newton", False):
-        mf_ll = mf_ll.newton()
+    backend = make_backend(getattr(cfg, "qm_code", DEFAULT_QM_CODE), atoms, charge, cfg)
 
     projection = ProjectionEmbedding(
         atoms,
         embed_mask=sort_embed_mask,
-        calc_base_ll=PySCF(method=mf_ll),
-        calc_base_hl=PySCF(method=mf_hl),
+        calc_base_ll=backend.calc_ll,
+        calc_base_hl=backend.calc_hl,
         projection="level-shift",
         localisation=cfg.localisation,
-        # EmbASI sets the supersystem Mole's charge from this (AB_LL.input_total_charge),
-        # overwriting the one on `mol` above -- leaving it at its default 0 would silently
+        # EmbASI sets the supersystem's charge from this (AB_LL.input_total_charge),
+        # overwriting the backend's own -- leaving it at its default 0 would silently
         # run a charged system as neutral.  The fragments take theirs from SPADE's populations.
         total_charge=charge,
         # Only when set, so a run against an EmbASI without the option is unaffected.
@@ -396,12 +371,7 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
         **({"scf_stability": True} if cfg.scf_stability else {}),
         parallel=parallel,
     )
-    # PySCFIntegrals wraps the *same* mf_hl/mf_ll objects handed to
-    # calc_base_hl/calc_base_ll, so veff_ll undoes exactly what EmbASI folded into
-    # F_emb (which is built from the A_LL blocks -- see the h_emb property) and
-    # veff_hl remains available as the high-level mean field.
-    density_fit: bool | str = cfg.df_auxbasis or cfg.density_fit
-    integrals = PySCFIntegrals(mf_hl, mf_ll, density_fit=density_fit)
+    integrals = backend.integrals
     return ProjectionEmbeddingAdapter(
         projection, integrals, mu=cfg.mu, unrestricted=cfg.unrestricted
     )
@@ -676,6 +646,9 @@ class EmbeddingWorkflow(BaseSettings):
     s26_index: int = 22  # methanol dimer in the s26 set
     n_atoms: int | None = 6  # first N atoms -> monomer; None for the dimer
     active_atoms: list[int] = [1, 5]  # O and its hydroxyl H -> the OH fragment
+    # QM code behind the embedding (see `embasi_qiskit_integration.backends`).  Only
+    # "pyscf" is implemented; the PySCF-only SCF controls below are rejected for any other.
+    qm_code: Literal["pyscf"] = "pyscf"
     basis: str = "sto-3g"  # matches the EmbASI developers' example
     xc_ll: str = "PBE"
     # HF high level -> the WF-in-DFT path (the SQD integration this package is
@@ -744,6 +717,8 @@ class EmbeddingWorkflow(BaseSettings):
     fci_spin_average: bool = False
 
     # --- low-level / high-level SCF controls (None -> PySCF's own default) --- #
+    # (`init_guess`, `init_guess_breaksym`, `scf_newton`, `density_fit`, `df_auxbasis` are
+    # PySCF-backend options; `scf_max_cycle` is honoured by every backend.)
     scf_max_cycle: int | None = None  # SCF iteration cap (PySCF default 50)
     # Starting guess for each SCF: "minao" (PySCF default), "atom", "huckel", "1e", ...
     init_guess: str | None = None

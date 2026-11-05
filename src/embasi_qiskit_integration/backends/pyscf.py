@@ -3,9 +3,9 @@
 
 """PySCF backend: the default QM code behind the embedding workflow.
 
-The only module (with :mod:`embasi_qiskit_integration.embedding`'s calculator
-construction, which moves here in Stage 2) allowed to reach into PySCF ``Mole`` / SCF
-objects.  Everything else talks to :class:`PySCFIntegrals` through the
+The only module allowed to build or reach into PySCF ``Mole`` / SCF objects for the
+QM system itself: :func:`build_pyscf_backend` (registered as ``--qm_code pyscf``)
+constructs the calculators, andeverything else talks to :class:`PySCFIntegrals` through the
 :class:`~embasi_qiskit_integration.backends.base.AOIntegrals` protocol.
 """
 
@@ -26,6 +26,7 @@ from embasi_qiskit_integration.backends.base import (
     CAP_MINAO_PROJECTOR,
     DensityArg,
 )
+from embasi_qiskit_integration.backends.registry import QMBackend, register_backend
 
 
 def is_spin_resolved(mf: Any) -> bool:
@@ -375,3 +376,63 @@ class PySCFIntegrals(PySCFBasis):
 
     def layer_footing(self, layer: Any) -> tuple[np.ndarray, float]:
         return pyscf_layer_footing(layer)
+
+
+# --------------------------------------------------------------------------- #
+# Calculator construction (``--qm_code pyscf``)
+# --------------------------------------------------------------------------- #
+@register_backend("pyscf")
+def build_pyscf_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
+    """PySCF ``Mole`` + KS/UKS calculators for EmbASI, and the integrals over them.
+
+    ``atoms`` must already be in the region-1-first order ``ProjectionEmbedding`` needs,
+    so the ``Mole``'s atom indices line up with ``active_atoms``.
+    """
+    import pyscf
+    from pyscf.pbc.tools.pyscf_ase import PySCF, ase_atoms_to_pyscf
+
+    mol = pyscf.M(
+        atom=ase_atoms_to_pyscf(atoms),
+        basis=cfg.basis,
+        charge=charge,
+        spin=cfg.spin,
+    )
+    # A non-zero spin needs an unrestricted low level; PySCF's UKS carries the
+    # spin axis EmbASI already threads through SPADE (n_spins > 1).
+    if cfg.spin != 0 or cfg.unrestricted:
+        mf_ll = mol.UKS(xc=cfg.xc_ll)
+        mf_hl = mol.UKS(xc=cfg.xc_hl)
+    else:
+        mf_ll = mol.KS(xc=cfg.xc_ll)
+        mf_hl = mol.KS(xc=cfg.xc_hl)
+    # EmbASI runs each SCF on these objects (`mf.kernel(dm0=mf.get_init_guess())` when it
+    # has no density of its own), so their cycle cap and guess settings are honoured.
+    for mf in (mf_ll, mf_hl):
+        if cfg.scf_max_cycle is not None:
+            mf.max_cycle = cfg.scf_max_cycle
+        if getattr(cfg, "init_guess", None) is not None:
+            mf.init_guess = cfg.init_guess
+        breaksym = getattr(cfg, "init_guess_breaksym", None)
+        if breaksym is not None and hasattr(mf, "init_guess_breaksym"):
+            mf.init_guess_breaksym = breaksym
+    # Second-order (Newton) SCF for the low level.  At stretched bonds the small HOMO-LUMO
+    # gap leaves DIIS circling a converged energy whose orbital gradient never meets
+    # conv_tol_grad, and EmbASI then falls back to the *input* density.  Low level only:
+    # DIIS converges the high-level (embedded HF) SCF in cases where Newton does not.
+    # Read with a default so drivers whose settings predate the flag are unaffected.
+    if getattr(cfg, "scf_newton", False):
+        mf_ll = mf_ll.newton()
+
+    # PySCFIntegrals wraps the *same* mf_hl/mf_ll objects handed to
+    # calc_base_hl/calc_base_ll, so veff_ll undoes exactly what EmbASI folded into
+    # F_emb (which is built from the A_LL blocks -- see the h_emb property) and
+    # veff_hl remains available as the high-level mean field.
+    density_fit: bool | str = getattr(cfg, "df_auxbasis", None) or getattr(
+        cfg, "density_fit", False
+    )
+    return QMBackend(
+        name="pyscf",
+        calc_ll=PySCF(method=mf_ll),
+        calc_hl=PySCF(method=mf_hl),
+        integrals=PySCFIntegrals(mf_hl, mf_ll, density_fit=density_fit),
+    )
