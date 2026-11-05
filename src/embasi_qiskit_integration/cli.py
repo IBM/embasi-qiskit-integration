@@ -5,6 +5,8 @@
 
 Reads a job (``<dir>/job.fcidump`` + sidecar), runs the requested solver, and
 writes ``<dir>/result.npz`` atomically (or ``<dir>/result.ERROR`` on failure).
+``import-fcidump <file> <dir>`` turns an external FCIDUMP (WEST/QDET, CP2K, ...) into
+such a job directory.
 This is the process-B side of the two-process handoff; it needs neither EmbASI
 nor FHI-aims.
 
@@ -208,12 +210,88 @@ class SolveCommand(BaseSettings):
             raise SystemExit(f"--sampler {self.sampler!r}: {exc}") from exc
 
 
+class ImportFcidumpCommand(BaseSettings):
+    """Turn an externally built FCIDUMP into a job directory ``solve`` can run.
+
+    The front end for active-space Hamiltonians this package did not downfold itself:
+    WEST/QDET (Quantum ESPRESSO), CP2K's ``&ACTIVE_SPACE &FCIDUMP``, Molpro, ...
+    Restricted and ``UHF=1`` files are both read; an unrestricted one keeps its
+    ``(h1a, h1b)`` / ``(aa, ab, bb)`` blocks (in the job's ``.npz`` sidecar), which
+    ``--solver fci`` consumes exactly.
+
+    These Hamiltonians come from a *different* embedding than this package's projection
+    embedding (QDET uses a screened interaction with a double-counting correction; CP2K's
+    is range-separated DFT embedding), so their energies are not comparable with a
+    ``--qm_code`` run on the same system.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="EQI_IMPORT_", cli_parse_args=False)
+
+    fcidump: CliPositionalArg[str]
+    directory: CliPositionalArg[str]
+    # Override the header's spin sector, for a writer that emits MS2 unsigned.
+    nelec_alpha: int | None = None
+    nelec_beta: int | None = None
+    source: str | None = None  # free-text provenance stored in the job's meta
+
+    _exit_code: int = 0
+
+    def cli_cmd(self) -> None:
+        self._exit_code = self._run()
+
+    def _run(self) -> int:
+        from embasi_qiskit_integration.hamiltonian import fcidump
+
+        src = Path(self.fcidump)
+        if not src.is_file():
+            print(f"error: no such FCIDUMP: {src}", file=sys.stderr)
+            return 1
+        if (self.nelec_alpha is None) != (self.nelec_beta is None):
+            print("error: give --nelec_alpha and --nelec_beta together", file=sys.stderr)
+            return 1
+        try:
+            ham = fcidump.read(src)
+        except Exception as exc:  # noqa: BLE001 - report any parse failure
+            print(f"error: could not read {src}: {exc}", file=sys.stderr)
+            return 1
+        updates: dict = {
+            "meta": {
+                **ham.meta,
+                "imported_from": str(src.resolve()),
+                **({"source": self.source} if self.source else {}),
+            }
+        }
+        if self.nelec_alpha is not None and self.nelec_beta is not None:
+            nelec = (int(self.nelec_alpha), int(self.nelec_beta))
+            if sum(nelec) != sum(ham.nelec):
+                print(
+                    f"error: --nelec_alpha + --nelec_beta = {sum(nelec)} but the FCIDUMP "
+                    f"has NELEC={sum(ham.nelec)}",
+                    file=sys.stderr,
+                )
+                return 1
+            updates["nelec"] = nelec
+        ham = ham.model_copy(update=updates)
+        import warnings
+
+        with warnings.catch_warnings():
+            # A spin-resolved job is lossless through the sidecar; the warning is for
+            # callers expecting a self-contained restricted FCIDUMP.
+            warnings.simplefilter("ignore", UserWarning)
+            path = ipc.write_job(ham, Path(self.directory))
+        spin = "unrestricted" if ham.is_spin_dependent else "restricted"
+        print(f"imported {spin} CAS({sum(ham.nelec)}e, {ham.norb}o), nelec={ham.nelec}")
+        print(f"wrote {path}")
+        return 0
+
+
 class Cli(BaseSettings):
     """embasi-qiskit-integration command-line interface."""
 
     model_config = SettingsConfigDict(env_prefix="EQI_")
 
     solve: CliSubCommand[SolveCommand]
+    import_fcidump: CliSubCommand[ImportFcidumpCommand]
 
     # Propagated up from the chosen subcommand.
     exit_code: ClassVar[int] = 0
