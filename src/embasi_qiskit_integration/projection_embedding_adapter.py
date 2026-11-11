@@ -674,8 +674,9 @@ class ProjectionEmbeddingAdapter:
         these off the same A_LL object EmbASI integrated keeps the downfold
         bit-identical to the previous ``construct_embedded_fock()`` path.
         """
-        h_kin_a = self._as_ao_total(self.p.A_LL.hamiltonian_kinetic)
-        h_estat_xc_a = self._as_ao_total(self.p.A_LL.hamiltonian_estat_plus_xc)
+        # Operators: the spin-channel MEAN (`_as_ao_operator`), never the sum -- see there.
+        h_kin_a = self._as_ao_operator(self.p.A_LL.hamiltonian_kinetic)
+        h_estat_xc_a = self._as_ao_operator(self.p.A_LL.hamiltonian_estat_plus_xc)
         self._fock = h_kin_a + h_estat_xc_a + self._v_emb_embasi + self._p_b
         # Rebuild the per-spin Fock from the same (unchanged) v_emb/P_B pair: `A_LL`'s
         # one-electron blocks were just refreshed and the potential is frozen for the
@@ -788,8 +789,9 @@ class ProjectionEmbeddingAdapter:
                 "construct_embedding_potential returned P_B=None; only "
                 "projection='level-shift' (constant projector) can be exported"
             )
-        self._p_b = self._as_ao_total(p_b_embasi)
-        self._v_emb_embasi = self._as_ao_total(v_emb_embasi)
+        # Operators, so the channel mean (`_as_ao_operator`); the densities above sum.
+        self._p_b = self._as_ao_operator(p_b_embasi)
+        self._v_emb_embasi = self._as_ao_operator(v_emb_embasi)
 
         # Per-spin blocks kept ALONGSIDE the spin-summed ones above (which the
         # restricted path and the energy assembly still use unchanged).  These are what
@@ -865,8 +867,8 @@ class ProjectionEmbeddingAdapter:
         # Same assembly as _assemble_fock_a_only's self._fock, but off A_HL's
         # converged one-electron blocks instead of A_LL's frozen ones (mirrors
         # ProjectionEmbedding.construct_embedded_fock, embasi/embedding.py:828).
-        h_kin_a = self._as_ao_total(self.p.A_HL.hamiltonian_kinetic)
-        h_estat_xc_a = self._as_ao_total(self.p.A_HL.hamiltonian_estat_plus_xc)
+        h_kin_a = self._as_ao_operator(self.p.A_HL.hamiltonian_kinetic)
+        h_estat_xc_a = self._as_ao_operator(self.p.A_HL.hamiltonian_estat_plus_xc)
         self._fock_relaxed = h_kin_a + h_estat_xc_a + self._v_emb_embasi + self._p_b
         self._dm_a_relaxed = self._as_ao_total(self.p.A_HL.density_matrices_out)
 
@@ -1357,6 +1359,27 @@ class ProjectionEmbeddingAdapter:
             if arr.ndim == 3 and arr.shape[0] == 2:
                 a, b = self._as_ao_matrix_spin(arr)
                 return np.ascontiguousarray(a + b)
+        return self._as_ao_matrix(arr)
+
+    def _as_ao_operator(self, m) -> np.ndarray:
+        """Spin-restricted ``(nao, nao)`` *operator*: the mean of a length-2 spin axis.
+
+        The operator counterpart of :meth:`_as_ao_total`.  A density is additive over
+        spin (``d = d_alpha + d_beta``) but an operator is per-electron: the restricted
+        equivalent of ``(F_alpha, F_beta)`` is ``(F_alpha + F_beta) / 2`` -- on a closed
+        shell exactly the restricted ``F``.  Summing them doubled ``F_emb``, ``v_emb``
+        and ``P_B`` on an ``unrestricted=True`` run without ``spin_downfold``, while
+        :attr:`h_emb` subtracts the channel-mean ``veff_ll``: ``h_emb = 2F - veff``
+        put the closed-shell water total 40 Ha low (-153.69 vs -113.77 Ha).  Restricted
+        runs (one channel) are unchanged.
+        """
+        arr = np.asarray(m)
+        if self.unrestricted:
+            while arr.ndim > 3 and arr.shape[0] == 1:
+                arr = arr[0]
+            if arr.ndim == 3 and arr.shape[0] == 2:
+                a, b = self._as_ao_matrix_spin(arr)
+                return np.ascontiguousarray(0.5 * (a + b))
         return self._as_ao_matrix(arr)
 
     @staticmethod

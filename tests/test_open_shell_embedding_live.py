@@ -872,8 +872,11 @@ def test_stretched_spans_are_not_cross_orthogonal():
     # ...and the cross terms are enormous, which is what makes a spin-summed contraction
     # of these operators wrong rather than merely imprecise.
     assert abs(tr(d_a, p_b)) > 1e3
+    # The restricted copy `_p_b` is the channel MEAN of the operator (it used to be the
+    # sum, which doubled every operator on the restricted path), so contracting it with
+    # the spin-summed density carries half of each cross term.
     assert tr(d_a + d_b, adapter._p_b) == pytest.approx(
-        tr(d_a, p_a) + tr(d_b, p_b) + tr(d_a, p_b) + tr(d_b, p_a), abs=1e-6
+        0.5 * (tr(d_a, p_a) + tr(d_b, p_b) + tr(d_a, p_b) + tr(d_b, p_a)), abs=1e-6
     )
 
 

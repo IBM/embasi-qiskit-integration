@@ -284,3 +284,18 @@ def test_workflow_total_matches_on_the_callback_route(case, tmp_path):
         from test_open_shell_embedding_live import REF_TOTAL
 
         assert callback == pytest.approx(REF_TOTAL, abs=1e-6)
+
+
+@pytest.mark.embasi
+def test_unrestricted_closed_shell_matches_the_restricted_total():
+    """Regression: without --spin_downfold an unrestricted closed shell summed the spin
+    channels of every operator, putting the water WF-in-DFT total 40 Ha low
+    (-153.69 vs -113.77 Ha)."""
+    settings = dict(
+        basis="sto-3g", xc_hl="HF", selector="none", n_virtual=2, solver="fci", max_cycles=1
+    )
+    restricted = _total("pyscf", **settings)
+    unrestricted = _total("pyscf", unrestricted=True, **settings)
+    per_spin = _total("pyscf", unrestricted=True, spin_downfold=True, **settings)
+    assert unrestricted == pytest.approx(per_spin, abs=1e-8)
+    assert unrestricted == pytest.approx(restricted, abs=1e-5)  # UKS vs RKS SCF residual
