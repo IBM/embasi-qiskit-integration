@@ -31,6 +31,7 @@ def test_wannier_hamiltonian_reproduces_the_independent_ks_eigenvalues():
     eig, occ = cpmd.read_ks_eigenvalues(DATA / "ks_eigenvalues.out")
     occupied = eig[occ > 0]
     assert w.nstate == occupied.size == 4
+    np.testing.assert_allclose(w.hamiltonian, w.hamiltonian.T, atol=1e-14)
     np.testing.assert_allclose(w.eigenvalues(), occupied, atol=1e-8)  # Hartree
 
 
@@ -73,12 +74,6 @@ def test_localised_water_is_two_lone_pairs_and_two_bonds():
     assert sorted(nearest[~off_plane].tolist()) == [1, 2]
 
 
-def test_wannier_hamiltonian_is_symmetric_and_in_hartree():
-    h = cpmd.read_wannier_ham(DATA / "WANNIER_HAM", 4)
-    np.testing.assert_allclose(h, h.T, atol=1e-14)
-    assert np.abs(h).max() < 1.0  # Hartree scale; the file itself is in eV (~17)
-
-
 def test_wrong_state_count_is_rejected():
     with pytest.raises(ValueError, match="not a multiple of 5\\^2"):
         cpmd.read_wannier_ham(DATA / "WANNIER_HAM", 5)
@@ -95,10 +90,18 @@ def test_mismatched_files_are_detected(tmp_path):
         cpmd.read_wannier(tmp_path)
 
 
-def test_missing_eigenvalue_block_is_reported(tmp_path):
+@pytest.mark.parametrize(
+    "text, match",
+    [
+        ("no eigenvalues here\n", "EIGENVALUES"),
+        (" EIGENVALUES(EV) AND OCCUPATION:\n K POINT:   1  0.0 0.0 0.0\n", "k-point"),
+    ],
+    ids=["no-block", "k-points"],
+)
+def test_ks_eigenvalue_reader_rejects(tmp_path, text, match):
     out = tmp_path / "x.out"
-    out.write_text("no eigenvalues here\n")
-    with pytest.raises(ValueError, match="EIGENVALUES"):
+    out.write_text(text)
+    with pytest.raises(ValueError, match=match):
         cpmd.read_ks_eigenvalues(out)
 
 
@@ -137,13 +140,6 @@ def test_not_converged_states_are_read_with_a_warning(tmp_path):
         eig, occ = cpmd.read_ks_eigenvalues(out)
     assert eig[2] * HARTREE_EV == pytest.approx(-0.9067432, abs=1e-6)
     np.testing.assert_allclose(occ, [2, 2, 0])
-
-
-def test_k_point_eigenvalues_are_refused(tmp_path):
-    out = tmp_path / "k.out"
-    out.write_text(" EIGENVALUES(EV) AND OCCUPATION:\n K POINT:   1  0.0 0.0 0.0\n")
-    with pytest.raises(ValueError, match="k-point"):
-        cpmd.read_ks_eigenvalues(out)
 
 
 def test_cpmd_backend_refuses_with_the_reasons():

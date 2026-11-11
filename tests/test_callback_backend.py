@@ -19,12 +19,13 @@ import numpy as np
 import pytest
 
 from embasi_qiskit_integration.backends.base import MissingCapabilityError
-from embasi_qiskit_integration.backends.callback import CallbackIntegrals, Evaluation
+from embasi_qiskit_integration.backends.callback import (
+    CallbackIntegrals,
+    Evaluation,
+    LayerEvaluator,
+)
 
 TOL = 1e-10
-
-# EmbASI imports mpi4py; without a working MPI library the layer cannot be built.
-embasi_layers = pytest.importorskip("embasi.atoms_embedding_asi", exc_type=ImportError)
 
 
 def _cfg(**over):
@@ -58,6 +59,8 @@ def _oh():
 
 
 def _pair(atoms, charge, cfg):
+    # EmbASI imports mpi4py; without a working MPI library the layer cannot be built.
+    pytest.importorskip("embasi.atoms_embedding_asi", exc_type=ImportError)
     from embasi_qiskit_integration.backends.registry import make_backend
 
     direct = make_backend("pyscf", atoms, charge, cfg).integrals
@@ -85,27 +88,28 @@ def _density(direct):
     return total + (x + x.T), (dm[0], dm[1]) if dm.ndim == 3 else (0.5 * total, 0.5 * total)
 
 
-def test_one_electron_and_energies(closed_shell):
+@pytest.mark.parametrize(
+    "method, takes_dm",
+    [
+        ("overlap", False),
+        ("hcore", False),
+        ("veff_ll", True),
+        ("veff_hl", True),
+        ("veff_hf", True),
+        ("get_k", True),
+    ],
+)
+def test_matrices_match_pyscf(closed_shell, method, takes_dm):
     direct, cb = closed_shell
-    np.testing.assert_allclose(cb.overlap(), direct.overlap(), atol=TOL)
-    np.testing.assert_allclose(cb.hcore(), direct.hcore(), atol=TOL)
+    args = (_density(direct)[0],) if takes_dm else ()
+    np.testing.assert_allclose(getattr(cb, method)(*args), getattr(direct, method)(*args), atol=TOL)
+
+
+def test_energies_and_uhf_potentials(closed_shell):
+    direct, cb = closed_shell
     assert cb.energy_nuc() == pytest.approx(direct.energy_nuc(), abs=TOL)
     dm, _ = _density(direct)
     assert cb.energy_elec_ll(dm) == pytest.approx(direct.energy_elec_ll(dm), abs=1e-9)
-
-
-def test_mean_field_potentials(closed_shell):
-    direct, cb = closed_shell
-    dm, _ = _density(direct)
-    np.testing.assert_allclose(cb.veff_ll(dm), direct.veff_ll(dm), atol=TOL)
-    np.testing.assert_allclose(cb.veff_hl(dm), direct.veff_hl(dm), atol=TOL)
-
-
-def test_exact_exchange(closed_shell):
-    direct, cb = closed_shell
-    dm, _ = _density(direct)
-    np.testing.assert_allclose(cb.veff_hf(dm), direct.veff_hf(dm), atol=TOL)
-    np.testing.assert_allclose(cb.get_k(dm), direct.get_k(dm), atol=TOL)
     da, db = 0.55 * dm, 0.45 * dm
     va, vb, e2 = cb.veff_uhf(da, db)
     ra, rb, re2 = direct.veff_uhf(da, db)
@@ -141,7 +145,8 @@ def test_basis_metadata_and_eris(closed_shell):
     direct, cb = closed_shell
     np.testing.assert_array_equal(cb.ao_atom_map(), direct.ao_atom_map())
     assert cb.ao_labels() == direct.ao_labels()
-    np.testing.assert_array_equal(cb.search_ao_label(["O 2p"]), direct.search_ao_label(["O 2p"]))
+    for labels in (["O 2p"], ["O 2px"], ["O"], ["O 2p", "H 1s"]):
+        np.testing.assert_array_equal(cb.search_ao_label(labels), direct.search_ao_label(labels))
     np.testing.assert_allclose(
         cb.valence_ao_projector(["O 2p"]), direct.valence_ao_projector(["O 2p"]), atol=TOL
     )
@@ -221,6 +226,27 @@ def test_zero_density_reference_is_cached():
     ints.veff_ll(np.eye(2))
     ints.veff_ll(np.eye(2))
     assert len(calls) == 3  # one H[0], two H[dm]
+
+
+def test_layer_evaluator_drops_embasis_cached_eigenvalue_sum():
+    """EmbASI caches `ev_sum` per layer; a reused layer must not carry it across densities."""
+    seen = []
+
+    class _Layer:
+        hamiltonian_total = {(0, 0): np.eye(1)}
+        overlap = {(0, 0): np.eye(1)}
+        total_energy = 0.0
+
+        def run_noscf(self, dm_in):
+            seen.append(hasattr(self, "ev_sum"))
+            self.ev_sum = 1.23  # what EmbASI's run() leaves behind
+
+    ev = object.__new__(LayerEvaluator)
+    ev.n_spin, ev.label, ev._layer = 1, "t", _Layer()
+    ev._wrap = lambda dm: dm  # type: ignore[method-assign]
+    ev(np.zeros((1, 1)))
+    ev(np.zeros((1, 1)))
+    assert seen == [False, False]
 
 
 # --------------------------------------------------------------------------- #

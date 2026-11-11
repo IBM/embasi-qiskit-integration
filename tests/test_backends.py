@@ -274,11 +274,25 @@ def test_layer_status_and_footing(water_uks):
     assert enuc == m.energy_nuc()
 
 
+def test_layer_footing_hcore_includes_the_ecp():
+    """Regression: the footing dropped ECP terms (50.5 Ha on HI/def2-SVP)."""
+    from pyscf import gto, scf
+
+    from embasi_qiskit_integration.backends.pyscf import pyscf_layer_footing
+
+    mol = gto.M(atom="I 0 0 0; H 0 0 1.6", basis="def2-svp", ecp={"I": "def2-svp"}, verbose=0)
+    assert mol._ecp  # the test is only meaningful with a real ECP
+    layer = SimpleNamespace(atoms=SimpleNamespace(calc=SimpleNamespace(mol=mol)))
+    hcore, enuc = pyscf_layer_footing(layer)
+    np.testing.assert_allclose(hcore, scf.RHF(mol).get_hcore(), atol=1e-12)
+    assert enuc == pytest.approx(mol.energy_nuc())
+
+
 # --------------------------------------------------------------------------- #
 # Capabilities
 # --------------------------------------------------------------------------- #
 class _DFTOnlyBackend:
-    """A DFT-in-DFT-only code: matrices but no ERIs / exact exchange (SIESTA-like)."""
+    """A DFT-in-DFT-only code: matrices but no ERIs / exact exchange."""
 
     capabilities = frozenset({"arbitrary_dm_veff"})
 
@@ -288,28 +302,6 @@ def test_require_capability():
     require_capability(SimpleNamespace(), "eri", "x")  # undeclared stand-in: let through
     with pytest.raises(MissingCapabilityError, match="'eri' capability.*_DFTOnlyBackend"):
         require_capability(_DFTOnlyBackend(), "eri", "the downfold")
-
-
-def test_avas_projector_requires_the_minao_capability():
-    from embasi_qiskit_integration.selectors import avas_ao_projector
-
-    class _NoMinao(_DFTOnlyBackend):
-        def ao_atom_map(self):
-            return np.zeros(2, dtype=int)
-
-    with pytest.raises(MissingCapabilityError, match="minao_projector"):
-        avas_ao_projector(_NoMinao(), ["O 2p"])
-
-
-def test_downfold_refuses_a_backend_without_eris():
-    from embasi_qiskit_integration.projection_embedding_adapter import (
-        ProjectionEmbeddingAdapter,
-    )
-
-    adapter = ProjectionEmbeddingAdapter.__new__(ProjectionEmbeddingAdapter)
-    adapter.ints = _DFTOnlyBackend()
-    with pytest.raises(MissingCapabilityError, match="'hcore' capability"):
-        adapter._require_downfold_capabilities("the active-space downfold")
 
 
 def test_pyscf_backend_declares_everything_the_downfold_needs(water_uks):
@@ -336,25 +328,43 @@ def test_scf_guard_honours_a_backend_status():
 # --------------------------------------------------------------------------- #
 # Registry / --qm_code (Stage 2)
 # --------------------------------------------------------------------------- #
-def test_pyscf_is_the_default_backend():
-    from embasi_qiskit_integration.backends.registry import (
-        DEFAULT_QM_CODE,
-        available_backends,
-    )
+def test_qm_code_defaults_to_pyscf_and_accepts_only_registered_backends(monkeypatch):
+    """``--qm_code`` and the registry list the same codes, so neither can drift."""
+    import sys
+    import typing
+
+    from pydantic import ValidationError
+
+    from embasi_qiskit_integration.backends.registry import DEFAULT_QM_CODE, available_backends
+    from embasi_qiskit_integration.embedding import EmbeddingWorkflow
 
     assert DEFAULT_QM_CODE == "pyscf"
     assert DEFAULT_QM_CODE in available_backends()
-
-
-def test_qm_code_literal_matches_the_registry():
-    """``--qm_code`` and the registry list the same codes, so neither can drift."""
-    import typing
-
-    from embasi_qiskit_integration.backends.registry import available_backends
-    from embasi_qiskit_integration.embedding import EmbeddingWorkflow
-
     literal = typing.get_args(EmbeddingWorkflow.model_fields["qm_code"].annotation)
     assert sorted(literal) == available_backends()
+    monkeypatch.setattr(sys, "argv", ["prog"])
+    assert EmbeddingWorkflow(_cli_parse_args=False).qm_code == "pyscf"
+    with pytest.raises(ValidationError, match="qm_code"):
+        EmbeddingWorkflow(_cli_parse_args=False, qm_code="no-such-code")
+
+
+def test_refused_qm_code_reports_its_reason_before_embasi_is_imported(monkeypatch):
+    import builtins
+    import sys
+
+    from embasi_qiskit_integration.embedding import EmbeddingWorkflow, build_adapter
+
+    real_import = builtins.__import__
+
+    def no_embasi(name, *args, **kwargs):
+        if name == "embasi" or name.startswith("embasi."):
+            raise ImportError("simulated: no MPI library")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(sys, "argv", ["prog"])
+    monkeypatch.setattr(builtins, "__import__", no_embasi)
+    with pytest.raises(NotImplementedError, match="plane-wave code"):
+        build_adapter(EmbeddingWorkflow(_cli_parse_args=False, qm_code="espresso"), parallel=False)
 
 
 def test_make_backend_refuses_an_unknown_code():
@@ -364,9 +374,18 @@ def test_make_backend_refuses_an_unknown_code():
         make_backend("no-such-code", atoms=None, charge=0, cfg=SimpleNamespace())
 
 
-def test_pyscf_only_settings_are_refused_for_another_backend():
+def test_pyscf_only_settings_are_declared_and_refused_for_another_backend():
+    from embasi_qiskit_integration.backends import registry
     from embasi_qiskit_integration.backends.registry import check_backend_settings
 
+    registry.available_backends()
+    assert set(registry._BACKEND_ONLY_SETTINGS["pyscf"]) == {
+        "scf_newton",
+        "init_guess",
+        "init_guess_breaksym",
+        "density_fit",
+        "df_auxbasis",
+    }
     check_backend_settings("pyscf", SimpleNamespace(scf_newton=True, density_fit=True))
     check_backend_settings("cp2k", SimpleNamespace(scf_newton=False, init_guess=None))
     with pytest.raises(ValueError, match="--scf_newton is a pyscf option.*--qm_code cp2k"):
@@ -437,19 +456,6 @@ def test_pyscf_builder_constructs_matching_calculators_and_integrals():
     assert ints.nao == 7
 
 
-def test_qm_code_setting_accepts_only_implemented_backends(monkeypatch):
-    import sys
-
-    from pydantic import ValidationError
-
-    from embasi_qiskit_integration.embedding import EmbeddingWorkflow
-
-    monkeypatch.setattr(sys, "argv", ["prog"])
-    assert EmbeddingWorkflow(_cli_parse_args=False).qm_code == "pyscf"
-    with pytest.raises(ValidationError, match="qm_code"):
-        EmbeddingWorkflow(_cli_parse_args=False, qm_code="no-such-code")
-
-
 # --------------------------------------------------------------------------- #
 # Protocol enforcement: PySCF fallbacks are for stand-ins only
 # --------------------------------------------------------------------------- #
@@ -485,10 +491,25 @@ def _spin_adapter(ints):
     return ad
 
 
-def test_missing_veff_ll_spin_fails_instead_of_spin_averaging():
-    """A real backend without veff_ll_spin must not get the channel mean (0.42 Ha off)."""
-    with pytest.raises(MissingCapabilityError, match="veff_ll_spin"):
-        _spin_adapter(_RealBackendWithoutSpinVeff())._veff_ll_channel(0)
+def _real_adapter():
+    ad = _spin_adapter(_RealBackendWithoutSpinVeff())
+    ad.p = SimpleNamespace(A_LL=SimpleNamespace())
+    return ad
+
+
+@pytest.mark.parametrize(
+    "call, match",
+    [
+        # Without veff_ll_spin a real backend must not get the channel mean (0.42 Ha off).
+        (lambda ad: ad._veff_ll_channel(0), "veff_ll_spin"),
+        (lambda ad: ad._layer_scf_status(SimpleNamespace()), "layer_scf_status"),
+        (lambda ad: ad._a_fragment_footing(), "layer_footing"),
+    ],
+    ids=["veff_ll_spin", "layer_scf_status", "layer_footing"],
+)
+def test_real_backend_missing_a_method_fails(call, match):
+    with pytest.raises(MissingCapabilityError, match=match):
+        call(_real_adapter())
 
 
 def test_stand_in_without_veff_ll_spin_still_uses_the_mean():
@@ -501,27 +522,42 @@ def test_stand_in_without_veff_ll_spin_still_uses_the_mean():
     np.testing.assert_array_equal(ad._veff_ll_channel(1), np.full((2, 2), 7.0))
 
 
-def test_real_backend_without_scf_status_or_footing_fails():
-    ad = _spin_adapter(_RealBackendWithoutSpinVeff())
-    with pytest.raises(MissingCapabilityError, match="layer_scf_status"):
-        ad._layer_scf_status(SimpleNamespace())
-    ad.p = SimpleNamespace(A_LL=SimpleNamespace())
-    with pytest.raises(MissingCapabilityError, match="layer_footing"):
-        ad._a_fragment_footing()
+# --------------------------------------------------------------------------- #
+# Capability gates on AVAS, the downfold, h_emb, the footing and the K-based rankings
+# --------------------------------------------------------------------------- #
+def _avas_without_minao():
+    from embasi_qiskit_integration.selectors import avas_ao_projector
+
+    class _NoMinao(_DFTOnlyBackend):
+        def ao_atom_map(self):
+            return np.zeros(2, dtype=int)
+
+    avas_ao_projector(_NoMinao(), ["O 2p"])
 
 
-# --------------------------------------------------------------------------- #
-# Capability gates on h_emb, the footing and the K-based rankings
-# --------------------------------------------------------------------------- #
-def test_h_emb_and_footing_refuse_a_backend_without_hcore():
+def _dft_only_adapter():
     ad = _spin_adapter(_DFTOnlyBackend())
     ad._fock = np.eye(2)
-    with pytest.raises(MissingCapabilityError, match="h_emb needs the 'hcore'"):
-        _ = ad.h_emb
-    with pytest.raises(MissingCapabilityError, match="spin-0 embedded one-body.*'hcore'"):
-        ad._veff_ll_channel(0)
-    with pytest.raises(MissingCapabilityError, match="footing rebase needs the 'hcore'"):
-        ad._a_fragment_footing()
+    return ad
+
+
+@pytest.mark.parametrize(
+    "call, match",
+    [
+        (_avas_without_minao, "minao_projector"),
+        (
+            lambda: _dft_only_adapter()._require_downfold_capabilities("the AS downfold"),
+            "'hcore' capability",
+        ),
+        (lambda: _dft_only_adapter().h_emb, "h_emb needs the 'hcore'"),
+        (lambda: _dft_only_adapter()._veff_ll_channel(0), "spin-0 embedded one-body.*'hcore'"),
+        (lambda: _dft_only_adapter()._a_fragment_footing(), "footing rebase needs the 'hcore'"),
+    ],
+    ids=["avas", "downfold", "h_emb", "veff_channel", "footing"],
+)
+def test_a_backend_without_the_capability_is_refused(call, match):
+    with pytest.raises(MissingCapabilityError, match=match):
+        call()
 
 
 def test_k_based_rankings_are_gated_on_exact_exchange():
@@ -551,19 +587,6 @@ def test_scf_hint_names_pyscf_flags_only_for_pyscf():
     )
     with pytest.raises(RuntimeError, match="--scf_newton"):
         _require_scf_converged(layer, "x")
-
-
-def test_pyscf_declares_its_own_backend_only_settings():
-    from embasi_qiskit_integration.backends import registry
-
-    registry.available_backends()
-    assert set(registry._BACKEND_ONLY_SETTINGS["pyscf"]) == {
-        "scf_newton",
-        "init_guess",
-        "init_guess_breaksym",
-        "density_fit",
-        "df_auxbasis",
-    }
 
 
 def test_fingerprint_does_not_read_private_backend_state():

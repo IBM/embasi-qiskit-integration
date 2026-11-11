@@ -338,9 +338,7 @@ def test_spin_block_accepts_either_spin_count_attribute():
 
 
 def test_operators_average_the_spin_channels_while_densities_sum():
-    """Regression: F_emb, v_emb and P_B went through the density helper and were SUMMED
-    over spin, doubling every operator on an ``unrestricted=True`` run without
-    ``spin_downfold`` (closed-shell water came out 40 Ha low)."""
+    """Regression: operators were summed over spin like densities (water 40 Ha low)."""
     rng = np.random.default_rng(5)
     a, b = rng.standard_normal((2, 4, 4))
     block = np.stack([a, b])  # (nspin, nao, nao): what the adapter gets from EmbASI

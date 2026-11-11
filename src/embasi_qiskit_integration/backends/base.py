@@ -3,18 +3,10 @@
 
 """The code-agnostic seam between the embedding workflow and a QM code.
 
-Everything the workflow needs from the QM code beyond what EmbASI's
-``ProjectionEmbedding`` hands back goes through the two protocols here:
-
-* :class:`AOBasis` -- metadata about the AO basis (which atom each function sits on,
-  its shell label), used to pick fragment AOs and AVAS targets.
-* :class:`AOIntegrals` -- AO-basis operators and integrals (overlap, ``hcore``, mean-field
-  potentials at a given density, ERIs), used by the downfold.  It is also an
-  :class:`AOBasis`, so one backend object serves both.
-
-A backend advertises what it can actually supply in ``capabilities``; a path that needs
-something a backend lacks fails up front through :func:`require_capability` rather than
-producing a wrong number.  PySCF (:mod:`.pyscf`) supplies everything.
+:class:`AOBasis` describes the AO basis (atom and shell of each function);
+:class:`AOIntegrals` adds the operators and integrals the downfold needs.  A backend
+lists what it can supply in ``capabilities``, and a path needing something missing fails
+up front through :func:`require_capability`.
 """
 
 from __future__ import annotations
@@ -24,9 +16,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
-# A density argument to the `veff_*` accessors: either the spin-summed AO matrix or a
-# genuine `(alpha, beta)` pair.  The pair matters for a KS low level, whose xc is
-# nonlinear in the spin densities -- see `ProjectionEmbeddingAdapter._dm_a_for_veff`.
+# A spin-summed AO density or an (alpha, beta) pair (see `_dm_a_for_veff`).
 DensityArg = np.ndarray | tuple[np.ndarray, np.ndarray]
 
 # --------------------------------------------------------------------------- #
@@ -55,9 +45,7 @@ class MissingCapabilityError(NotImplementedError):
 def require_capability(backend: Any, capability: str, what: str) -> None:
     """Raise :class:`MissingCapabilityError` if ``backend`` lacks ``capability``.
 
-    A backend that declares no ``capabilities`` at all (a test stand-in) is let through:
-    the check exists to stop a *real* backend that knows it cannot supply a quantity, not
-    to force every stub to enumerate what it fakes.
+    A backend without ``capabilities`` (a test stand-in) is let through.
     """
     caps = getattr(backend, "capabilities", None)
     if caps is None or capability in caps:
@@ -72,11 +60,8 @@ def require_capability(backend: Any, capability: str, what: str) -> None:
 def backend_method(backend: Any, name: str, fallback: Any = None) -> Any:
     """``backend.<name>``, or ``fallback`` for a test stand-in that does not implement it.
 
-    The fallback is only for stand-ins, i.e. objects that declare no ``capabilities``
-    (the same rule :func:`require_capability` uses).  A real backend declares its
-    capabilities, and if it leaves out a protocol method it gets an error here instead
-    of silently getting PySCF's behaviour, or a spin average where a per-channel
-    potential was needed.  ``None`` as the result tells the caller to use its stand-in path.
+    Only objects without ``capabilities`` get the fallback; a real backend missing a
+    protocol method raises instead of silently getting PySCF's behaviour.
     """
     method = getattr(backend, name, None)
     if callable(method):
@@ -100,12 +85,7 @@ class AOBasis(Protocol):
     def nao(self) -> int: ...
 
     def ao_atom_map(self) -> np.ndarray:
-        """``(nao,)`` int array: the atom index each AO is centred on.
-
-        Atom indices are positions in the (region-1-first) atom list the workflow hands
-        the QM code, so they line up with ``active_atoms`` after the reorder.  AOs of one
-        atom are assumed contiguous.
-        """
+        """``(nao,)`` atom index of each AO, in the region-1-first atom order."""
 
     def ao_labels(self) -> list[tuple[int, str, str, str]]:
         """One ``(atom_index, element, shell, m_label)`` per AO, e.g. ``(0, "O", "2p", "x")``."""
@@ -114,12 +94,8 @@ class AOBasis(Protocol):
         """AO indices matching any of ``labels`` (``"Fe 3d"``, ``"C 2p"``, ...)."""
 
     def describe(self) -> dict[str, Any]:
-        """Identity of the system and method, for state fingerprints.
-
-        Keys read by the fingerprint: ``basis``, ``natm``, ``charge``, ``spin``,
-        ``atom_coords`` (an ``(natm, 3)`` array, hashed rather than stored),
-        ``atom_symbols``, and optionally ``xc_hl`` / ``density_fit``.
-        """
+        """Fingerprint fields: ``basis``, ``natm``, ``charge``, ``spin``, ``atom_coords``,
+        ``atom_symbols``, optionally ``xc_hl`` / ``density_fit``."""
 
 
 class AOIntegrals(AOBasis, Protocol):
@@ -129,33 +105,14 @@ class AOIntegrals(AOBasis, Protocol):
     def hcore(self) -> np.ndarray: ...
 
     def veff_hl(self, dm: DensityArg) -> np.ndarray:
-        """Effective potential of the *high-level* calculator, at a 2-occupancy dm.
-
-        Must match ``calc_base_hl``.  Retained for callers that want the
-        high-level mean field explicitly; the :attr:`h_emb` inverse uses
-        :meth:`veff_ll` instead -- see that method.
-
-        ``dm`` may be an ``(alpha, beta)`` pair; see :meth:`veff_ll` for why that
-        matters and what the return must be in that case.
-        """
+        """Effective potential of ``calc_base_hl`` at a 2-occupancy dm (see :meth:`veff_ll`)."""
 
     def veff_ll(self, dm: DensityArg) -> np.ndarray:
-        """Effective potential of the *low-level* calculator, at a 2-occupancy dm.
+        """Effective potential of ``calc_base_ll`` at a 2-occupancy dm.
 
-        Must match ``calc_base_ll``: it exists only to undo the mean-field
-        contribution EmbASI folded into ``F_emb``.  ``F_emb`` is assembled from
-        the **A_LL** one-electron blocks (see
-        :meth:`ProjectionEmbeddingAdapter._assemble_fock_a_only`), so the mean
-        field baked into it is the *low-level* one, and that is what
-        :attr:`ProjectionEmbeddingAdapter.h_emb` must subtract back off.
-
-        ``dm`` is either a spin-summed ``(nao, nao)`` matrix or an
-        ``(alpha, beta)`` pair -- the adapter passes the pair whenever it has one
-        (:attr:`ProjectionEmbeddingAdapter._dm_a_for_veff`), because an
-        unrestricted KS ``get_veff`` handed a summed matrix silently substitutes
-        ``d/2`` for both channels and loses the spin polarisation.  The **return**
-        is always a single ``(nao, nao)`` operator: a spin-resolved backend must
-        average its two channels, not sum them (a potential is per-electron).
+        It undoes the low-level mean field EmbASI folded into ``F_emb`` (see
+        :attr:`ProjectionEmbeddingAdapter.h_emb`).  ``dm`` may be an ``(alpha, beta)``
+        pair; the return is one ``(nao, nao)`` operator, the mean of the spin channels.
         """
 
     def veff_ll_spin(self, dm: tuple[np.ndarray, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
@@ -165,42 +122,17 @@ class AOIntegrals(AOBasis, Protocol):
         """The low-level calculator's electronic energy at a 2-occupancy ``dm`` (no E_nuc)."""
 
     def veff_hf(self, dm: np.ndarray) -> np.ndarray:
-        """Hartree-Fock effective potential J[dm] - K[dm]/2, at a 2-occupancy dm.
-
-        Used for the inactive-core downfold, independently of the high level.
-        """
+        """HF potential ``J[dm] - K[dm]/2`` at a 2-occupancy dm (inactive-core downfold)."""
 
     def get_k(self, dm: np.ndarray) -> np.ndarray:
-        """Bare HF exchange operator K[dm] (no J, no 0.5 factor), at a 2-occupancy dm.
-
-        Used only by the APC active-space ranking (:meth:`ProjectionEmbeddingAdapter.
-        build_orbitals_apc_concentric`), which needs K's diagonal separately from the
-        combined ``veff_hf`` (King & Gagliardi, *J. Chem. Theory Comput.* **2021**, 17,
-        7. eq. 18: ``(ia|ia) ~ 0.5 K_aa``).
-        """
+        """Bare exchange ``K[dm]`` at a 2-occupancy dm (APC ranking, King & Gagliardi 2021)."""
 
     def veff_uhf(self, dm_a: np.ndarray, dm_b: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-        """Unrestricted HF mean field of a spin-resolved 1-occupancy density pair.
+        """Unrestricted HF mean field ``(v_alpha, v_beta, e_two_body)`` of a 1-occupancy pair.
 
-        Returns ``(v_alpha, v_beta, e_two_body)`` where
-        ``v_sigma = J[dm_a + dm_b] - K[dm_sigma]`` and
-        ``e_two_body = 0.5 tr[d J[d]] - 0.5 (tr[dm_a K[dm_a]] + tr[dm_b K[dm_b]])``
-        with ``d = dm_a + dm_b``.
-
-        This is the frozen-core fold the *per-spin* downfold needs, and it is **not**
-        obtainable from :meth:`veff_hf`.  ``veff_hf`` is the restricted ``J - K/2``:
-        correct only when the two channels share an orbital set, because Coulomb is a
-        functional of the total density but **exchange couples like spins only**.
-        Using the spin-averaged form for two genuinely different cores understates the
-        channel splitting -- measured (ERI-only ground truth, 6-31g, valence-like cores
-        overlapping by 0.34) ``max|v_avg - v_alpha| = 1.09 Ha`` and **+0.78 Ha
-        (+492 kcal/mol)** on the CAS total.  It vanishes only as the two cores coincide,
-        which is why a deep-1s frozen core (overlap 0.9999998) hides it at 0.02
-        kcal/mol.
-
-        The energy is returned alongside the potentials rather than left to the caller
-        because the exchange self-interaction does not factor out of
-        ``0.5 tr[d v]``: that expression is only valid for the restricted ``J - K/2``.
+        ``v_s = J[dm_a + dm_b] - K[dm_s]``.  The per-spin frozen-core fold needs this:
+        :meth:`veff_hf` is exact only when both channels share an orbital set, since
+        exchange couples like spins only.
         """
 
     def eri_mo(self, mo_coeff: np.ndarray) -> np.ndarray:
@@ -212,11 +144,7 @@ class AOIntegrals(AOBasis, Protocol):
     def energy_nuc(self) -> float: ...
 
     def layer_scf_status(self, layer: Any) -> dict[str, Any] | None:
-        """``{"converged", "max_cycle", "e_tot", "conv_tol"}`` of an EmbASI layer's SCF.
-
-        ``None`` when the layer's calculator does not expose a convergence flag; the
-        guard then lets it through (EmbASI itself gives no flag).
-        """
+        """``{"converged", "max_cycle", "e_tot", "conv_tol"}`` of a layer's SCF, or ``None``."""
 
     def hl_scf_status(self) -> dict[str, Any]:
         """Convergence settings/state of the high-level mean field, for diagnostics."""
@@ -229,12 +157,7 @@ class AOIntegrals(AOBasis, Protocol):
 # Helpers
 # --------------------------------------------------------------------------- #
 def as_ao_basis(obj: Any) -> AOBasis:
-    """Return ``obj`` as an :class:`AOBasis`.
-
-    A backend passes straight through.  A bare PySCF ``Mole`` (anything with
-    ``aoslice_by_atom``) is wrapped in :class:`~.pyscf.PySCFBasis`, so existing callers
-    that still hand a ``mol`` keep working.
-    """
+    """``obj`` as an :class:`AOBasis`; a PySCF ``Mole`` is wrapped in :class:`~.pyscf.PySCFBasis`."""
     if hasattr(obj, "ao_atom_map"):
         return obj
     if hasattr(obj, "aoslice_by_atom"):

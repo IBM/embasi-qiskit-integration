@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -111,7 +112,7 @@ def test_dropped_negative_integrals_ignores_tiny_spaces_and_jk_only_tensors():
 # --------------------------------------------------------------------------- #
 # Input generation
 # --------------------------------------------------------------------------- #
-def _input(section=("FORCE_EVAL", "DFT"), multiplicity=1, n_act=4, n_val=8):
+def _input(section=("FORCE_EVAL", "DFT"), multiplicity=1, n_act=4, n_val=8, **kw):
     return cp2k.active_space_input(
         ["O", "H", "H"],
         [[5.0, 5.0, 5.0], [5.0, 5.757, 5.587], [5.0, 4.243, 5.587]],
@@ -120,6 +121,7 @@ def _input(section=("FORCE_EVAL", "DFT"), multiplicity=1, n_act=4, n_val=8):
         potential=POTENTIAL,
         data_dir="/data",
         section=section,
+        **kw,
     )
 
 
@@ -133,15 +135,10 @@ def test_input_places_active_space_where_the_installed_cp2k_wants_it():
         assert "ADDED_MOS 2" in text  # the two active virtuals
         assert "INACTIVE_ELECTRONS 4\n" in text
         assert "POTENTIAL GTH-PBE-q6" in text and "/data/BASIS_MOLOPT" in text
+        assert "CHARGE" not in text
+    assert "    CHARGE 1\n" in _input(charge=1)
     with pytest.raises(ValueError, match="unsupported ACTIVE_SPACE location"):
         _input(("FORCE_EVAL", "PROPERTIES"))
-
-
-def test_unrestricted_input_uses_per_spin_lists():
-    """CP2K reads ACTIVE_ORBITALS / INACTIVE_ELECTRONS as per-spin lists under UKS."""
-    text = _input(multiplicity=2, n_act=3, n_val=7)
-    assert "UKS" in text and "MULTIPLICITY 2" in text
-    assert "INACTIVE_ELECTRONS 2 2" in text and "ACTIVE_ORBITALS 4 4" in text
 
 
 def test_spin_split_and_its_refusals():
@@ -163,23 +160,6 @@ def test_valence_from_potential():
 # --------------------------------------------------------------------------- #
 # Section discovery, output parsing, refusal
 # --------------------------------------------------------------------------- #
-def _xml(tmp_path, under_print):
-    inner = "<SECTION><NAME>ACTIVE_SPACE</NAME></SECTION>"
-    if under_print:
-        inner = f"<SECTION><NAME>PRINT</NAME>{inner}</SECTION>"
-    path = tmp_path / "cp2k_input.xml"
-    path.write_text(
-        "<CP2K_INPUT><SECTION><NAME>FORCE_EVAL</NAME><SECTION><NAME>DFT</NAME>"
-        f"{inner}</SECTION></SECTION></CP2K_INPUT>"
-    )
-    return path
-
-
-def test_active_space_section_from_xml(tmp_path):
-    assert cp2k.active_space_section_in_xml(_xml(tmp_path, True)) == ("FORCE_EVAL", "DFT", "PRINT")
-    assert cp2k.active_space_section_in_xml(_xml(tmp_path, False)) == ("FORCE_EVAL", "DFT")
-
-
 def _modern_xml(tmp_path):
     """The ACTIVE_SPACE part of a CP2K >= 2026.1 ``--xml`` (no INACTIVE_ELECTRONS, no
     ISOLATED_SYSTEM, a single-valued ACTIVE_ORBITALS, &ERI PERIODICITY)."""
@@ -206,40 +186,47 @@ def _modern_xml(tmp_path):
     return path
 
 
-@pytest.mark.parametrize("multiplicity, n_act, n_val", [(1, 4, 8), (2, 3, 7)])
+@pytest.mark.parametrize(
+    "legacy, section, version",
+    [(True, ("FORCE_EVAL", "DFT", "PRINT"), (7, 1)), (False, ("FORCE_EVAL", "DFT"), None)],
+    ids=["7.1", "2026.1"],
+)
+def test_active_space_layout_from_xml(tmp_path, legacy, section, version):
+    """7.1's own --xml (ACTIVE_SPACE section only) keeps lists and ISOLATED_SYSTEM."""
+    xml = DATA / "cp2k71_active_space.xml" if legacy else _modern_xml(tmp_path)
+    layout = cp2k.active_space_layout_in_xml(xml)
+    assert layout.section == cp2k.active_space_section_in_xml(xml) == section
+    assert (cp2k.LEGACY_KEYWORDS <= layout.keywords) == legacy
+    assert layout.orbitals_per_spin == legacy and layout.version == version
+
+
+@pytest.mark.parametrize(
+    "modern, multiplicity, n_act, n_val, present, absent",
+    [
+        (False, 2, 3, 7, ["INACTIVE_ELECTRONS 2 2", "ACTIVE_ORBITALS 4 4"], []),
+        (True, 1, 4, 8, ["ACTIVE_ORBITALS 4\n", "PERIODICITY 0 0 0"], ["UKS"]),
+        (True, 2, 3, 7, ["ACTIVE_ORBITALS 4\n", "PERIODICITY 0 0 0"], []),
+    ],
+    ids=["7.1-uks", "2026.1-rks", "2026.1-uks"],
+)
 def test_input_writes_only_the_keywords_the_installed_cp2k_has(
-    tmp_path, multiplicity, n_act, n_val
+    tmp_path, modern, multiplicity, n_act, n_val, present, absent
 ):
     """Regression: INACTIVE_ELECTRONS (gone in 2024.1), a per-spin ACTIVE_ORBITALS list
     (single-valued from 2024.1) and ISOLATED_SYSTEM (gone in 2026.1) were always written,
     and CP2K's parser aborts on any of them."""
-    layout = cp2k.active_space_layout_in_xml(_modern_xml(tmp_path))
-    assert layout.section == ("FORCE_EVAL", "DFT") and not layout.orbitals_per_spin
-    text = cp2k.active_space_input(
-        ["O", "H", "H"],
-        [[5.0, 5.0, 5.0], [5.0, 5.757, 5.587], [5.0, 4.243, 5.587]],
-        spec=cp2k.ActiveSpaceSpec(n_act, 4, n_val, multiplicity=multiplicity),
-        basis=BASIS,
-        potential=POTENTIAL,
-        data_dir="/data",
-        layout=layout,
-    )
-    assert "INACTIVE_ELECTRONS" not in text and "ISOLATED_SYSTEM" not in text
-    assert "ACTIVE_ORBITALS 4\n" in text and "PERIODICITY 0 0 0" in text
-    assert ("UKS" in text) == (multiplicity != 1)
+    layout = cp2k.active_space_layout_in_xml(_modern_xml(tmp_path)) if modern else None
+    text = _input(multiplicity=multiplicity, n_act=n_act, n_val=n_val, layout=layout)
+    if multiplicity != 1:
+        present = [*present, "UKS", f"MULTIPLICITY {multiplicity}"]
+    if modern:
+        absent = [*absent, "INACTIVE_ELECTRONS", "ISOLATED_SYSTEM"]
+    assert all(s in text for s in present), present
+    assert not any(s in text for s in absent), absent
 
 
-def test_cp2k71_xml_keeps_the_legacy_keywords():
-    """CP2K 7.1's own --xml (ACTIVE_SPACE section only): lists and ISOLATED_SYSTEM stay."""
-    layout = cp2k.active_space_layout_in_xml(DATA / "cp2k71_active_space.xml")
-    assert layout.section == ("FORCE_EVAL", "DFT", "PRINT")
-    assert cp2k.LEGACY_KEYWORDS <= layout.keywords and layout.orbitals_per_spin
-    assert layout.version == (7, 1)
-
-
-def test_unrestricted_spec_is_refused_on_cp2k7_before_running(tmp_path, monkeypatch):
-    """CP2K 7.1's UKS active space aborts -- or, about one run in seven, segfaults --
-    after the SCF, so it is refused up front instead of run."""
+def _run_offline(tmp_path, monkeypatch, spec, run):
+    """run_active_space for OH against the 7.1 layout, with ``run`` in place of CP2K."""
     import subprocess
 
     from ase import Atoms
@@ -250,21 +237,42 @@ def test_unrestricted_spec_is_refused_on_cp2k7_before_running(tmp_path, monkeypa
     (data / "GTH_POTENTIALS").write_text("")
     layout = cp2k.active_space_layout_in_xml(DATA / "cp2k71_active_space.xml")
     monkeypatch.setattr(cp2k, "active_space_layout", lambda exe=None: layout)
+    monkeypatch.setattr(subprocess, "run", run)
+    return cp2k.run_active_space(
+        Atoms("OH", positions=[(0, 0, 0), (0, 0, 0.97)]),
+        spec,
+        workdir=tmp_path / "w",
+        basis=BASIS,
+        potential=POTENTIAL,
+        data_dir=data,
+        executable="cp2k",
+    )
+
+
+def test_unrestricted_spec_is_refused_on_cp2k7_before_running(tmp_path, monkeypatch):
+    """CP2K 7.1's UKS active space aborts -- or, about one run in seven, segfaults --
+    after the SCF, so it is refused up front instead of run."""
 
     def never(*a, **k):
         raise AssertionError("CP2K must not be run")
 
-    monkeypatch.setattr(subprocess, "run", never)
+    spec = cp2k.ActiveSpaceSpec(3, 3, 7, multiplicity=2)
     with pytest.raises(RuntimeError, match="Spin option not yet available"):
-        cp2k.run_active_space(
-            Atoms("OH", positions=[(0, 0, 0), (0, 0, 0.97)]),
-            cp2k.ActiveSpaceSpec(3, 3, 7, multiplicity=2),
-            workdir=tmp_path / "w",
-            basis=BASIS,
-            potential=POTENTIAL,
-            data_dir=data,
-            executable="cp2k",
-        )
+        _run_offline(tmp_path, monkeypatch, spec, never)
+
+
+def test_cp2k_run_never_returns_a_stale_fcidump(tmp_path, monkeypatch):
+    """A crash that writes no FCIDUMP must not hand back the previous run's file."""
+    stale = tmp_path / "w" / "active.fcidump"
+    stale.parent.mkdir()
+    stale.write_text("stale")
+
+    def segfault(*a, **k):
+        return SimpleNamespace(returncode=139)
+
+    with pytest.raises(RuntimeError, match="exited with status 139"):
+        _run_offline(tmp_path, monkeypatch, cp2k.ActiveSpaceSpec(2, 2, 6), segfault)
+    assert not stale.exists()
 
 
 @pytest.mark.parametrize(
@@ -282,7 +290,7 @@ def test_total_energy_in_every_cp2k_output_format(tmp_path, unit):
     assert cp2k.read_total_energy(out) == pytest.approx(-17.220800284869728, abs=1e-15)
 
 
-def test_abort_message_and_total_energy(tmp_path):
+def test_abort_message(tmp_path):
     out = tmp_path / "x.out"
     out.write_text(
         " *  /   \\       *\n * [ABORT]       *\n"
@@ -290,9 +298,6 @@ def test_abort_message_and_total_energy(tmp_path):
     )
     assert cp2k.abort_message(out) == "Spin option not yet available"
     assert cp2k.abort_message(DATA / "h2o_cas44_energy.out") is None
-    assert cp2k.read_total_energy(DATA / "h2o_cas44_energy.out") == pytest.approx(
-        -17.220800284869728, abs=1e-15
-    )
 
 
 def test_cp2k_backend_refuses_projection_embedding_and_points_to_its_route():
@@ -306,14 +311,10 @@ def test_cp2k_backend_refuses_projection_embedding_and_points_to_its_route():
 # Against the real code
 # --------------------------------------------------------------------------- #
 @needs_cp2k
-def test_real_cp2k_reports_where_active_space_lives():
-    assert cp2k.active_space_section()[:2] == ("FORCE_EVAL", "DFT")
-
-
-@needs_cp2k
 def test_run_active_space_end_to_end(tmp_path):
     from ase import Atoms
 
+    assert cp2k.active_space_section()[:2] == ("FORCE_EVAL", "DFT")
     atoms = Atoms("OH2", positions=[(0, 0, 0), (0, 0.757, 0.587), (0, -0.757, 0.587)])
     run = cp2k.run_active_space(
         atoms, cp2k.ActiveSpaceSpec(4, 4, 8), workdir=tmp_path, basis=BASIS, potential=POTENTIAL
@@ -324,21 +325,23 @@ def test_run_active_space_end_to_end(tmp_path):
 
 
 @needs_cp2k
-def test_unrestricted_active_space_abort_is_reported(tmp_path):
+def test_unrestricted_active_space(tmp_path):
+    """CP2K < 8 is refused before running; a newer CP2K writes a UHF FCIDUMP."""
     from ase import Atoms
 
     if shutil.which("cp2k.ssmp") is None and not os.environ.get(cp2k.EXE_ENV):
         pytest.skip("needs cp2k.ssmp")
-    atoms = Atoms("OH", positions=[(0, 0, 0), (0, 0, 0.97)])
+    version = cp2k.active_space_layout().version
+    refused = version is not None and version < (8, 0)
     try:
         run = cp2k.run_active_space(
-            atoms,
+            Atoms("OH", positions=[(0, 0, 0), (0, 0, 0.97)]),
             cp2k.ActiveSpaceSpec(3, 3, 7, multiplicity=2),
             workdir=tmp_path,
             basis=BASIS,
             potential=POTENTIAL,
         )
-    except RuntimeError as exc:  # CP2K 7.1: its active-space module is restricted-only
-        assert "Spin option not yet available" in str(exc)
-    else:  # a newer CP2K: a genuine UHF FCIDUMP
-        assert fcidump.read(run.fcidump).is_spin_dependent
+    except RuntimeError as exc:
+        assert refused and "Spin option not yet available" in str(exc)
+    else:
+        assert not refused and fcidump.read(run.fcidump).is_spin_dependent

@@ -674,7 +674,6 @@ class ProjectionEmbeddingAdapter:
         these off the same A_LL object EmbASI integrated keeps the downfold
         bit-identical to the previous ``construct_embedded_fock()`` path.
         """
-        # Operators: the spin-channel MEAN (`_as_ao_operator`), never the sum -- see there.
         h_kin_a = self._as_ao_operator(self.p.A_LL.hamiltonian_kinetic)
         h_estat_xc_a = self._as_ao_operator(self.p.A_LL.hamiltonian_estat_plus_xc)
         self._fock = h_kin_a + h_estat_xc_a + self._v_emb_embasi + self._p_b
@@ -789,7 +788,6 @@ class ProjectionEmbeddingAdapter:
                 "construct_embedding_potential returned P_B=None; only "
                 "projection='level-shift' (constant projector) can be exported"
             )
-        # Operators, so the channel mean (`_as_ao_operator`); the densities above sum.
         self._p_b = self._as_ao_operator(p_b_embasi)
         self._v_emb_embasi = self._as_ao_operator(v_emb_embasi)
 
@@ -1362,16 +1360,10 @@ class ProjectionEmbeddingAdapter:
         return self._as_ao_matrix(arr)
 
     def _as_ao_operator(self, m) -> np.ndarray:
-        """Spin-restricted ``(nao, nao)`` *operator*: the mean of a length-2 spin axis.
+        """Spin-restricted ``(nao, nao)`` operator: the MEAN of a length-2 spin axis.
 
-        The operator counterpart of :meth:`_as_ao_total`.  A density is additive over
-        spin (``d = d_alpha + d_beta``) but an operator is per-electron: the restricted
-        equivalent of ``(F_alpha, F_beta)`` is ``(F_alpha + F_beta) / 2`` -- on a closed
-        shell exactly the restricted ``F``.  Summing them doubled ``F_emb``, ``v_emb``
-        and ``P_B`` on an ``unrestricted=True`` run without ``spin_downfold``, while
-        :attr:`h_emb` subtracts the channel-mean ``veff_ll``: ``h_emb = 2F - veff``
-        put the closed-shell water total 40 Ha low (-153.69 vs -113.77 Ha).  Restricted
-        runs (one channel) are unchanged.
+        The operator counterpart of :meth:`_as_ao_total` (densities sum, operators are
+        per-electron); summing ``F_emb``/``v_emb``/``P_B`` doubled them.
         """
         arr = np.asarray(m)
         if self.unrestricted:

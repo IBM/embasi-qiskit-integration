@@ -194,28 +194,6 @@ def _assert_same_spin_blocks(a, b, atol=1e-12):
     assert a.e_core == pytest.approx(b.e_core, abs=atol)
 
 
-def test_uhf_write_read_roundtrip_is_exact(tmp_path):
-    ham, _mf = _uhf_ham()
-    path = tmp_path / "uhf.fcidump"
-    fcidump.write_uhf(ham, path)
-    assert "UHF=1" in path.read_text().split("/")[0]
-    back = fcidump.read(path)  # read() dispatches on UHF=1, no sidecar needed
-    _assert_same_spin_blocks(ham, back)
-    assert back.meta["fcidump_uhf_layout"] == "spin-orbital"
-    assert _fci(back) == pytest.approx(_fci(ham), abs=1e-10)
-
-
-def test_uhf_fcidump_reproduces_the_uhf_energy_at_full_space(tmp_path):
-    """Full space of an OH doublet: FCI on the UHF integrals is a well-defined energy, and
-    an alpha/beta mix-up in the reader would move it by Hartrees, not round-off."""
-    ham, mf = _uhf_ham()
-    path = tmp_path / "uhf.fcidump"
-    fcidump.write_uhf(ham, path)
-    e = _fci(fcidump.read(path))
-    assert e < mf.e_tot  # correlation lowers the UHF energy
-    assert e == pytest.approx(_fci(ham), abs=1e-10)
-
-
 def _write_separated(ham, path):
     """Molpro-style: indices restart at 1, a `0 0 0 0` line closes each block."""
     n = ham.norb
@@ -245,19 +223,8 @@ def _write_separated(ham, path):
     path.write_text("\n".join(lines) + "\n")
 
 
-def test_uhf_separator_layout_reads_to_the_same_hamiltonian(tmp_path):
-    ham, _mf = _uhf_ham()
-    path = tmp_path / "molpro.fcidump"
-    _write_separated(ham, path)
-    back = fcidump.read(path)
-    _assert_same_spin_blocks(ham, back)
-    assert back.meta["fcidump_uhf_layout"] == "separated"
-
-
-def test_uhf_cp2k_layout_with_beta_alpha_pair_order(tmp_path):
+def _write_beta_alpha(ham, path):
     """CP2K writes (aa|bb) with the beta pair second; a (bb|aa) line must land transposed."""
-    ham, _mf = _uhf_ham()
-    path = tmp_path / "cp2k.fcidump"
     fcidump.write_uhf(ham, path)
     n = ham.norb
     text = path.read_text().splitlines()
@@ -270,7 +237,30 @@ def test_uhf_cp2k_layout_with_beta_alpha_pair_order(tmp_path):
                 parts = [parts[0], str(k), str(m), str(i), str(j)]
         swapped.append(" ".join(parts) if len(parts) == 5 else line)
     path.write_text("\n".join(swapped) + "\n")
-    _assert_same_spin_blocks(ham, fcidump.read(path))
+
+
+_WRITERS = {
+    "spin-orbital": fcidump.write_uhf,
+    "separated": _write_separated,
+    "beta-alpha": _write_beta_alpha,
+}
+
+
+@pytest.mark.parametrize("layout", list(_WRITERS))
+def test_uhf_fcidump_reads_back_exactly_in_every_layout(tmp_path, layout):
+    """Full space of an OH doublet: an alpha/beta mix-up would move FCI by Hartrees."""
+    ham, mf = _uhf_ham()
+    path = tmp_path / "uhf.fcidump"
+    _WRITERS[layout](ham, path)
+    assert "UHF=1" in path.read_text().split("/")[0]
+    back = fcidump.read(path)  # read() dispatches on UHF=1, no sidecar needed
+    _assert_same_spin_blocks(ham, back)
+    assert back.meta["fcidump_uhf_layout"] == (
+        "separated" if layout == "separated" else "spin-orbital"
+    )
+    e = _fci(back)
+    assert e < mf.e_tot  # correlation lowers the UHF energy
+    assert e == pytest.approx(_fci(ham), abs=1e-10)
 
 
 def test_spin_resolved_ham_roundtrips_through_write_via_the_sidecar(tmp_path):
@@ -292,27 +282,88 @@ def test_restricted_write_is_unchanged_by_the_spin_sidecar(tmp_path, rng):
         assert set(npz.files) == {"e_core", "nelec", "meta_json"}
 
 
+_RESTRICTED_BODY = " 0.5 1 1 1 1\n 0.5 2 2 2 2\n-1.0 1 1 0 0\n-0.5 2 2 0 0\n 0.0 0 0 0 0\n"
+_UHF_BODY = " 0.5 1 1 1 1\n 0.5 3 3 3 3\n 0.4 1 1 3 3\n-1.0 1 1 0 0\n-0.9 3 3 0 0\n 0.0 0 0 0 0\n"
+
+
+@pytest.mark.parametrize(
+    "flags, body",
+    [
+        ("UHF=.FALSE.,TREL=.FALSE.,\n ORBSYM=1,1,\n ISYM=1,\n &END", _RESTRICTED_BODY),
+        ("IUHF=1,\n /", _UHF_BODY),
+        ("UHF=.TRUE.,\n /", _UHF_BODY),
+    ],
+    ids=["logical-false", "iuhf", "logical-true"],
+)
+def test_logical_and_iuhf_header_flags_select_the_reader(tmp_path, flags, body):
+    """Regression: Fortran logicals and the IUHF spelling were not read."""
+    path = tmp_path / "x.fcidump"
+    path.write_text(f"&FCI NORB=2,NELEC=2,MS2=0,{flags}\n{body}")
+    ham = fcidump.read(path)
+    assert ham.norb == 2 and ham.is_spin_dependent == (body is _UHF_BODY)
+    if ham.is_spin_dependent:
+        assert ham.h1b[0, 0] == pytest.approx(-0.9)
+
+
+def test_orbital_energy_lines_do_not_overwrite_matrix_elements(tmp_path):
+    """`eps i 0 0 0` lines used to land in h1[i-1, -1] (the last column)."""
+    path = tmp_path / "eps.fcidump"
+    path.write_text(
+        "&FCI NORB=2,NELEC=2,MS2=0,UHF=1,\n /\n"
+        " 0.5 1 1 1 1\n 0.5 3 3 3 3\n 0.4 1 1 3 3\n"
+        "-1.0 1 1 0 0\n-0.3 2 2 0 0\n-0.9 3 3 0 0\n-0.2 4 4 0 0\n"
+        "-7.77 2 0 0 0\n-6.66 4 0 0 0\n 0.0 0 0 0 0\n"
+    )
+    ham = fcidump.read(path)
+    np.testing.assert_allclose(np.diag(ham.h1a), [-1.0, -0.3])
+    np.testing.assert_allclose(np.diag(ham.h1b), [-0.9, -0.2])
+
+
 # --------------------------------------------------------------------------- #
 # The FCIDUMP front end: import an external file, then solve it
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("layout", ["spin-orbital", "separated"])
-def test_import_fcidump_then_solve_reproduces_the_uhf_fci_energy(tmp_path, layout):
+def _scaled(ham, factor):
+    update = {"h1": factor * ham.h1, "h2": factor * ham.h2, "e_core": factor * ham.e_core}
+    if ham.is_spin_dependent:
+        update |= {
+            "h1a": factor * ham.h1a,
+            "h1b": factor * ham.h1b,
+            "h2_spin": tuple(factor * b for b in ham.h2_spin),
+        }
+    return ham.model_copy(update=update)
+
+
+@pytest.mark.parametrize(
+    "layout, unit",
+    [
+        ("spin-orbital", "hartree"),
+        ("separated", "hartree"),
+        ("restricted", "rydberg"),
+        ("spin-orbital", "rydberg"),
+    ],
+)
+def test_import_fcidump_then_solve_reproduces_the_fci_energy(tmp_path, rng, layout, unit):
+    """WEST writes its FCIDUMP in Rydberg; read as Hartree the energy doubles."""
     from embasi_qiskit_integration import ipc
     from embasi_qiskit_integration.cli import main
 
-    ham, _mf = _uhf_ham()
+    ham = _random_ham(3, (2, 2), rng) if layout == "restricted" else _uhf_ham()[0]
     external = tmp_path / "external.fcidump"
-    if layout == "spin-orbital":
-        fcidump.write_uhf(ham, external)
+    if layout == "restricted":
+        fcidump.write(_scaled(ham, 2), external)
+        fcidump._sidecar_path(external).unlink(missing_ok=True)  # a foreign file has none
     else:
-        _write_separated(ham, external)
+        _WRITERS[layout](_scaled(ham, 2) if unit == "rydberg" else ham, external)
     job = tmp_path / "job"
-
-    assert main(["import_fcidump", str(external), str(job), "--source", "test"]) == 0
+    argv = ["import_fcidump", str(external), str(job), "--source", "test", "--energy_unit", unit]
+    assert main(argv) == 0
     imported = ipc.read_job(job)
-    _assert_same_spin_blocks(ham, imported)
+    np.testing.assert_allclose(imported.h1, ham.h1, atol=1e-12)
+    np.testing.assert_allclose(imported.h2, ham.h2, atol=1e-12)
+    assert imported.e_core == pytest.approx(ham.e_core, abs=1e-12)
+    if ham.is_spin_dependent:
+        _assert_same_spin_blocks(ham, imported)
     assert imported.meta["source"] == "test"
-
     assert main(["solve", str(job), "--solver", "fci"]) == 0
     assert ipc.read_result(job).energy == pytest.approx(_fci(ham), abs=1e-10)
 
@@ -336,45 +387,6 @@ def test_import_fcidump_rejects_an_inconsistent_spin_override(tmp_path, rng, cap
     )
     assert rc == 1
     assert "NELEC=4" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("spin_resolved", [False, True])
-def test_import_fcidump_converts_a_rydberg_file_to_hartree(tmp_path, rng, spin_resolved):
-    """WEST writes its FCIDUMP in Rydberg; read as Hartree the energy doubles."""
-    from embasi_qiskit_integration import ipc
-    from embasi_qiskit_integration.cli import main
-
-    ham = _uhf_ham()[0] if spin_resolved else _random_ham(3, (2, 2), rng)
-    in_rydberg = ham.model_copy(
-        update={
-            "h1": 2 * ham.h1,
-            "h2": 2 * ham.h2,
-            "e_core": 2 * ham.e_core,
-            **(
-                {
-                    "h1a": 2 * ham.h1a,
-                    "h1b": 2 * ham.h1b,
-                    "h2_spin": tuple(2 * b for b in ham.h2_spin),
-                }
-                if spin_resolved
-                else {}
-            ),
-        }
-    )
-    external = tmp_path / "west.fcidump"
-    (fcidump.write_uhf if spin_resolved else fcidump.write)(in_rydberg, external)
-    if not spin_resolved:
-        fcidump._sidecar_path(external).unlink(missing_ok=True)  # a foreign file has none
-    job = tmp_path / "job"
-    assert main(["import_fcidump", str(external), str(job), "--energy_unit", "rydberg"]) == 0
-    imported = ipc.read_job(job)
-    np.testing.assert_allclose(imported.h1, ham.h1, atol=1e-12)
-    np.testing.assert_allclose(imported.h2, ham.h2, atol=1e-12)
-    assert imported.e_core == pytest.approx(ham.e_core, abs=1e-12)
-    if spin_resolved:
-        _assert_same_spin_blocks(ham, imported)
-    assert main(["solve", str(job), "--solver", "fci"]) == 0
-    assert ipc.read_result(job).energy == pytest.approx(_fci(ham), abs=1e-10)
 
 
 def test_to_hartree_refuses_an_unknown_unit(rng):

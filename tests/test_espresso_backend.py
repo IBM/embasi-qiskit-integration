@@ -27,24 +27,23 @@ DATA = Path(__file__).parent / "data" / "espresso"
 # --------------------------------------------------------------------------- #
 # atomic_proj.xml (real projwfc.x output)
 # --------------------------------------------------------------------------- #
-def test_atomic_proj_closed_shell_water():
-    a = qe.read_atomic_proj(DATA / "h2o_atomic_proj.xml")
-    assert a.eigenvalues.shape == (1, 8)
-    assert a.projections.shape == (1, 6, 8)  # O 2s,2p(3) + 2x H 1s
-    assert a.n_electrons == 8.0
-    # QE's scf.out printed the HOMO at -7.3188 eV; band 4 of 8 electrons / 2.
-    assert a.eigenvalues[0, 3] * 27.211386245988 == pytest.approx(-7.3188, abs=1e-3)
-    s = a.overlaps[0]
-    np.testing.assert_allclose(s, s.conj().T, atol=1e-12)
-
-
-def test_atomic_proj_lsda_has_two_spin_channels():
-    a = qe.read_atomic_proj(DATA / "oh_lsda_atomic_proj.xml")
-    assert a.eigenvalues.shape == (2, 8)
-    assert a.projections.shape == (2, 5, 8)
-    assert a.overlaps.shape == (2, 5, 5)
-    assert a.n_electrons == 7.0
-    assert not np.allclose(a.eigenvalues[0], a.eigenvalues[1])  # genuinely polarised
+@pytest.mark.parametrize(
+    "name, nspin, nwfc, n_electrons",
+    [("h2o_atomic_proj.xml", 1, 6, 8.0), ("oh_lsda_atomic_proj.xml", 2, 5, 7.0)],
+    ids=["closed-shell", "lsda"],
+)
+def test_atomic_proj_shapes_and_spin_channels(name, nspin, nwfc, n_electrons):
+    a = qe.read_atomic_proj(DATA / name)
+    assert a.eigenvalues.shape == (nspin, 8)
+    assert a.projections.shape == (nspin, nwfc, 8)  # water: O 2s,2p(3) + 2x H 1s
+    assert a.overlaps.shape == (nspin, nwfc, nwfc)
+    assert a.n_electrons == n_electrons
+    for s in a.overlaps:
+        np.testing.assert_allclose(s, s.conj().T, atol=1e-12)
+    if nspin == 2:
+        assert not np.allclose(a.eigenvalues[0], a.eigenvalues[1])  # genuinely polarised
+    else:  # QE's scf.out printed the HOMO at -7.3188 eV (band 4 of 8 electrons / 2)
+        assert a.eigenvalues[0, 3] * 27.211386245988 == pytest.approx(-7.3188, abs=1e-3)
 
 
 def test_projectability_matches_projwfc_own_output():
