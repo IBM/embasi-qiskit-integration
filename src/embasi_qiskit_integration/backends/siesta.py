@@ -5,9 +5,8 @@
 
 **Licence boundary.**  SIESTA is GPL-3.0; this package is Apache-2.0.  It is therefore
 only ever *run as an external program* (``siesta``, through ASE's file-based
-calculator) and its *output files* are read.  No SIESTA code is imported, linked or
-vendored.  The plain-text ``.ORB_INDX`` is parsed here directly; the sparse binary
-matrices (``.HSX``, ``.DM``) are read through ``sisl`` (MPL-2.0), an optional extra.
+calculator), and only its plain-text ``.ORB_INDX`` is read, by the parser here.  No
+SIESTA code is imported, linked or vendored; the matrices come through EmbASI.
 
 **What SIESTA can supply** (checked against its source and a real run):
 
@@ -126,79 +125,6 @@ def ao_labels_from_orbitals(
     return [(o.atom, _element(o.species), o.shell, o.symbol) for o in orbitals]
 
 
-def read_matrices(label: str | Path) -> dict[str, np.ndarray]:
-    """``S``, ``H`` (per spin) and ``DM`` (per spin) at Gamma from ``<label>.HSX`` / ``.DM``.
-
-    Uses ``sisl`` (install the ``siesta`` extra).  Matrices are dense ``(nao, nao)`` in
-    Hartree (sisl reports H in eV); spin-polarised runs give two channels.
-    """
-    try:
-        import sisl
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise ImportError(
-            "reading SIESTA's binary matrices needs sisl: pip install "
-            "'embasi-qiskit-integration[siesta]'"
-        ) from exc
-    from ase.units import Hartree
-
-    label = Path(label)
-    hsx = sisl.get_sile(str(label.with_suffix(".HSX")))
-    ham = hsx.read_hamiltonian()
-    dm = sisl.get_sile(str(label.with_suffix(".DM"))).read_density_matrix(geometry=ham.geometry)
-    n_spin = 2 if ham.spin.is_polarized else 1
-    s = np.asarray(ham.Sk(format="array")).real
-    # sisl takes `spin=` only on a polarised matrix; an unpolarised one has one channel.
-    spins: list[dict[str, int]] = [{"spin": i} for i in range(n_spin)] if n_spin == 2 else [{}]
-    # What sisl returns is NOT the Kohn-Sham H: each channel comes back as H_s - Ef_s*S
-    # (sisl shifts HSX v1/v2 files to the Fermi level on read, and with Spin.Fix SIESTA
-    # stores each channel against its *own* Fermi level, while the HSX file carries only
-    # one).  Add each channel's Fermi level back, so `hcore = H[0]`, `veff = H[dm] - H[0]`
-    # and the alpha/beta splitting carry no density-dependent Ef*S (checked on real runs:
-    # the generalised eigenvalues then equal SIESTA's .EIG per spin to 1e-7 eV).
-    fermi = _fermi_levels(hsx, label, n_spin)
-    h = tuple(
-        (np.asarray(ham.Hk(format="array", **k)).real + ef * s) / Hartree
-        for k, ef in zip(spins, fermi, strict=True)
-    )
-    d = tuple(np.asarray(dm.Dk(format="array", **k)).real for k in spins)
-    return {"overlap": s, "hamiltonian": np.stack(h), "density": np.stack(d)}
-
-
-def _fermi_levels(hsx: Any, label: Path, n_spin: int) -> tuple[float, ...]:
-    """Per spin channel, the Fermi level (eV) sisl subtracted from H when reading ``hsx``.
-
-    A v0 HSX file (SIESTA < 5) has no Fermi level and is not shifted (zeros).  Otherwise
-    the file's single Ef applies to an unpolarised run, or to a spin-polarised one with a
-    common Fermi level.  A ``Spin.Fix`` run has one Fermi level per spin, printed only in
-    ``<label>.out`` (``Fermi_up`` / ``Fermi_dn``); without that file the beta channel
-    cannot be corrected, so a polarised run then raises rather than return a wrong H.
-    """
-    import re
-    import warnings
-
-    if getattr(hsx, "version", 0) == 0:
-        return (0.0,) * n_spin
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")  # sisl's own "no usable Ef" warning (it uses 0)
-        common = hsx.read_fermi_level()
-    common = 0.0 if common is None else float(common)
-    if n_spin == 1:
-        return (common,)
-    out = label.with_suffix(".out")
-    if not out.is_file():
-        raise FileNotFoundError(
-            f"{out} is needed to read a spin-polarised SIESTA Hamiltonian: its per-spin "
-            "Fermi levels (Fermi_up/Fermi_dn) are not stored in the .HSX file"
-        )
-    text = out.read_text(errors="replace")
-    number = r"(-?\d+\.\d+(?:[EeDd][-+]?\d+)?)"
-    up = re.findall(r"Fermi_up\s*=\s*" + number, text)
-    dn = re.findall(r"Fermi_dn\s*=\s*" + number, text)
-    if up and dn:
-        return (float(up[-1]), float(dn[-1]))
-    return (common, common)  # free spin: one Fermi level for both channels
-
-
 def basis_atoms_from_orbitals(orbitals: Sequence[SiestaOrbital]) -> np.ndarray:
     return np.array([o.atom for o in orbitals], dtype=int)
 
@@ -218,8 +144,6 @@ def probe_basis(atoms: Any, cfg: Any, *, directory: str | Path) -> list[SiestaOr
         # ASE's own key spelling: it writes `SCFMustConverge True` itself, so a dotted
         # variant would leave two conflicting keys in the fdf.
         "SCFMustConverge": False,
-        "SaveHS": False,
-        "Write.DM": False,
     }
     probe = atoms.copy()
     probe.calc = calc
@@ -276,8 +200,8 @@ def siesta_calculator(
     (checked: OH doublet gives N_alpha = N_beta = 3.5 and H_alpha == H_beta).
 
     Basis, mesh cutoff and pseudopotential path come from the workflow settings
-    (``siesta_basis``, ``siesta_mesh_cutoff``, ``SIESTA_PP_PATH``).  Matrix output
-    (``SaveHS``, ``Write.DM``, ``WriteOrbIndx``) is always on: the readers above need it.
+    (``siesta_basis``, ``siesta_mesh_cutoff``, ``SIESTA_PP_PATH``); ``WriteOrbIndx`` is
+    always on for :func:`probe_basis`.
     """
     from ase.calculators.siesta import Siesta
 
@@ -309,8 +233,6 @@ def siesta_calculator(
         spin="collinear" if spin_polarised else "non-polarized",
         pseudo_path=pseudo,
         fdf_arguments={
-            "SaveHS": True,
-            "Write.DM": True,
             "WriteOrbIndx": True,
             **({"Spin.Fix": True, "Spin.Total": float(total_spin)} if spin_polarised else {}),
             # --scf_max_cycle is honoured by every backend.
