@@ -272,6 +272,16 @@ class ImportFcidumpCommand(BaseSettings):
                 return 1
             updates["nelec"] = nelec
         ham = ham.model_copy(update=updates)
+        from embasi_qiskit_integration.backends.cp2k import dropped_negative_integrals
+
+        if dropped_negative_integrals(ham.h2):
+            print(
+                "warning: this FCIDUMP has off-diagonal two-electron integrals but no "
+                "negative ones -- the signature of CP2K <= 7.1's signed EPS_INTEGRAL "
+                "screening, which drops every negative integral.  Regenerate it with a "
+                "negative EPS_INTEGRAL (backends.cp2k does) before trusting the energy.",
+                file=sys.stderr,
+            )
         import warnings
 
         with warnings.catch_warnings():
