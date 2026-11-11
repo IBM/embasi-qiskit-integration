@@ -233,6 +233,9 @@ class ImportFcidumpCommand(BaseSettings):
     nelec_alpha: int | None = None
     nelec_beta: int | None = None
     source: str | None = None  # free-text provenance stored in the job's meta
+    # The FCIDUMP format has no unit field.  WEST/QDET writes Rydberg (pass `rydberg`);
+    # CP2K, Molpro and PySCF write Hartree.
+    energy_unit: Literal["hartree", "rydberg"] = "hartree"
 
     _exit_code: int = 0
 
@@ -271,7 +274,7 @@ class ImportFcidumpCommand(BaseSettings):
                 )
                 return 1
             updates["nelec"] = nelec
-        ham = ham.model_copy(update=updates)
+        ham = fcidump.to_hartree(ham.model_copy(update=updates), self.energy_unit)
         from embasi_qiskit_integration.backends.cp2k import dropped_negative_integrals
 
         if dropped_negative_integrals(ham.h2):

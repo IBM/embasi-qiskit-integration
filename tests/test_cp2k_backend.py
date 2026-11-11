@@ -180,6 +180,108 @@ def test_active_space_section_from_xml(tmp_path):
     assert cp2k.active_space_section_in_xml(_xml(tmp_path, False)) == ("FORCE_EVAL", "DFT")
 
 
+def _modern_xml(tmp_path):
+    """The ACTIVE_SPACE part of a CP2K >= 2026.1 ``--xml`` (no INACTIVE_ELECTRONS, no
+    ISOLATED_SYSTEM, a single-valued ACTIVE_ORBITALS, &ERI PERIODICITY)."""
+
+    def kw(name, n_var):
+        return (
+            f"<KEYWORD><NAME type='default'>{name}</NAME>"
+            f"<DATA_TYPE kind='integer'><N_VAR>{n_var}</N_VAR></DATA_TYPE></KEYWORD>"
+        )
+
+    path = tmp_path / "modern.xml"
+    path.write_text(
+        "<CP2K_INPUT><SECTION><NAME>FORCE_EVAL</NAME><SECTION><NAME>DFT</NAME>"
+        "<SECTION><NAME>ACTIVE_SPACE</NAME>"
+        + kw("ACTIVE_ELECTRONS", 1)
+        + kw("ACTIVE_ORBITALS", 1)
+        + kw("INACTIVE_ORBITALS", -1)
+        + "<SECTION><NAME>ERI</NAME>"
+        + kw("METHOD", 1)
+        + kw("EPS_INTEGRAL", 1)
+        + kw("PERIODICITY", 3)
+        + "</SECTION></SECTION></SECTION></SECTION></CP2K_INPUT>"
+    )
+    return path
+
+
+@pytest.mark.parametrize("multiplicity, n_act, n_val", [(1, 4, 8), (2, 3, 7)])
+def test_input_writes_only_the_keywords_the_installed_cp2k_has(
+    tmp_path, multiplicity, n_act, n_val
+):
+    """Regression: INACTIVE_ELECTRONS (gone in 2024.1), a per-spin ACTIVE_ORBITALS list
+    (single-valued from 2024.1) and ISOLATED_SYSTEM (gone in 2026.1) were always written,
+    and CP2K's parser aborts on any of them."""
+    layout = cp2k.active_space_layout_in_xml(_modern_xml(tmp_path))
+    assert layout.section == ("FORCE_EVAL", "DFT") and not layout.orbitals_per_spin
+    text = cp2k.active_space_input(
+        ["O", "H", "H"],
+        [[5.0, 5.0, 5.0], [5.0, 5.757, 5.587], [5.0, 4.243, 5.587]],
+        spec=cp2k.ActiveSpaceSpec(n_act, 4, n_val, multiplicity=multiplicity),
+        basis=BASIS,
+        potential=POTENTIAL,
+        data_dir="/data",
+        layout=layout,
+    )
+    assert "INACTIVE_ELECTRONS" not in text and "ISOLATED_SYSTEM" not in text
+    assert "ACTIVE_ORBITALS 4\n" in text and "PERIODICITY 0 0 0" in text
+    assert ("UKS" in text) == (multiplicity != 1)
+
+
+def test_cp2k71_xml_keeps_the_legacy_keywords():
+    """CP2K 7.1's own --xml (ACTIVE_SPACE section only): lists and ISOLATED_SYSTEM stay."""
+    layout = cp2k.active_space_layout_in_xml(DATA / "cp2k71_active_space.xml")
+    assert layout.section == ("FORCE_EVAL", "DFT", "PRINT")
+    assert cp2k.LEGACY_KEYWORDS <= layout.keywords and layout.orbitals_per_spin
+    assert layout.version == (7, 1)
+
+
+def test_unrestricted_spec_is_refused_on_cp2k7_before_running(tmp_path, monkeypatch):
+    """CP2K 7.1's UKS active space aborts -- or, about one run in seven, segfaults --
+    after the SCF, so it is refused up front instead of run."""
+    import subprocess
+
+    from ase import Atoms
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "BASIS_MOLOPT").write_text("")
+    (data / "GTH_POTENTIALS").write_text("")
+    layout = cp2k.active_space_layout_in_xml(DATA / "cp2k71_active_space.xml")
+    monkeypatch.setattr(cp2k, "active_space_layout", lambda exe=None: layout)
+
+    def never(*a, **k):
+        raise AssertionError("CP2K must not be run")
+
+    monkeypatch.setattr(subprocess, "run", never)
+    with pytest.raises(RuntimeError, match="Spin option not yet available"):
+        cp2k.run_active_space(
+            Atoms("OH", positions=[(0, 0, 0), (0, 0, 0.97)]),
+            cp2k.ActiveSpaceSpec(3, 3, 7, multiplicity=2),
+            workdir=tmp_path / "w",
+            basis=BASIS,
+            potential=POTENTIAL,
+            data_dir=data,
+            executable="cp2k",
+        )
+
+
+@pytest.mark.parametrize(
+    "unit",
+    ["(a.u.):", "[a.u.]:", "[hartree]"],
+    ids=["7.1", "8.1-2024.1", "2025.1-on"],
+)
+def test_total_energy_in_every_cp2k_output_format(tmp_path, unit):
+    """Each spelling CP2K has printed; regression: 8.1-2024.1's ``[a.u.]:`` was missed."""
+    out = tmp_path / "e.out"
+    out.write_text(
+        f" ENERGY| Total FORCE_EVAL ( QS ) energy {unit}          -17.220800284869728\n"
+        " ENERGY| Total FORCE_EVAL ( QS ) free energy [hartree]     -99.0\n"  # not this one
+    )
+    assert cp2k.read_total_energy(out) == pytest.approx(-17.220800284869728, abs=1e-15)
+
+
 def test_abort_message_and_total_energy(tmp_path):
     out = tmp_path / "x.out"
     out.write_text(

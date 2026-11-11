@@ -136,6 +136,38 @@ def read(path: str | Path) -> EmbeddedHamiltonian:
     return EmbeddedHamiltonian(h1=h1, h2=h2, e_core=e_core, nelec=nelec_pair, meta=meta, **spin)
 
 
+#: Energy units a foreign FCIDUMP may be written in, as the factor to Hartree.
+#: WEST writes its QDET FCIDUMP in Rydberg (its internal unit, unconverted).
+ENERGY_UNIT_TO_HARTREE = {"hartree": 1.0, "rydberg": 0.5}
+
+
+def to_hartree(ham: EmbeddedHamiltonian, unit: str) -> EmbeddedHamiltonian:
+    """``ham`` with every integral and the core energy converted from ``unit`` to Hartree.
+
+    The FCIDUMP format carries no unit, and a file written in Rydberg (WEST/QDET) reads
+    as a valid Hamiltonian twice too large; the caller has to say which it is.
+    """
+    try:
+        factor = ENERGY_UNIT_TO_HARTREE[unit.lower()]
+    except KeyError:
+        raise ValueError(
+            f"unknown energy unit {unit!r}; expected one of {sorted(ENERGY_UNIT_TO_HARTREE)}"
+        ) from None
+    if factor == 1.0:
+        return ham
+    update: dict[str, Any] = {
+        "h1": ham.h1 * factor,
+        "h2": ham.h2 * factor,
+        "e_core": float(ham.e_core) * factor,
+        "meta": {**ham.meta, "energy_unit_converted_from": unit.lower()},
+    }
+    if ham.h1a is not None and ham.h1b is not None:
+        update["h1a"], update["h1b"] = ham.h1a * factor, ham.h1b * factor
+    if ham.h2_spin is not None:
+        update["h2_spin"] = tuple(block * factor for block in ham.h2_spin)
+    return ham.model_copy(update=update)
+
+
 def _nelec_from_header(nelec_total: int, ms2: int, path: Path) -> tuple[int, int]:
     """``(NELEC, MS2)`` -> ``(n_alpha, n_beta)``, taking ``MS2`` as ``n_alpha - n_beta``.
 

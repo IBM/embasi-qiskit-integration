@@ -336,3 +336,47 @@ def test_import_fcidump_rejects_an_inconsistent_spin_override(tmp_path, rng, cap
     )
     assert rc == 1
     assert "NELEC=4" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("spin_resolved", [False, True])
+def test_import_fcidump_converts_a_rydberg_file_to_hartree(tmp_path, rng, spin_resolved):
+    """WEST writes its FCIDUMP in Rydberg; read as Hartree the energy doubles."""
+    from embasi_qiskit_integration import ipc
+    from embasi_qiskit_integration.cli import main
+
+    ham = _uhf_ham()[0] if spin_resolved else _random_ham(3, (2, 2), rng)
+    in_rydberg = ham.model_copy(
+        update={
+            "h1": 2 * ham.h1,
+            "h2": 2 * ham.h2,
+            "e_core": 2 * ham.e_core,
+            **(
+                {
+                    "h1a": 2 * ham.h1a,
+                    "h1b": 2 * ham.h1b,
+                    "h2_spin": tuple(2 * b for b in ham.h2_spin),
+                }
+                if spin_resolved
+                else {}
+            ),
+        }
+    )
+    external = tmp_path / "west.fcidump"
+    (fcidump.write_uhf if spin_resolved else fcidump.write)(in_rydberg, external)
+    if not spin_resolved:
+        fcidump._sidecar_path(external).unlink(missing_ok=True)  # a foreign file has none
+    job = tmp_path / "job"
+    assert main(["import_fcidump", str(external), str(job), "--energy_unit", "rydberg"]) == 0
+    imported = ipc.read_job(job)
+    np.testing.assert_allclose(imported.h1, ham.h1, atol=1e-12)
+    np.testing.assert_allclose(imported.h2, ham.h2, atol=1e-12)
+    assert imported.e_core == pytest.approx(ham.e_core, abs=1e-12)
+    if spin_resolved:
+        _assert_same_spin_blocks(ham, imported)
+    assert main(["solve", str(job), "--solver", "fci"]) == 0
+    assert ipc.read_result(job).energy == pytest.approx(_fci(ham), abs=1e-10)
+
+
+def test_to_hartree_refuses_an_unknown_unit(rng):
+    with pytest.raises(ValueError, match="unknown energy unit"):
+        fcidump.to_hartree(_random_ham(2, (1, 1), rng), "ev")

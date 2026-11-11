@@ -47,14 +47,24 @@ def test_atomic_proj_lsda_has_two_spin_channels():
     assert not np.allclose(a.eigenvalues[0], a.eigenvalues[1])  # genuinely polarised
 
 
-def test_projectability_quantifies_the_completeness_error():
-    """Why QE cannot host the AO projection embedding: even occupied bands are only
-    partly spanned by its pseudo-atomic functions, and the high virtuals hardly at all."""
-    p = qe.read_atomic_proj(DATA / "h2o_atomic_proj.xml").projectability()
-    occupied, top = p[0, :4], p[0, -1]
-    assert np.all((occupied > 0.7) & (occupied < 1.0 + 1e-9))
-    assert occupied.min() < 0.95  # a real deficit, not round-off
-    assert top < 0.05
+def test_projectability_matches_projwfc_own_output():
+    """``projectability`` is QE's own ``|psi|^2`` (printed to 3 digits in projwfc.x's
+    output for these runs).  Regression: combining the Loewdin-orthogonalised projections
+    with the non-orthogonal OVPS overlap gave 0.81/0.76/0.97/0.99 for water's occupied
+    bands.  The occupied bands are ~98% spanned; the virtuals much less."""
+    water = qe.read_atomic_proj(DATA / "h2o_atomic_proj.xml").projectability()
+    np.testing.assert_allclose(
+        water[0], [0.988, 0.976, 0.984, 0.987, 0.329, 0.257, 0.208, 0.003], atol=6e-4
+    )
+    oh = qe.read_atomic_proj(DATA / "oh_lsda_atomic_proj.xml").projectability()
+    np.testing.assert_allclose(
+        oh,
+        [
+            [0.992, 0.977, 0.997, 0.994, 0.265, 0.290, 0.000, 0.001],
+            [0.990, 0.977, 0.991, 0.984, 0.238, 0.272, 0.002, 0.004],
+        ],
+        atol=6e-4,
+    )
 
 
 def test_atomic_proj_rejects_another_file(tmp_path):
@@ -220,3 +230,27 @@ def test_espresso_backend_refuses_with_the_qdet_alternative():
 
     with pytest.raises(NotImplementedError, match="no AO basis.*import_fcidump"):
         make_backend("espresso", atoms=None, charge=0, cfg=object())
+
+
+def test_west_fcidump_is_read_as_rydberg(tmp_path):
+    """WEST's FCIDUMP carries its integrals in Rydberg (westpy halves them on read)."""
+    from embasi_qiskit_integration import ipc
+    from embasi_qiskit_integration.hamiltonian import fcidump
+
+    rng = np.random.default_rng(3)
+    h1 = rng.normal(size=(2, 2))
+    h1 = h1 + h1.T
+    h2 = np.zeros((2, 2, 2, 2))
+    h2[0, 0, 0, 0], h2[1, 1, 1, 1], h2[0, 0, 1, 1] = 0.7, 0.6, 0.4
+    h2[1, 1, 0, 0] = 0.4
+    for p, q, r, s in [(0, 1, 0, 1), (1, 0, 0, 1), (0, 1, 1, 0), (1, 0, 1, 0)]:
+        h2[p, q, r, s] = 0.1
+    ham = EmbeddedHamiltonian(h1=h1, h2=h2, e_core=0.0, nelec=(1, 1))
+    path = tmp_path / "FCIDUMP"
+    fcidump.write(ham.model_copy(update={"h1": 2 * h1, "h2": 2 * h2}), path)
+    fcidump._sidecar_path(path).unlink(missing_ok=True)
+    got = qe.read_west_fcidump(path)
+    np.testing.assert_allclose(got.h1, h1, atol=1e-12)
+    np.testing.assert_allclose(got.h2, h2, atol=1e-12)
+    job = qe.write_job_from_west_fcidump(path, tmp_path / "job")
+    np.testing.assert_allclose(ipc.read_job(job.parent).h1, h1, atol=1e-12)

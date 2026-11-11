@@ -1,0 +1,90 @@
+<CP2K_INPUT>
+  <CP2K_VERSION>CP2K version 7.1</CP2K_VERSION>
+  <SECTION>
+    <NAME>FORCE_EVAL</NAME>
+    <SECTION>
+      <NAME>DFT</NAME>
+      <SECTION>
+        <NAME>PRINT</NAME>
+        <SECTION>
+          <NAME>ACTIVE_SPACE</NAME>
+          <KEYWORD>
+            <NAME type="default">MODEL</NAME>
+            <DATA_TYPE kind="keyword">
+              <N_VAR>1</N_VAR>
+            </DATA_TYPE>
+          </KEYWORD>
+          <KEYWORD>
+            <NAME type="default">ACTIVE_ELECTRONS</NAME>
+            <DATA_TYPE kind="integer">
+              <N_VAR>1</N_VAR>
+            </DATA_TYPE>
+          </KEYWORD>
+          <KEYWORD>
+            <NAME type="default">INACTIVE_ELECTRONS</NAME>
+            <DATA_TYPE kind="integer">
+              <N_VAR>-1</N_VAR>
+            </DATA_TYPE>
+          </KEYWORD>
+          <KEYWORD>
+            <NAME type="default">ACTIVE_ORBITALS</NAME>
+            <DATA_TYPE kind="integer">
+              <N_VAR>-1</N_VAR>
+            </DATA_TYPE>
+          </KEYWORD>
+          <KEYWORD>
+            <NAME type="default">INACTIVE_ORBITALS</NAME>
+            <DATA_TYPE kind="integer">
+              <N_VAR>-1</N_VAR>
+            </DATA_TYPE>
+          </KEYWORD>
+          <KEYWORD>
+            <NAME type="default">ISOLATED_SYSTEM</NAME>
+            <DATA_TYPE kind="logical">
+              <N_VAR>1</N_VAR>
+            </DATA_TYPE>
+          </KEYWORD>
+          <KEYWORD>
+            <NAME type="default">ORBITAL_SELECTION</NAME>
+            <DATA_TYPE kind="keyword">
+              <N_VAR>1</N_VAR>
+            </DATA_TYPE>
+          </KEYWORD>
+          <KEYWORD>
+            <NAME type="default">SUBSPACE_ATOM</NAME>
+            <DATA_TYPE kind="integer">
+              <N_VAR>1</N_VAR>
+            </DATA_TYPE>
+          </KEYWORD>
+          <KEYWORD>
+            <NAME type="default">SUBSPACE_SHELL</NAME>
+            <DATA_TYPE kind="word">
+              <N_VAR>1</N_VAR>
+            </DATA_TYPE>
+          </KEYWORD>
+          <SECTION>
+            <NAME>ERI</NAME>
+            <KEYWORD>
+              <NAME type="default">METHOD</NAME>
+            </KEYWORD>
+            <KEYWORD>
+              <NAME type="default">OPERATOR</NAME>
+            </KEYWORD>
+            <KEYWORD>
+              <NAME type="default">OPERATOR_PARAMETER</NAME>
+            </KEYWORD>
+            <KEYWORD>
+              <NAME type="default">PERIODICITY</NAME>
+            </KEYWORD>
+            <KEYWORD>
+              <NAME type="default">CUTOFF_RADIUS</NAME>
+            </KEYWORD>
+            <KEYWORD>
+              <NAME type="default">EPS_INTEGRAL</NAME>
+            </KEYWORD>
+          </SECTION>
+        </SECTION>
+      </SECTION>
+    </SECTION>
+  </SECTION>
+</CP2K_INPUT>

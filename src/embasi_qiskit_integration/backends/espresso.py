@@ -21,8 +21,9 @@ has no hook to add a nonlocal operator such as ``mu P_B`` to its Hamiltonian.  S
 * QE's own active-space route is supported instead: WEST/QDET writes an effective
   Hamiltonian over a set of Kohn-Sham bands, which :func:`read_wfreq_json` turns into an
   :class:`~embasi_qiskit_integration.contract.EmbeddedHamiltonian` for our FCI/SQD solvers
-  (``embasi-qiskit-integration import_fcidump`` covers WEST's FCIDUMP output, and
-  :func:`write_job_from_wfreq` the JSON);
+  (:func:`write_job_from_west_fcidump`, or ``embasi-qiskit-integration import_fcidump
+  --energy_unit rydberg``, covers WEST's FCIDUMP output -- written in **Rydberg** -- and
+  :func:`write_job_from_wfreq` the JSON, in eV);
 * :func:`read_atomic_proj` reads ``projwfc.x``'s ``atomic_proj.xml`` (band projections
   onto the pseudo-atomic functions, and their overlap), the starting point for any
   future localized-basis route.
@@ -211,6 +212,31 @@ def write_job_from_wfreq(
         return ipc.write_job(ham, job_dir)
 
 
+def read_west_fcidump(path: str | Path) -> EmbeddedHamiltonian:
+    """WEST/QDET's FCIDUMP as an :class:`EmbeddedHamiltonian` in Hartree.
+
+    WEST writes ``h1e`` and ``eri_w`` to its FCIDUMP in its internal unit, Rydberg, with
+    no conversion (westpy divides them by 2 when reading).  Read as Hartree, every
+    energy would come out twice too large.
+    """
+    from embasi_qiskit_integration.hamiltonian import fcidump
+
+    ham = fcidump.to_hartree(fcidump.read(path), "rydberg")
+    return ham.model_copy(update={"meta": {**ham.meta, "source": "west-qdet-fcidump"}})
+
+
+def write_job_from_west_fcidump(path: str | Path, job_dir: str | Path) -> Path:
+    """Read WEST's (Rydberg) FCIDUMP and write a job directory ``solve`` can run."""
+    import warnings
+
+    from embasi_qiskit_integration import ipc
+
+    ham = read_west_fcidump(path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)  # spin blocks travel in the sidecar
+        return ipc.write_job(ham, job_dir)
+
+
 # --------------------------------------------------------------------------- #
 # projwfc.x: atomic_proj.xml
 # --------------------------------------------------------------------------- #
@@ -227,20 +253,15 @@ class AtomicProjections:
     def projectability(self, n_occ: int | None = None) -> np.ndarray:
         """Per band, the weight captured by the atomic basis (``1`` = fully represented).
 
-        With the overlap, ``p_n = <psi_n|phi> S^{-1} <phi|psi_n>``; without it the
-        orthonormal-basis estimate ``sum_a |<phi_a|psi_n>|^2``.  Below 1 is the
-        completeness error any projected AO-like operator built from these bands carries.
+        ``p_n = sum_a |<phi_a|psi_n>|^2`` -- QE's own ``|psi|^2`` in ``projwfc.x``'s output.
+        The projections in ``atomic_proj.xml`` are onto the Loewdin-*orthogonalised*
+        atomic functions, so the plain sum is exact.  ``overlaps`` (``OVPS``) is the overlap
+        of the *non-orthogonal* functions and must not be combined with them: ``p^H S^-1 p``
+        mixes the two bases (water: 0.76-0.99 for the occupied bands where QE prints
+        0.976-0.988).  Below 1 is the completeness error any projected AO-like operator
+        built from these bands carries.
         """
-        p = self.projections
-        if self.overlaps is not None:
-            weights = np.stack(
-                [
-                    np.einsum("an,ab,bn->n", p[s].conj(), np.linalg.inv(self.overlaps[s]), p[s])
-                    for s in range(p.shape[0])
-                ]
-            ).real
-        else:
-            weights = np.sum(np.abs(p) ** 2, axis=1)
+        weights = np.sum(np.abs(self.projections) ** 2, axis=1)
         return weights if n_occ is None else weights[:, :n_occ]
 
 
@@ -310,6 +331,7 @@ def build_espresso_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
         "hook for the nonlocal mu*P_B projector, so it cannot drive this package's "
         "projection embedding (there is no EmbASI adapter for it either).  Use QE's own "
         "active-space route instead: run WEST/QDET, then "
-        "`embasi-qiskit-integration import_fcidump <FCIDUMP> <job>` (or "
-        "backends.espresso.write_job_from_wfreq for wfreq.json) and `solve <job>`."
+        "`embasi-qiskit-integration import_fcidump <FCIDUMP> <job> --energy_unit rydberg` "
+        "(WEST's FCIDUMP is in Rydberg; or backends.espresso.write_job_from_west_fcidump, "
+        "or write_job_from_wfreq for wfreq.json) and `solve <job>`."
     )

@@ -536,9 +536,15 @@ def build_pyscf_callback_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend
     direct = PySCFIntegrals(mf_hl, mf_ll, density_fit=density_fit)
     basis = PySCFBasis(mol)
     ints = PySCFCallbackIntegrals(
-        LayerEvaluator(atoms, calc_ll, n_spin=2 if ll_spin else 1, label="cb_ll"),
-        LayerEvaluator(atoms, calc_hl, n_spin=2 if is_spin_resolved(mf_hl) else 1, label="cb_hl"),
-        LayerEvaluator(atoms, calc_hf, n_spin=2, label="cb_hf"),
+        LayerEvaluator(atoms, calc_ll, n_spin=2 if ll_spin else 1, label="cb_ll", charge=charge),
+        LayerEvaluator(
+            atoms,
+            calc_hl,
+            n_spin=2 if is_spin_resolved(mf_hl) else 1,
+            label="cb_hl",
+            charge=charge,
+        ),
+        LayerEvaluator(atoms, calc_hf, n_spin=2, label="cb_hf", charge=charge),
         nao=int(mol.nao),
         basis_atoms=basis.ao_atom_map(),
         ao_labels=basis.ao_labels(),

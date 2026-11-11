@@ -71,12 +71,17 @@ class LayerEvaluator:
     state into each other or into the calculators handed to ``ProjectionEmbedding``.
     """
 
-    def __init__(self, atoms: Any, calc: Any, *, n_spin: int, label: str):
+    def __init__(self, atoms: Any, calc: Any, *, n_spin: int, label: str, charge: int = 0):
         from embasi.atoms_embedding_asi import AtomsEmbed
 
         self.n_spin = int(n_spin)
         self.label = label
         self._layer = AtomsEmbed(atoms, calc, embed_mask=None, outdir=label)
+        # EmbASI writes the layer's total charge onto the calculator before every run
+        # (`set_qm_total_charge`), defaulting to 0.  Left unset, a charged system is
+        # re-run as neutral -- and for an odd charge PySCF refuses the Mole outright
+        # (electron count and spin no longer have the same parity).
+        self._layer.input_total_charge = float(charge)
 
     def _wrap(self, dm: DensityArg) -> Any:
         from embasi.ks_array import SpinKpointArray

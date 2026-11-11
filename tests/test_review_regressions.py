@@ -167,7 +167,11 @@ def test_cp2k_run_never_returns_a_stale_fcidump(tmp_path, monkeypatch):
     work = tmp_path / "work"
     work.mkdir()
     (work / "active.fcidump").write_text("stale")
-    monkeypatch.setattr(cp2k, "active_space_section", lambda exe=None: ("FORCE_EVAL", "DFT"))
+    monkeypatch.setattr(
+        cp2k,
+        "active_space_layout",
+        lambda exe=None: cp2k.ActiveSpaceLayout(("FORCE_EVAL", "DFT"), cp2k.LEGACY_KEYWORDS),
+    )
     monkeypatch.setattr(
         subprocess,
         "run",

@@ -190,25 +190,59 @@ def read_ks_eigenvalues(output: str | Path) -> tuple[np.ndarray, np.ndarray]:
     """``(eigenvalues [Hartree], occupations)`` from the last ``EIGENVALUES(EV)`` block.
 
     CPMD prints it from a ``KOHN-SHAM ENERGIES`` run (``index value occupation``, two
-    states per line).
+    states per line; ``wreigen`` in ``wrener_utils``).  A closed-shell run gives ``(n,)``
+    arrays; a spin-polarised (LSD) run, whose block is split into ``ALPHA STATES:`` and
+    ``BETA STATES:``, gives ``(2, n)`` arrays, alpha first.  A state CPMD flags as not
+    converged (``NC`` glued to the value) is read, with a warning.  Multi-k-point output
+    is refused (molecules are Gamma-only).
     """
+    import re
+    import warnings
+
     lines = Path(output).read_text().splitlines()
     starts = [i for i, line in enumerate(lines) if "EIGENVALUES(EV) AND OCCUPATION" in line]
     if not starts:
         raise ValueError(f"{output} has no 'EIGENVALUES(EV) AND OCCUPATION' block")
-    entries: dict[int, tuple[float, float]] = {}
+    entry = re.compile(r"(\d+)\s+(-?\d+\.\d+(?:[EeDd][-+]?\d+)?)(NC)?\s+(-?\d+\.\d+)")
+    channels: list[dict[int, tuple[float, float]]] = [{}]
+    labelled = False
+    not_converged: list[int] = []
     for line in lines[starts[-1] + 1 :]:
-        parts = line.split()
-        if not parts or len(parts) % 3 or not parts[0].isdigit():
+        text = line.strip()
+        if text.startswith("K POINT"):
+            raise ValueError(f"{output}: k-point resolved eigenvalues are not supported")
+        if text in ("ALPHA STATES:", "BETA STATES:"):
+            if text == "BETA STATES:":
+                channels.append({})
+            labelled = True
+            continue
+        hits = entry.findall(line)
+        if not hits:  # the CHEMICAL POTENTIAL line (or anything else) ends the block
             break
-        for k in range(0, len(parts), 3):
-            entries[int(parts[k])] = (float(parts[k + 1]), float(parts[k + 2]))
-    idx = sorted(entries)
-    if idx != list(range(1, len(idx) + 1)):
-        raise ValueError(f"{output}: eigenvalue indices are not contiguous")
-    eig = np.array([entries[i][0] for i in idx]) / _HARTREE_EV
-    occ = np.array([entries[i][1] for i in idx])
-    return eig, occ
+        for index, value, nc, occupation in hits:
+            channels[-1][int(index)] = (float(value.replace("D", "E")), float(occupation))
+            if nc:
+                not_converged.append(int(index))
+    if labelled and len(channels) != 2:
+        raise ValueError(f"{output}: an LSD block needs both ALPHA and BETA STATES")
+    eig, occ = [], []
+    for states in channels:
+        idx = sorted(states)
+        if not idx or idx != list(range(1, len(idx) + 1)):
+            raise ValueError(f"{output}: eigenvalue indices are missing or not contiguous")
+        eig.append(np.array([states[i][0] for i in idx]) / _HARTREE_EV)
+        occ.append(np.array([states[i][1] for i in idx]))
+    if not_converged:
+        warnings.warn(
+            f"{output}: CPMD flags states {sorted(set(not_converged))} as not converged (NC)",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if len(channels) == 1:
+        return eig[0], occ[0]
+    if eig[0].size != eig[1].size:
+        raise ValueError(f"{output}: alpha and beta list a different number of states")
+    return np.stack(eig), np.stack(occ)
 
 
 # --------------------------------------------------------------------------- #

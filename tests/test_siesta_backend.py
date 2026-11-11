@@ -144,6 +144,49 @@ def test_refuses_until_embasi_has_a_siesta_adapter(monkeypatch, tmp_path):
         make_backend("siesta", _water(), 0, _cfg())
 
 
+def test_adapter_refusal_comes_before_the_install_checks(monkeypatch):
+    """Without SIESTA installed the user must hear the real blocker, not 'install SIESTA'."""
+    from embasi_qiskit_integration.backends.registry import make_backend
+
+    monkeypatch.delenv(sb.PSEUDO_ENV, raising=False)
+    monkeypatch.delenv(sb.COMMAND_ENV, raising=False)
+    monkeypatch.setattr(sb, "_embasi_supports", lambda calc: False)
+    with pytest.raises(NotImplementedError, match="no QMCodeAdapter for ASE's Siesta"):
+        make_backend("siesta", _water(), 0, _cfg())
+
+
+def test_a_cell_less_molecule_gets_a_vacuum_box():
+    from ase import Atoms
+
+    atoms = Atoms("OH2", positions=[(0, 0, 0), (0, 0.757, 0.587), (0, -0.757, 0.587)])
+    before = atoms.get_positions().copy()
+    sb.ensure_vacuum_cell(atoms)
+    np.testing.assert_allclose(np.diag(atoms.cell), [10.0, 11.514, 10.587])
+    np.testing.assert_array_equal(atoms.get_positions(), before)  # positions untouched
+    boxed = Atoms("H", cell=[7.0, 7.0, 7.0])
+    sb.ensure_vacuum_cell(boxed)
+    np.testing.assert_allclose(np.diag(boxed.cell), [7.0, 7.0, 7.0])  # explicit cell kept
+
+
+def test_basis_probe_uses_ases_scf_must_converge_spelling(monkeypatch, tmp_path):
+    """ASE writes `SCFMustConverge True` itself; a dotted key would conflict with it."""
+    seen = {}
+
+    class _Calc:
+        def __init__(self):
+            self.parameters = {"fdf_arguments": {}}
+
+    def fake_calculator(cfg, **kw):
+        seen["calc"] = _Calc()
+        return seen["calc"]
+
+    monkeypatch.setattr(sb, "siesta_calculator", fake_calculator)
+    with pytest.raises(Exception):  # noqa: B017 - the fake cannot run; only the keys matter
+        sb.probe_basis(_water(), _cfg(), directory=tmp_path)
+    fdf = seen["calc"].parameters["fdf_arguments"]
+    assert fdf["SCFMustConverge"] is False and "SCF.MustConverge" not in fdf
+
+
 # --------------------------------------------------------------------------- #
 # Against the real code (skipped without SIESTA)
 # --------------------------------------------------------------------------- #
@@ -174,6 +217,9 @@ def test_matrix_reader_on_a_real_run(tmp_path):
     np.testing.assert_allclose(s, s.T, atol=1e-8)
     np.testing.assert_allclose(h, h.T, atol=1e-7)
     assert float(np.trace(d @ s)) == pytest.approx(8.0, abs=1e-6)  # valence electrons
+    # The Kohn-Sham H itself, not sisl's Fermi-shifted H - Ef*S: its generalised
+    # eigenvalues are SIESTA's own band energies.
+    _assert_matches_eig(m, tmp_path / "siesta.EIG")
 
 
 @needs_siesta
@@ -193,3 +239,18 @@ def test_open_shell_run_is_genuinely_spin_polarised(tmp_path):
     n_a, n_b = (float(np.trace(d @ s)) for d in m["density"])
     assert (n_a, n_b) == pytest.approx((4.0, 3.0), abs=1e-6)
     assert float(np.abs(m["hamiltonian"][0] - m["hamiltonian"][1]).max()) > 1e-3
+    # Spin.Fix gives each channel its own Fermi level; sisl removes only one of them, so a
+    # missing per-spin correction shows up as a ~1 eV error in the beta levels.
+    _assert_matches_eig(m, tmp_path / "siesta.EIG")
+
+
+def _assert_matches_eig(matrices, eig_file):
+    import scipy.linalg as sla
+    from ase.units import Hartree
+
+    toks = eig_file.read_text().split()
+    n_band, n_spin = int(toks[1]), int(toks[2])
+    ref = np.array(toks[5 : 5 + n_band * n_spin], dtype=float).reshape(n_spin, n_band)
+    for spin in range(n_spin):
+        e = sla.eigh(matrices["hamiltonian"][spin], matrices["overlap"], eigvals_only=True)
+        np.testing.assert_allclose(e * Hartree, ref[spin], atol=1e-5)

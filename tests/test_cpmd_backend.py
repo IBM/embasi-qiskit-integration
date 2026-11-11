@@ -102,6 +102,50 @@ def test_missing_eigenvalue_block_is_reported(tmp_path):
         cpmd.read_ks_eigenvalues(out)
 
 
+_LSD_BLOCK = """
+ EIGENVALUES(EV) AND OCCUPATION:
+ ALPHA STATES:
+       1    -25.5594566       1.00000000          2    -13.0690492       1.00000000
+       3     -9.2097962       1.00000000          4     -7.4797781       1.00000000
+ BETA STATES:
+       1    -24.5594566       1.00000000          2    -12.0690492       1.00000000
+       3     -8.2097962       1.00000000          4     -6.0797781       0.00000000
+ ALPHA CHEMICAL POTENTIAL =                -7.4797781 EV
+"""
+
+
+def test_spin_polarised_eigenvalues_give_one_row_per_spin(tmp_path):
+    """Regression: the ALPHA STATES: line ended the loop and two empty arrays came back."""
+    out = tmp_path / "lsd.out"
+    out.write_text(_LSD_BLOCK)
+    eig, occ = cpmd.read_ks_eigenvalues(out)
+    assert eig.shape == occ.shape == (2, 4)
+    np.testing.assert_allclose(occ, [[1, 1, 1, 1], [1, 1, 1, 0]])
+    assert eig[1, 0] * HARTREE_EV == pytest.approx(-24.5594566, abs=1e-6)
+
+
+def test_not_converged_states_are_read_with_a_warning(tmp_path):
+    """CPMD glues 'NC' to the value of a state that did not converge (-0.9067432NC)."""
+    out = tmp_path / "nc.out"
+    out.write_text(
+        " EIGENVALUES(EV) AND OCCUPATION:\n"
+        "       1    -25.5594566       2.00000000          2    -13.0690492       2.00000000\n"
+        "       3     -0.9067432NC     0.00000000\n"
+        " CHEMICAL POTENTIAL = -7 EV\n"
+    )
+    with pytest.warns(RuntimeWarning, match=r"states \[3\] as not converged"):
+        eig, occ = cpmd.read_ks_eigenvalues(out)
+    assert eig[2] * HARTREE_EV == pytest.approx(-0.9067432, abs=1e-6)
+    np.testing.assert_allclose(occ, [2, 2, 0])
+
+
+def test_k_point_eigenvalues_are_refused(tmp_path):
+    out = tmp_path / "k.out"
+    out.write_text(" EIGENVALUES(EV) AND OCCUPATION:\n K POINT:   1  0.0 0.0 0.0\n")
+    with pytest.raises(ValueError, match="k-point"):
+        cpmd.read_ks_eigenvalues(out)
+
+
 def test_cpmd_backend_refuses_with_the_reasons():
     from embasi_qiskit_integration.backends.registry import make_backend
 

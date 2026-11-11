@@ -125,6 +125,18 @@ def test_open_shell_spin_pair_potentials(open_shell):
     np.testing.assert_allclose(cb.veff_ll(total), direct.veff_ll(total), atol=TOL)
 
 
+@pytest.mark.parametrize("atoms, charge, spin", [(_water, 1, 1), (_oh, -1, 0)], ids=["H2O+", "OH-"])
+def test_charged_systems_evaluate_at_their_own_charge(atoms, charge, spin):
+    """Regression: the standalone layers never got the total charge, so EmbASI re-ran
+    them neutral -- and PySCF refused the Mole outright for an odd charge."""
+    direct, cb = _pair(atoms(), charge, _cfg(spin=spin, unrestricted=bool(spin)))
+    np.testing.assert_allclose(cb.hcore(), direct.hcore(), atol=TOL)
+    total, pair = _density(direct)
+    arg = pair if spin else total
+    np.testing.assert_allclose(cb.veff_ll(arg), direct.veff_ll(arg), atol=TOL)
+    np.testing.assert_allclose(cb.veff_hf(total), direct.veff_hf(total), atol=TOL)
+
+
 def test_basis_metadata_and_eris(closed_shell):
     direct, cb = closed_shell
     np.testing.assert_array_equal(cb.ao_atom_map(), direct.ao_atom_map())

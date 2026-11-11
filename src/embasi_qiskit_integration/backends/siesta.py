@@ -142,15 +142,61 @@ def read_matrices(label: str | Path) -> dict[str, np.ndarray]:
     from ase.units import Hartree
 
     label = Path(label)
-    ham = sisl.get_sile(str(label.with_suffix(".HSX"))).read_hamiltonian()
+    hsx = sisl.get_sile(str(label.with_suffix(".HSX")))
+    ham = hsx.read_hamiltonian()
     dm = sisl.get_sile(str(label.with_suffix(".DM"))).read_density_matrix(geometry=ham.geometry)
     n_spin = 2 if ham.spin.is_polarized else 1
     s = np.asarray(ham.Sk(format="array")).real
     # sisl takes `spin=` only on a polarised matrix; an unpolarised one has one channel.
     spins: list[dict[str, int]] = [{"spin": i} for i in range(n_spin)] if n_spin == 2 else [{}]
-    h = tuple(np.asarray(ham.Hk(format="array", **k)).real / Hartree for k in spins)
+    # What sisl returns is NOT the Kohn-Sham H: each channel comes back as H_s - Ef_s*S
+    # (sisl shifts HSX v1/v2 files to the Fermi level on read, and with Spin.Fix SIESTA
+    # stores each channel against its *own* Fermi level, while the HSX file carries only
+    # one).  Add each channel's Fermi level back, so `hcore = H[0]`, `veff = H[dm] - H[0]`
+    # and the alpha/beta splitting carry no density-dependent Ef*S (checked on real runs:
+    # the generalised eigenvalues then equal SIESTA's .EIG per spin to 1e-7 eV).
+    fermi = _fermi_levels(hsx, label, n_spin)
+    h = tuple(
+        (np.asarray(ham.Hk(format="array", **k)).real + ef * s) / Hartree
+        for k, ef in zip(spins, fermi, strict=True)
+    )
     d = tuple(np.asarray(dm.Dk(format="array", **k)).real for k in spins)
     return {"overlap": s, "hamiltonian": np.stack(h), "density": np.stack(d)}
+
+
+def _fermi_levels(hsx: Any, label: Path, n_spin: int) -> tuple[float, ...]:
+    """Per spin channel, the Fermi level (eV) sisl subtracted from H when reading ``hsx``.
+
+    A v0 HSX file (SIESTA < 5) has no Fermi level and is not shifted (zeros).  Otherwise
+    the file's single Ef applies to an unpolarised run, or to a spin-polarised one with a
+    common Fermi level.  A ``Spin.Fix`` run has one Fermi level per spin, printed only in
+    ``<label>.out`` (``Fermi_up`` / ``Fermi_dn``); without that file the beta channel
+    cannot be corrected, so a polarised run then raises rather than return a wrong H.
+    """
+    import re
+    import warnings
+
+    if getattr(hsx, "version", 0) == 0:
+        return (0.0,) * n_spin
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # sisl's own "no usable Ef" warning (it uses 0)
+        common = hsx.read_fermi_level()
+    common = 0.0 if common is None else float(common)
+    if n_spin == 1:
+        return (common,)
+    out = label.with_suffix(".out")
+    if not out.is_file():
+        raise FileNotFoundError(
+            f"{out} is needed to read a spin-polarised SIESTA Hamiltonian: its per-spin "
+            "Fermi levels (Fermi_up/Fermi_dn) are not stored in the .HSX file"
+        )
+    text = out.read_text(errors="replace")
+    number = r"(-?\d+\.\d+(?:[EeDd][-+]?\d+)?)"
+    up = re.findall(r"Fermi_up\s*=\s*" + number, text)
+    dn = re.findall(r"Fermi_dn\s*=\s*" + number, text)
+    if up and dn:
+        return (float(up[-1]), float(dn[-1]))
+    return (common, common)  # free spin: one Fermi level for both channels
 
 
 def basis_atoms_from_orbitals(orbitals: Sequence[SiestaOrbital]) -> np.ndarray:
@@ -169,7 +215,9 @@ def probe_basis(atoms: Any, cfg: Any, *, directory: str | Path) -> list[SiestaOr
     calc.parameters["fdf_arguments"] = {
         **calc.parameters.get("fdf_arguments", {}),
         "MaxSCFIterations": 0,
-        "SCF.MustConverge": False,
+        # ASE's own key spelling: it writes `SCFMustConverge True` itself, so a dotted
+        # variant would leave two conflicting keys in the fdf.
+        "SCFMustConverge": False,
         "SaveHS": False,
         "Write.DM": False,
     }
@@ -189,11 +237,32 @@ def probe_basis(atoms: Any, cfg: Any, *, directory: str | Path) -> list[SiestaOr
 # Calculator construction and the registered backend
 # --------------------------------------------------------------------------- #
 def _embasi_supports(calc: Any) -> bool:
+    """Whether EmbASI has a ``QMCodeAdapter`` for ``calc`` (a calculator or its class name)."""
     try:
         from embasi.qmcode_adapters import implemented_calculators
     except (ImportError, RuntimeError, OSError):  # EmbASI / its MPI not available
         return False
-    return type(calc).__name__ in implemented_calculators
+    name = calc if isinstance(calc, str) else type(calc).__name__
+    return name in implemented_calculators
+
+
+#: Vacuum (Angstrom) between periodic images of a molecule given without a cell.
+MOLECULE_VACUUM = 10.0
+
+
+def ensure_vacuum_cell(atoms: Any, vacuum: float = MOLECULE_VACUUM) -> None:
+    """Give a cell-less molecule an orthorhombic box with ``vacuum`` between its images.
+
+    SIESTA is always periodic.  Without ``LatticeVectors`` (ASE writes none for a zero
+    cell) it picks an automatic cell that only keeps the orbitals of neighbouring images
+    from overlapping -- about 6.4 x 8.0 x 6.5 Angstrom for water, not vacuum -- so the
+    images interact through Hartree and xc.  Set in place, positions untouched, because
+    EmbASI copies these very atoms into every layer; an explicit cell is left alone.
+    """
+    if np.any(np.asarray(atoms.cell)):
+        return
+    extent = np.ptp(np.asarray(atoms.get_positions(), dtype=float), axis=0)
+    atoms.set_cell(np.diag(extent + float(vacuum)))
 
 
 def siesta_calculator(
@@ -275,6 +344,16 @@ def build_siesta_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
             f"--basis {cfg.basis!r} is a Gaussian basis and has no effect with --qm_code "
             "siesta; set SIESTA's numerical-orbital basis with --siesta_basis (SZ/DZ/DZP...)"
         )
+    # Before the calculators: building them needs $SIESTA_PP_PATH and the executable,
+    # and a user without SIESTA should hear the real reason first.
+    if not _embasi_supports("Siesta"):
+        raise NotImplementedError(
+            "--qm_code siesta: EmbASI has no QMCodeAdapter for ASE's Siesta calculator, "
+            "so ProjectionEmbedding cannot drive SIESTA yet (EmbASI's registry lists "
+            "only its supported codes).  This backend is ready on our side and works "
+            "unchanged once EmbASI registers an adapter for 'Siesta'."
+        )
+    ensure_vacuum_cell(atoms)
     spin_polarised = bool(cfg.spin != 0 or cfg.unrestricted)
     workdir = Path(getattr(cfg, "siesta_workdir", None) or "siesta_calc")
     calc_ll, calc_hl = (
@@ -287,13 +366,6 @@ def build_siesta_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
         )
         for xc, level in ((cfg.xc_ll, "ll"), (cfg.xc_hl, "hl"))
     )
-    if not _embasi_supports(calc_ll):
-        raise NotImplementedError(
-            "--qm_code siesta: EmbASI has no QMCodeAdapter for ASE's Siesta calculator, "
-            "so ProjectionEmbedding cannot drive SIESTA yet (EmbASI's registry lists "
-            "only its supported codes).  This backend is ready on our side and works "
-            "unchanged once EmbASI registers an adapter for 'Siesta'."
-        )
     n_spin = 2 if spin_polarised else 1
     ev_ll = LayerEvaluator(atoms, calc_ll, n_spin=n_spin, label=str(workdir / "eval_ll"))
     ev_hl = LayerEvaluator(atoms, calc_hl, n_spin=n_spin, label=str(workdir / "eval_hl"))
