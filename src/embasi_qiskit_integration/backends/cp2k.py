@@ -9,10 +9,10 @@ module writes its input *text*, runs it, and reads the files it writes.  No CP2K
 (nor its data files: basis sets and pseudopotentials are passed by path) is imported,
 linked or vendored.
 
-**What CP2K can supply** (checked against its source and real runs; see
-``BACKEND_DECOUPLING_PLAN.md``).  CP2K has a Gaussian basis, but no ASI implementation and
-no runtime AO-matrix API: it cannot take an AO potential or density matrix during its SCF,
-nor add the ``mu P_B`` projector, and EmbASI has no adapter for it.  So
+**What CP2K can supply** (checked against its source and real runs).  CP2K has a
+Gaussian basis, but no ASI implementation and no runtime AO-matrix API: it cannot take
+an AO potential or density matrix during its SCF, nor add the ``mu P_B`` projector, and
+EmbASI has no adapter for it.  So
 :func:`build_cp2k_backend` refuses this package's projection embedding.  What CP2K *does*
 have is a native active-space module (``&ACTIVE_SPACE``): it builds an active-space
 Hamiltonian over its own Kohn-Sham orbitals and writes it as an FCIDUMP, which
@@ -180,6 +180,7 @@ def active_space_input(
     project: str = "as",
     fcidump: str = "active.fcidump",
     added_mos: int | None = None,
+    charge: int = 0,
 ) -> str:
     """CP2K input text for an isolated-molecule SCF followed by an active-space FCIDUMP.
 
@@ -238,6 +239,7 @@ def active_space_input(
         f"    BASIS_SET_FILE_NAME {data_dir / 'BASIS_MOLOPT'}\n"
         f"    POTENTIAL_FILE_NAME {data_dir / 'GTH_POTENTIALS'}\n"
         + spin
+        + (f"    CHARGE {int(charge)}\n" if charge else "")
         + f"    &MGRID\n      CUTOFF {cutoff}\n    &END MGRID\n"
         "    &POISSON\n      PERIODIC NONE\n      PSOLVER MT\n    &END POISSON\n"
         "    &SCF\n      EPS_SCF 1.0E-8\n      MAX_SCF 100\n"
@@ -295,7 +297,9 @@ def dropped_negative_integrals(h2: Any, *, tol: float = 1e-6, min_couplings: int
     import numpy as np
 
     h2 = np.asarray(h2)
-    p, q, r, s = np.indices(h2.shape)
+    n = h2.shape[0]
+    # Broadcast index grids instead of four materialised norb^4 int arrays.
+    p, q, r, s = np.ogrid[:n, :n, :n, :n]
     coulomb = (p == q) & (r == s)
     exchange = ((p == r) & (q == s)) | ((p == s) & (q == r))
     other = ~(coulomb | exchange) & (np.abs(h2) > tol)
@@ -322,11 +326,13 @@ def run_active_space(
     xc: str = "PBE",
     cutoff: float = 300.0,
     threads: int = 1,
+    charge: int = 0,
 ) -> ActiveSpaceRun:
     """Run CP2K on ``atoms`` (an ASE ``Atoms``) and return its active-space FCIDUMP.
 
     The FCIDUMP is the input of ``embasi-qiskit-integration import_fcidump``.  Molecules
-    are centred in the cubic cell.
+    are centred in the cubic cell.  ``charge`` is the total charge; ``spec``'s valence
+    electron count must already account for it.
     """
     exe = executable or find_executable()
     data = Path(data_dir or os.environ.get(DATA_ENV) or "")
@@ -350,18 +356,23 @@ def run_active_space(
         xc=xc,
         cutoff=cutoff,
         section=active_space_section(exe),
+        charge=charge,
     )
     inp, out = workdir / "as.inp", workdir / "as.out"
+    fcidump = workdir / "active.fcidump"
+    # Never let a previous run's FCIDUMP pass for this one's.
+    fcidump.unlink(missing_ok=True)
     inp.write_text(text)
     env = {**os.environ, "OMP_NUM_THREADS": str(threads)}
     with open(out, "w") as handle:
-        subprocess.run(
+        proc = subprocess.run(
             [exe, "-i", inp.name], cwd=workdir, stdout=handle, stderr=subprocess.STDOUT, env=env
         )
     reason = abort_message(out)
     if reason is not None:
         raise RuntimeError(f"CP2K aborted ({out}): {reason}")
-    fcidump = workdir / "active.fcidump"
+    if proc.returncode != 0:
+        raise RuntimeError(f"CP2K exited with status {proc.returncode}; see {out}")
     if not fcidump.is_file():
         raise RuntimeError(f"CP2K finished but wrote no FCIDUMP; see {out}")
     from embasi_qiskit_integration.hamiltonian import fcidump as _fcidump

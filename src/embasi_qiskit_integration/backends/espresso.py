@@ -8,7 +8,7 @@ only ever *run as external programs* and their *output files* parsed by the read
 here, written from the documented data layout.  No QE/WEST/westpy code is imported,
 linked or vendored -- in particular not westpy, whose QDET reader covers the same file.
 
-**What QE can supply** (see ``BACKEND_DECOUPLING_PLAN.md``).  QE is a plane-wave code: it
+**What QE can supply** (checked against QE 7.6 runs).  QE is a plane-wave code: it
 has **no AO basis**, so none of the AO-basis quantities this package's projection
 embedding needs (``S``, ``hcore``, ``veff`` at an AO density matrix, ``J``/``K``, AO
 ERIs) exist inside it -- only post-SCF *projections* onto pseudo-atomic or Wannier

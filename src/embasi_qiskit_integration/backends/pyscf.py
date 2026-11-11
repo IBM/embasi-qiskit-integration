@@ -65,9 +65,17 @@ _PYSCF_SCF_HINT = (
 
 
 def pyscf_layer_footing(layer: Any) -> tuple[np.ndarray, float]:
-    """``(T + V_nuc, E_nuc)`` of the ``Mole`` an EmbASI PySCF layer integrates on."""
+    """``(h_core, E_nuc)`` of the ``Mole`` an EmbASI PySCF layer integrates on.
+
+    ``h_core`` is PySCF's full core Hamiltonian, ECP / pseudopotential terms included, so it
+    lives on the same footing as ``PySCFIntegrals.hcore()`` (``mf.get_hcore()``).  A bare
+    ``int1e_kin + int1e_nuc`` omits the ECP and shifts the WF-in-DFT energy by
+    ``tr[dm V_ECP]`` (50.5 Ha for HI/def2-SVP); without an ECP the two are identical.
+    """
+    from pyscf import scf
+
     mol = layer.atoms.calc.mol
-    hcore = np.asarray(mol.intor("int1e_kin") + mol.intor("int1e_nuc"))
+    hcore = np.asarray(scf.hf.get_hcore(mol))
     return hcore, float(mol.energy_nuc())
 
 
@@ -500,6 +508,10 @@ class PySCFCallbackIntegrals(CallbackIntegrals):
 
     def valence_ao_projector(self, ao_labels, atoms=None, minao: str = "minao") -> np.ndarray:
         return self._pyscf_basis.valence_ao_projector(ao_labels, atoms=atoms, minao=minao)
+
+    def search_ao_label(self, labels: Sequence[str]) -> np.ndarray:
+        # PySCF's own matcher ("O 2px", "Fe 3d", "O", ...), exactly as the direct backend.
+        return self._pyscf_basis.search_ao_label(labels)
 
 
 @register_backend("pyscf-callback", settings_of="pyscf")

@@ -93,6 +93,12 @@ class LayerEvaluator:
 
     def __call__(self, dm: DensityArg) -> Evaluation:
         layer = self._layer
+        # EmbASI caches the eigenvalue sum on the layer (`if not hasattr(self, "ev_sum")`)
+        # for its non-SCF energy correction; this layer is reused across densities, so a
+        # cached sum would belong to the *previous* evaluation.  (Inert for PySCF, which
+        # needs no correction; live for FHI-aims-like codes.)
+        if hasattr(layer, "ev_sum"):
+            del layer.ev_sum
         layer.run_noscf(dm_in=self._wrap(dm))
         ham = layer.hamiltonian_total
         blocks = tuple(

@@ -5,7 +5,7 @@
 
 Reads a job (``<dir>/job.fcidump`` + sidecar), runs the requested solver, and
 writes ``<dir>/result.npz`` atomically (or ``<dir>/result.ERROR`` on failure).
-``import-fcidump <file> <dir>`` turns an external FCIDUMP (WEST/QDET, CP2K, ...) into
+``import_fcidump <file> <dir>`` turns an external FCIDUMP (WEST/QDET, CP2K, ...) into
 such a job directory.
 This is the process-B side of the two-process handoff; it needs neither EmbASI
 nor FHI-aims.

@@ -107,7 +107,7 @@ def read(path: str | Path) -> EmbeddedHamiltonian:
 
     path = Path(path)
     header = _read_header(path)
-    if int(header.get("UHF", 0)) == 1:
+    if _is_uhf(header):
         return read_uhf(path)
     data = pyscf_fcidump.read(str(path))
     norb = int(data["NORB"])
@@ -203,7 +203,7 @@ def _json_default(obj: object) -> object:
 
 
 def _read_header(path: Path) -> dict[str, Any]:
-    """The ``&FCI ... /`` namelist as a dict (``ORBSYM`` dropped; values as int/float)."""
+    """The ``&FCI ... /`` namelist as a dict (``ORBSYM`` dropped; see :func:`_namelist_value`)."""
     import re
 
     lines = []
@@ -223,12 +223,40 @@ def _read_header(path: Path) -> dict[str, Any]:
         tokens = value.replace(",", " ").split()
         if key == "ORBSYM" or not tokens:
             continue
-        token = tokens[0].replace("D", "E").replace("d", "e")
-        try:
-            header[key] = int(token)
-        except ValueError:
-            header[key] = float(token)
+        header[key] = _namelist_value(tokens[0])
     return header
+
+
+def _namelist_value(token: str) -> Any:
+    """A Fortran namelist scalar: int, float (incl. ``1.0D0``), logical, or the raw text.
+
+    Logicals (``.TRUE.``/``.FALSE.``/``T``/``F``, as NECI/Molpro write ``UHF=``/``TREL=``)
+    become 1/0, so a flag reads the same whichever spelling a writer used; anything else
+    stays a string rather than aborting the read.
+    """
+    upper = token.strip().upper()
+    if upper in (".TRUE.", "T", ".T.", "TRUE"):
+        return 1
+    if upper in (".FALSE.", "F", ".F.", "FALSE"):
+        return 0
+    number = token.replace("D", "E").replace("d", "e")
+    try:
+        return int(number)
+    except ValueError:
+        pass
+    try:
+        return float(number)
+    except ValueError:
+        return token
+
+
+def _is_uhf(header: dict[str, Any]) -> bool:
+    """Whether the header declares an unrestricted file (``UHF`` or ``IUHF``, any spelling)."""
+    for key in ("UHF", "IUHF"):
+        value = header.get(key)
+        if isinstance(value, (int, float)) and value != 0:
+            return True
+    return False
 
 
 def _ends_namelist(line: str) -> bool:
@@ -285,6 +313,8 @@ def read_uhf(path: str | Path) -> EmbeddedHamiltonian:
             if i == j == k == m == 0:
                 e_core = v
                 continue
+            if j == k == m == 0:
+                continue  # an orbital energy ("eps i 0 0 0"): informational, not a matrix element
             if k == 0 and m == 0:  # one-electron
                 beta = i > norb
                 if (j > norb) != beta:
@@ -320,6 +350,8 @@ def read_uhf(path: str | Path) -> EmbeddedHamiltonian:
                     e_core = v
                     break
                 continue
+            if j == k == m == 0:
+                continue  # an orbital energy ("eps i 0 0 0"), not part of any block
             kind = order[section]
             if kind in ("a", "b"):
                 h1[kind][i - 1, j - 1] = h1[kind][j - 1, i - 1] = v

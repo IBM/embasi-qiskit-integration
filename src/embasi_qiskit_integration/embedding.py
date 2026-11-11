@@ -335,8 +335,6 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
         if getattr(cfg, "a_nmos", None) is not None:
             raise ValueError("--uno_n_env and --a_nmos both fix the UNO-SPADE cut; give only one")
 
-    from embasi.embedding import ProjectionEmbedding
-
     from embasi_qiskit_integration.backends.registry import DEFAULT_QM_CODE, make_backend
 
     atoms, charge = build_atoms(cfg)
@@ -353,7 +351,11 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
     sort_embed_mask = np.sort(embed_mask)
     atoms = atoms[idx_list]
 
+    # Before the EmbASI import, like the checks above: a refused --qm_code or a misplaced
+    # backend option must fail with its own message, not with an mpi4py/MPI error.
     backend = make_backend(getattr(cfg, "qm_code", DEFAULT_QM_CODE), atoms, charge, cfg)
+
+    from embasi.embedding import ProjectionEmbedding
 
     projection = ProjectionEmbedding(
         atoms,

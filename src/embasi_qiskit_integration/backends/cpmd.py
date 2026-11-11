@@ -9,9 +9,8 @@ Apache-2.0.  Two parts of the CPMD distribution are *not*: the Gromos QM/MM sour
 as its own executable (``cpmd.x``; there is no ASE calculator for it) and the files it
 writes are read here.
 
-**What CPMD can supply** (checked against its 4.3 source and a real run; see
-``BACKEND_DECOUPLING_PLAN.md``).  CPMD is a plane-wave pseudopotential code: like
-Quantum ESPRESSO it has **no AO basis**, so none of the AO-basis quantities this
+**What CPMD can supply** (checked against its 4.3 source and a real run).  CPMD is a
+plane-wave pseudopotential code: like Quantum ESPRESSO it has **no AO basis**, so none of the AO-basis quantities this
 package's projection embedding needs exist inside it, and it can only add a *local*
 external potential (``EXTERNAL POTENTIAL``), not the nonlocal ``mu P_B`` projector.
 Unlike QE it has **no native active-space route** either -- no ERIs, no FCIDUMP, no

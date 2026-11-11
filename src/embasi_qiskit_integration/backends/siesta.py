@@ -9,8 +9,7 @@ calculator) and its *output files* are read.  No SIESTA code is imported, linked
 vendored.  The plain-text ``.ORB_INDX`` is parsed here directly; the sparse binary
 matrices (``.HSX``, ``.DM``) are read through ``sisl`` (MPL-2.0), an optional extra.
 
-**What SIESTA can supply** (checked against its source and a real run; see
-``BACKEND_DECOUPLING_PLAN.md``):
+**What SIESTA can supply** (checked against its source and a real run):
 
 * overlap, the full Kohn-Sham ``H`` and the density matrix, in its numerical
   atomic-orbital (NAO) basis -- so ``hcore = H[0]`` and ``veff = H[dm] - H[0]`` follow
@@ -245,6 +244,12 @@ def siesta_calculator(
             "Write.DM": True,
             "WriteOrbIndx": True,
             **({"Spin.Fix": True, "Spin.Total": float(total_spin)} if spin_polarised else {}),
+            # --scf_max_cycle is honoured by every backend.
+            **(
+                {"MaxSCFIterations": int(cfg.scf_max_cycle)}
+                if getattr(cfg, "scf_max_cycle", None) is not None
+                else {}
+            ),
         },
     )
 
@@ -263,6 +268,13 @@ def build_siesta_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
         )
     if charge != 0:
         raise NotImplementedError("--qm_code siesta: charged systems are not wired yet")
+    # `--basis` names a Gaussian basis; SIESTA's NAO basis is `--siesta_basis`.  Refuse a
+    # non-default one rather than silently run DZP in its place.
+    if str(getattr(cfg, "basis", "sto-3g")).lower() != "sto-3g":
+        raise ValueError(
+            f"--basis {cfg.basis!r} is a Gaussian basis and has no effect with --qm_code "
+            "siesta; set SIESTA's numerical-orbital basis with --siesta_basis (SZ/DZ/DZP...)"
+        )
     spin_polarised = bool(cfg.spin != 0 or cfg.unrestricted)
     workdir = Path(getattr(cfg, "siesta_workdir", None) or "siesta_calc")
     calc_ll, calc_hl = (

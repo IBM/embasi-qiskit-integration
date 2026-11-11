@@ -267,7 +267,10 @@ def test_layer_status_and_footing(water_uks):
     assert status["e_tot"] == mf_ll.e_tot
     assert ints.layer_scf_status(SimpleNamespace()) is None
     hcore, enuc = ints.layer_footing(layer)
-    np.testing.assert_array_equal(hcore, m.intor("int1e_kin") + m.intor("int1e_nuc"))
+    # The footing is PySCF's full core Hamiltonian (ECP terms included); without an ECP
+    # that is T + V_nuc, up to summation-order round-off.
+    np.testing.assert_allclose(hcore, mf_ll.get_hcore(), atol=1e-12)
+    np.testing.assert_allclose(hcore, m.intor("int1e_kin") + m.intor("int1e_nuc"), atol=1e-12)
     assert enuc == m.energy_nuc()
 
 
