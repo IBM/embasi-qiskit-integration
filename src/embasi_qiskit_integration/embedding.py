@@ -649,9 +649,10 @@ class EmbeddingWorkflow(BaseSettings):
     # QM code behind the embedding (see `embasi_qiskit_integration.backends`).  "pyscf"
     # (default) calls PySCF directly; "pyscf-callback" runs the same calculators through the
     # generic EmbASI-callback route; "siesta" is DFT-in-DFT only and waits on an EmbASI
-    # adapter; "espresso" refuses (plane waves: no AO basis) and points to WEST/QDET via
-    # `import_fcidump`.  Each backend's own options are refused for the others.
-    qm_code: Literal["espresso", "pyscf", "pyscf-callback", "siesta"] = "pyscf"
+    # adapter; "espresso" and "cpmd" refuse (plane waves: no AO basis) -- QE points to
+    # WEST/QDET via `import_fcidump`, CPMD to its Wannier readers.  Each backend's own
+    # options are refused for the others.
+    qm_code: Literal["cpmd", "espresso", "pyscf", "pyscf-callback", "siesta"] = "pyscf"
     # --qm_code siesta only: NAO basis size and real-space mesh cutoff (Ry).
     siesta_basis: str = "DZP"
     siesta_mesh_cutoff: float = 200.0
