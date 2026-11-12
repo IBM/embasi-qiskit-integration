@@ -364,8 +364,8 @@ def test_refused_qm_code_reports_its_reason_before_embasi_is_imported(monkeypatc
 
     monkeypatch.setattr(sys, "argv", ["prog"])
     monkeypatch.setattr(builtins, "__import__", no_embasi)
-    with pytest.raises(NotImplementedError, match="DFT-in-DFT only"):
-        build_adapter(EmbeddingWorkflow(_cli_parse_args=False, qm_code="siesta"), parallel=False)
+    with pytest.raises(NotImplementedError, match="plane-wave code"):
+        build_adapter(EmbeddingWorkflow(_cli_parse_args=False, qm_code="espresso"), parallel=False)
 
 
 def test_make_backend_refuses_an_unknown_code():
