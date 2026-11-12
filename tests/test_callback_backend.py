@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from conftest import require_module
 
 from embasi_qiskit_integration.backends.base import MissingCapabilityError
 from embasi_qiskit_integration.backends.callback import (
@@ -59,8 +60,7 @@ def _oh():
 
 
 def _pair(atoms, charge, cfg):
-    # EmbASI imports mpi4py; without a working MPI library the layer cannot be built.
-    pytest.importorskip("embasi.atoms_embedding_asi", exc_type=ImportError)
+    require_module("embasi.atoms_embedding_asi", "needs a usable EmbASI")
     from embasi_qiskit_integration.backends.registry import make_backend
 
     direct = make_backend("pyscf", atoms, charge, cfg).integrals

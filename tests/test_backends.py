@@ -239,7 +239,8 @@ def test_energy_elec_ll_and_spin_flag_match_the_mean_field(water_uks):
     _m, mf_hl, mf_ll = water_uks
     ints = PySCFIntegrals(mf_hl, mf_ll)
     dm = np.asarray(mf_ll.make_rdm1()).sum(axis=0)
-    assert ints.energy_elec_ll(dm) == mf_ll.energy_elec(dm=dm)[0]
+    # Two grid evaluations: equal only to round-off under threaded BLAS/xc.
+    assert ints.energy_elec_ll(dm) == pytest.approx(mf_ll.energy_elec(dm=dm)[0], abs=1e-10)
     assert ints.ll_spin_resolved is True
     assert PySCFIntegrals(scf.RHF(_m)).ll_spin_resolved is False
 
@@ -271,7 +272,7 @@ def test_layer_status_and_footing(water_uks):
     # that is T + V_nuc, up to summation-order round-off.
     np.testing.assert_allclose(hcore, mf_ll.get_hcore(), atol=1e-12)
     np.testing.assert_allclose(hcore, m.intor("int1e_kin") + m.intor("int1e_nuc"), atol=1e-12)
-    assert enuc == m.energy_nuc()
+    assert enuc == pytest.approx(m.energy_nuc(), abs=1e-12)
 
 
 def test_layer_footing_hcore_includes_the_ecp():
