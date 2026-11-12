@@ -905,7 +905,7 @@ class ProjectionEmbeddingAdapter:
 
         ``h_emb`` needs a bare ``hcore`` and the low-level ``veff`` at A's density; the
         frozen-core fold needs HF J/K; ``h2`` needs AO-basis ERIs for our orbitals.  A
-        backend missing any of them (SIESTA today)
+        backend missing any of them (SIESTA today, CP2K outside its own active space)
         would otherwise fail deep inside, or -- worse -- succeed on a wrong operator.
         """
         for capability in (CAP_HCORE, CAP_ARBITRARY_DM_VEFF, CAP_EXACT_EXCHANGE, CAP_ERI):

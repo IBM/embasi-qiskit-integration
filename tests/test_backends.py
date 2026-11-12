@@ -388,11 +388,11 @@ def test_pyscf_only_settings_are_declared_and_refused_for_another_backend():
         "df_auxbasis",
     }
     check_backend_settings("pyscf", SimpleNamespace(scf_newton=True, density_fit=True))
-    check_backend_settings("siesta", SimpleNamespace(scf_newton=False, init_guess=None))
-    with pytest.raises(ValueError, match="--scf_newton is a pyscf option.*--qm_code siesta"):
-        check_backend_settings("siesta", SimpleNamespace(scf_newton=True))
+    check_backend_settings("cp2k", SimpleNamespace(scf_newton=False, init_guess=None))
+    with pytest.raises(ValueError, match="--scf_newton is a pyscf option.*--qm_code cp2k"):
+        check_backend_settings("cp2k", SimpleNamespace(scf_newton=True))
     with pytest.raises(ValueError, match="--df_auxbasis is a pyscf option"):
-        check_backend_settings("siesta", SimpleNamespace(df_auxbasis="cc-pvdz-ri"))
+        check_backend_settings("cp2k", SimpleNamespace(df_auxbasis="cc-pvdz-ri"))
 
 
 def test_make_backend_refuses_integrals_without_capabilities(monkeypatch):
