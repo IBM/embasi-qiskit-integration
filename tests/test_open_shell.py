@@ -378,12 +378,26 @@ def test_sqd_returns_a_spin_resolved_rdm_pair_matching_fci(ham_factory, nelec):
 # --------------------------------------------------------------------------- #
 # Ported per-spin occupation producers (the missing n_occ_b source)
 # --------------------------------------------------------------------------- #
+
+
+def _per_spin_ao_rdm1(mf):
+    """``(dm_alpha, dm_beta)`` for any PySCF SCF flavour (UHF pair, or split via ``mo_occ``)."""
+    dm = np.asarray(mf.make_rdm1())
+    if dm.ndim == 3:
+        return dm[0], dm[1]
+    mo = np.asarray(mf.mo_coeff)
+    occ = np.asarray(mf.mo_occ, dtype=float)
+    occ_a = (occ >= 0.5).astype(float)
+    occ_b = (occ >= 1.5).astype(float)
+    return (mo * occ_a) @ mo.T, (mo * occ_b) @ mo.T
+
+
 @pytest.mark.parametrize("scf_kind", ["ROHF", "UHF"])
 def test_density_projection_recovers_the_open_shell_spin_counts(scf_kind):
-    """``per_spin_ao_rdm1`` + ``column_occupation_from_density`` recover ``mol.nelec``.
+    """``_per_spin_ao_rdm1`` + ``column_occupation_from_density`` recover ``mol.nelec``.
 
     Exercised on an OH doublet through both SCF flavours, since
-    ``per_spin_ao_rdm1``'s two branches differ:
+    ``_per_spin_ao_rdm1``'s two branches differ:
     UHF hands back the pair directly, ROHF returns a 2D total that must be split via
     ``mo_occ`` rather than halved.
     """
@@ -392,7 +406,6 @@ def test_density_projection_recovers_the_open_shell_spin_counts(scf_kind):
 
     from embasi_qiskit_integration.selectors import (
         column_occupation_from_density,
-        per_spin_ao_rdm1,
         spin_counts_from_occupation,
     )
 
@@ -400,7 +413,7 @@ def test_density_projection_recovers_the_open_shell_spin_counts(scf_kind):
     mf = getattr(scf, scf_kind)(mol)
     mf.kernel()
 
-    dm_a, dm_b = per_spin_ao_rdm1(mf)
+    dm_a, dm_b = _per_spin_ao_rdm1(mf)
     assert dm_a.shape == dm_b.shape == (mol.nao, mol.nao)
     mo = np.asarray(mf.mo_coeff)
     mo = mo[0] if mo.ndim == 3 else mo
@@ -424,7 +437,6 @@ def test_density_projection_beats_the_positional_rule_after_rotation():
 
     from embasi_qiskit_integration.selectors import (
         column_occupation_from_density,
-        per_spin_ao_rdm1,
         somo_occupation_pattern,
         spin_counts_from_occupation,
     )
@@ -432,7 +444,7 @@ def test_density_projection_beats_the_positional_rule_after_rotation():
     mol = gto.M(atom="O 0 0 0; H 0 0 0.97", basis="sto-3g", spin=1, verbose=0)
     mf = scf.UHF(mol)
     mf.kernel()
-    dm_a, dm_b = per_spin_ao_rdm1(mf)
+    dm_a, dm_b = _per_spin_ao_rdm1(mf)
     s = mol.intor_symmetric("int1e_ovlp")
     mo = np.asarray(mf.mo_coeff)[0]
 

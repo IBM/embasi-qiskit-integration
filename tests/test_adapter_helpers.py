@@ -335,3 +335,18 @@ def test_spin_block_accepts_either_spin_count_attribute():
         assert adapter._spin_block(singular) is alpha
     finally:
         type(singular).n_spins = 2
+
+
+def test_operators_average_the_spin_channels_while_densities_sum():
+    """Regression: operators were summed over spin like densities (water 40 Ha low)."""
+    rng = np.random.default_rng(5)
+    a, b = rng.standard_normal((2, 4, 4))
+    block = np.stack([a, b])  # (nspin, nao, nao): what the adapter gets from EmbASI
+    adapter = ProjectionEmbeddingAdapter.__new__(ProjectionEmbeddingAdapter)
+    adapter.unrestricted = True
+    np.testing.assert_allclose(adapter._as_ao_total(block), a + b)
+    np.testing.assert_allclose(adapter._as_ao_operator(block), 0.5 * (a + b))
+    # A closed shell's two equal channels give back the restricted operator itself.
+    np.testing.assert_allclose(adapter._as_ao_operator(np.stack([a, a])), a)
+    adapter.unrestricted = False  # restricted: one channel, nothing to average
+    np.testing.assert_allclose(adapter._as_ao_operator(a[None]), a)
