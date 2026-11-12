@@ -55,6 +55,12 @@ from __future__ import annotations
 
 import numpy as np
 
+from embasi_qiskit_integration.backends.base import (
+    CAP_MINAO_PROJECTOR,
+    as_ao_basis,
+    atom_ao_indices,
+    require_capability,
+)
 from embasi_qiskit_integration.projection_embedding_adapter import (
     Selector,
     VirtualLocalizer,
@@ -514,15 +520,19 @@ def spade_virtual_selector(
     return _localise
 
 
-def fragment_ao_indices(mol, active_atoms) -> np.ndarray:
-    """AO indices of the ``active_atoms`` in ``mol`` (PySCF ``aoslice_by_atom``).
+def fragment_ao_indices(basis, active_atoms) -> np.ndarray:
+    """AO indices of the ``active_atoms`` in ``basis``.
 
-    ``active_atoms`` are indices into the *reordered* atom list the workflow
-    hands to ``pyscf.M`` (region-1 atoms first), so they line up with ``mol``.
+    ``basis`` is a QM backend (:class:`~embasi_qiskit_integration.backends.base.AOBasis`)
+    or, for existing callers, a PySCF ``Mole``.  ``active_atoms`` are indices into the
+    *reordered* atom list the workflow hands the QM code (region-1 atoms first), so they
+    line up with the basis.
     """
-    aoslice = mol.aoslice_by_atom()
-    ranges = [np.arange(aoslice[a, 2], aoslice[a, 3]) for a in active_atoms]
-    return np.hstack(ranges).astype(int) if ranges else np.empty(0, dtype=int)
+    basis = as_ao_basis(basis)
+    direct = getattr(basis, "atom_ao_indices", None)
+    if callable(direct):
+        return direct(list(active_atoms))
+    return atom_ao_indices(basis.ao_atom_map(), list(active_atoms))
 
 
 # --------------------------------------------------------------------------- #
@@ -539,53 +549,33 @@ def fragment_ao_indices(mol, active_atoms) -> np.ndarray:
 # span(A) and respect the embedding's occupied/virtual split.
 
 
-def avas_ao_projector(mol, ao_labels, atoms=None, minao: str = "minao") -> np.ndarray:
+def avas_ao_projector(basis, ao_labels, atoms=None, minao: str = "minao") -> np.ndarray:
     """AO-basis matrix ``M`` whose ``C^T M C`` is the AVAS projection of orbitals ``C``.
 
     ``M = S_21^T S_22^{-1} S_21``, with ``S_22`` the overlap of the target reference AOs
-    and ``S_21`` their cross overlap with ``mol``'s basis: ``c^T M c`` is the squared
+    and ``S_21`` their cross overlap with the system's basis: ``c^T M c`` is the squared
     norm of orbital ``c`` projected onto span(target AOs), in ``[0, 1]`` for an
     S-normalised ``c``.
 
     Args:
-        mol: the PySCF ``Mole`` the orbitals are expanded in.
-        ao_labels: PySCF AO labels selecting the target AOs in the reference basis
-            (``"Fe 3d"``, ``"C 2p"``, ...), matched with ``search_ao_label``.
-        atoms: restrict the targets to the AOs on these atoms (indices into ``mol``);
-            ``None`` keeps every match.  The workflow passes the active fragment, so a
-            label also present in the environment only targets the fragment's copy.
+        basis: the QM backend (or a PySCF ``Mole``) the orbitals are expanded in.  It
+            must provide ``valence_ao_projector`` (the ``minao_projector`` capability).
+        ao_labels: AO labels selecting the target AOs in the reference basis
+            (``"Fe 3d"``, ``"C 2p"``, ...).
+        atoms: restrict the targets to the AOs on these atoms (indices into the
+            system); ``None`` keeps every match.  The workflow passes the active
+            fragment, so a label also present in the environment only targets the
+            fragment's copy.
         minao: the minimal reference basis the labels are matched in (PySCF's AVAS
             default).
 
     Raises:
         ValueError: if no reference AO matches.
+        MissingCapabilityError: if the backend cannot build a reference-basis projector.
     """
-    import scipy.linalg
-    from pyscf import gto
-
-    pmol = mol.copy()
-    pmol.atom = mol._atom
-    pmol.unit = "B"
-    pmol.symmetry = False
-    pmol.basis = minao
-    pmol.build(False, False)
-
-    targets = np.asarray(pmol.search_ao_label(list(ao_labels)), dtype=int)
-    if atoms is not None:
-        targets = np.intersect1d(targets, fragment_ao_indices(pmol, list(atoms)))
-    if targets.size == 0:
-        ref_ao = fragment_ao_indices(pmol, list(atoms)) if atoms is not None else range(pmol.nao)
-        labels = pmol.ao_labels(fmt=False)
-        shells = sorted({" ".join(labels[i][1:3]) for i in ref_ao})
-        raise ValueError(
-            f"AVAS labels {list(ao_labels)} match no {minao} AO"
-            f"{' of the active fragment' if atoms is not None else ''}; available shells: "
-            f"{', '.join(shells)}"
-        )
-
-    s22 = pmol.intor_symmetric("int1e_ovlp")[np.ix_(targets, targets)]
-    s21 = gto.intor_cross("int1e_ovlp", pmol, mol)[targets]
-    return s21.T @ scipy.linalg.solve(s22, s21, assume_a="pos")
+    basis = as_ao_basis(basis)
+    require_capability(basis, CAP_MINAO_PROJECTOR, "the AVAS valence-AO projector")
+    return basis.valence_ao_projector(list(ao_labels), atoms=atoms, minao=minao)
 
 
 # --------------------------------------------------------------------------- #
@@ -685,28 +675,6 @@ def somo_occupation_pattern(n_orb: int, n_occ_a: int, n_occ_b: int) -> np.ndarra
     pattern[:lo] = 2
     pattern[lo:hi] = 1
     return pattern
-
-
-def per_spin_ao_rdm1(mf) -> tuple[np.ndarray, np.ndarray]:
-    """``(dm_alpha, dm_beta)`` in the AO basis, for any PySCF SCF flavour.
-
-    UHF/UKS hands back the pair directly (3D); RHF/ROHF/RKS return the 2D *total*, which
-    is rebuilt per spin from ``mo_occ`` (alpha where ``occ >= 1``, beta where ``occ == 2``)
-    rather than halved -- halving is exactly what cannot represent an open shell.
-
-    This is one of the two producers that can supply a real ``n_occ_b``; see
-    :func:`column_occupation_from_density`.
-    """
-    dm = np.asarray(mf.make_rdm1())
-    if dm.ndim == 3:
-        return dm[0], dm[1]
-    mo = np.asarray(mf.mo_coeff)
-    if mo.ndim == 3:  # UHF-shaped coeff with a 2D dm shouldn't happen; guard anyway
-        mo = mo[0]
-    occ = np.asarray(mf.mo_occ, dtype=float)
-    occ_a = (occ >= 0.5).astype(float)
-    occ_b = (occ >= 1.5).astype(float)
-    return (mo * occ_a) @ mo.T, (mo * occ_b) @ mo.T
 
 
 def column_occupation_from_density(
