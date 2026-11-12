@@ -35,7 +35,9 @@ def _sidecar_path(path: str | Path) -> Path:
     return Path(path).with_suffix(".npz")
 
 
-def write(ham: EmbeddedHamiltonian, path: str | Path, *, signed_ms2: bool = True) -> None:
+def write(
+    ham: EmbeddedHamiltonian, path: str | Path, *, signed_ms2: bool = True, uhf: bool = False
+) -> None:
     """Write ``ham`` to a FCIDUMP file at ``path`` plus a ``.npz`` sidecar.
 
     The integrals go into the FCIDUMP; ``e_core``, ``nelec`` and ``meta`` go
@@ -50,13 +52,20 @@ def write(ham: EmbeddedHamiltonian, path: str | Path, *, signed_ms2: bool = True
             :mod:`~embasi_qiskit_integration.circuit_generator.operator` therefore
             writes unsigned; that path takes ``nelec`` from the live ``ham`` and never
             re-reads it from the header, so no spin information is lost.
+        uhf: write the integrals as a ``UHF=1`` file (:func:`write_uhf`), so a
+            spin-dependent Hamiltonian stays exact even without its sidecar.
+
+    The sidecar records the FCIDUMP's SHA-256, so :func:`read` refuses a sidecar that
+    belongs to another file.
     """
+    import hashlib
+
     from pyscf.tools import fcidump as pyscf_fcidump
 
     path = Path(path)
     norb = ham.norb
     na, nb = ham.nelec
-    if ham.is_spin_dependent:
+    if ham.is_spin_dependent and not uhf:
         warnings.warn(
             "this Hamiltonian carries a spin-dependent (h1a, h1b) pair, which a "
             "restricted FCIDUMP cannot represent; the FCIDUMP gets the spin-averaged h1 "
@@ -64,24 +73,53 @@ def write(ham: EmbeddedHamiltonian, path: str | Path, *, signed_ms2: bool = True
             "Use write_uhf() for a UHF=1 file other programs can read.",
             stacklevel=2,
         )
-    pyscf_fcidump.from_integrals(
-        str(path),
-        ham.h1,
-        ham.h2,
-        norb,
-        na + nb,
-        nuc=ham.e_core,
-        ms=(na - nb) if signed_ms2 else abs(na - nb),
-    )
+    # The FCIDUMP appears last and whole (a watcher waits for it), after its sidecar.
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        if uhf:
+            write_uhf(ham, tmp)
+        else:
+            pyscf_fcidump.from_integrals(
+                str(tmp),
+                ham.h1,
+                ham.h2,
+                norb,
+                na + nb,
+                nuc=ham.e_core,
+                ms=(na - nb) if signed_ms2 else abs(na - nb),
+            )
 
-    meta_json = json.dumps(ham.meta, default=_json_default)
-    arrays: dict[str, Any] = {
-        "e_core": np.asarray(ham.e_core, dtype=float),
-        "nelec": np.asarray(ham.nelec, dtype=int),
-        "meta_json": np.asarray(meta_json),
-        **_spin_sidecar_fields(ham),
-    }
-    np.savez(_sidecar_path(path), **arrays)
+        meta_json = json.dumps(ham.meta, default=_json_default)
+        arrays: dict[str, Any] = {
+            "e_core": np.asarray(ham.e_core, dtype=float),
+            "nelec": np.asarray(ham.nelec, dtype=int),
+            "meta_json": np.asarray(meta_json),
+            "fcidump_sha256": np.asarray(hashlib.sha256(tmp.read_bytes()).hexdigest()),
+            **({} if uhf else _spin_sidecar_fields(ham)),
+        }
+        np.savez(_sidecar_path(path), **arrays)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _check_sidecar(
+    path: Path, sidecar: Path, nelec: tuple, header: dict[str, Any], digest: str | None
+) -> None:
+    """A sidecar left over from another Hamiltonian must not be paired silently: it must
+    carry this FCIDUMP's SHA-256 (sidecars from before the hash: its electron count)."""
+    import hashlib
+
+    if digest is not None and digest != hashlib.sha256(path.read_bytes()).hexdigest():
+        raise ValueError(
+            f"{sidecar.name} was written for a different {path.name} (content hash "
+            "mismatch): the sidecar belongs to another file"
+        )
+    if sum(nelec) != int(header["NELEC"]):
+        raise ValueError(
+            f"{sidecar.name} has {sum(nelec)} electrons but {path.name} has "
+            f"NELEC={header['NELEC']}: the sidecar belongs to another file"
+        )
 
 
 def _spin_sidecar_fields(ham: EmbeddedHamiltonian) -> dict[str, np.ndarray]:
@@ -96,40 +134,65 @@ def _spin_sidecar_fields(ham: EmbeddedHamiltonian) -> dict[str, np.ndarray]:
     return out
 
 
-def read(path: str | Path) -> EmbeddedHamiltonian:
+def read(
+    path: str | Path,
+    *,
+    nelec: tuple[int, int] | None = None,
+    alpha_index: str | None = None,
+) -> EmbeddedHamiltonian:
     """Read an :class:`EmbeddedHamiltonian` from a FCIDUMP + ``.npz`` sidecar.
 
     If the sidecar is absent, ``nelec`` is reconstructed from the FCIDUMP
-    ``NELEC``/``MS2`` header and ``e_core`` from ``ECORE``; ``meta`` is empty.
+    ``NELEC``/``MS2`` header and ``e_core`` from ``ECORE``; ``meta`` is empty.  An
+    explicit ``nelec = (n_alpha, n_beta)`` replaces the header's spin split (its sum must
+    equal ``NELEC``), for a writer whose ``MS2`` convention is unknown.  ``alpha_index``
+    is passed to :func:`read_uhf` (interleaved UHF files only).
     """
-    from pyscf import ao2mo
-    from pyscf.tools import fcidump as pyscf_fcidump
-
     path = Path(path)
     header = _read_header(path)
     if _is_uhf(header):
-        return read_uhf(path)
-    data = pyscf_fcidump.read(str(path))
-    norb = int(data["NORB"])
-    h1 = np.asarray(data["H1"], dtype=float)
-    # pyscf packs H2 in 4-fold/8-fold triangular form; restore the full tensor.
-    h2 = ao2mo.restore(1, np.asarray(data["H2"], dtype=float), norb)
+        return read_uhf(path, nelec=nelec, alpha_index=alpha_index)
+    # Our own parser rather than PySCF's, which caps the header at 10 lines (a wrapped
+    # ORBSYM of a large space) and rejects Fortran D exponents.
+    norb = int(header["NORB"])
+    h1 = np.zeros((norb, norb))
+    h2 = np.zeros((norb,) * 4)
+    e_core = float(header.get("ECORE", 0.0))  # a 0 0 0 0 line, if any, overrides it
+    rows = _integral_lines(path)
+    for v, i, j, k, m in rows:
+        if i == j == k == m == 0:
+            e_core = v
+        elif j == k == m == 0:
+            continue  # an orbital energy ("eps i 0 0 0"), not a matrix element
+        elif k == m == 0:
+            h1[i - 1, j - 1] = h1[j - 1, i - 1] = v
+        else:
+            _fill_eri(h2, i - 1, j - 1, k - 1, m - 1, v, same_spin=True)
+    if not h1.any() and not any(r[1:] == (0, 0, 0, 0) for r in rows):
+        raise ValueError(
+            f"{path.name}: no one-electron integrals and no core line -- a truncated file?"
+        )
 
     sidecar = _sidecar_path(path)
     spin: dict[str, Any] = {}
+    override = _nelec_override(nelec, int(header["NELEC"]), path)
     if sidecar.exists():
         with np.load(sidecar, allow_pickle=False) as npz:
             e_core = float(npz["e_core"])
             nelec = tuple(int(x) for x in npz["nelec"])
             meta = json.loads(str(npz["meta_json"]))
+            digest = str(npz["fcidump_sha256"]) if "fcidump_sha256" in npz.files else None
             if "h1a" in npz.files:
                 spin["h1a"], spin["h1b"] = np.asarray(npz["h1a"]), np.asarray(npz["h1b"])
             if "h2_aa" in npz.files:
                 spin["h2_spin"] = tuple(np.asarray(npz[k]) for k in ("h2_aa", "h2_ab", "h2_bb"))
+        _check_sidecar(path, sidecar, nelec, header, digest)
     else:
-        e_core = float(data.get("ECORE", 0.0))
-        nelec = _nelec_from_header(int(data["NELEC"]), int(data.get("MS2", 0)), path)
+        nelec = override or _nelec_from_header(
+            int(header["NELEC"]), int(header.get("MS2", 0)), path
+        )
         meta = {}
+    nelec = override or nelec
 
     nelec_pair: tuple[int, int] = (int(nelec[0]), int(nelec[1]))
 
@@ -168,6 +231,18 @@ def to_hartree(ham: EmbeddedHamiltonian, unit: str) -> EmbeddedHamiltonian:
     return ham.model_copy(update=update)
 
 
+def _nelec_override(
+    nelec: tuple[int, int] | None, nelec_total: int, path: Path
+) -> tuple[int, int] | None:
+    """A caller's ``(n_alpha, n_beta)``, checked against the header's ``NELEC``."""
+    if nelec is None:
+        return None
+    na, nb = (int(x) for x in nelec)
+    if na + nb != nelec_total or min(na, nb) < 0:
+        raise ValueError(f"nelec={nelec} does not add up to {path.name}'s NELEC={nelec_total}")
+    return (na, nb)
+
+
 def _nelec_from_header(nelec_total: int, ms2: int, path: Path) -> tuple[int, int]:
     """``(NELEC, MS2)`` -> ``(n_alpha, n_beta)``, taking ``MS2`` as ``n_alpha - n_beta``.
 
@@ -184,6 +259,22 @@ def _nelec_from_header(nelec_total: int, ms2: int, path: Path) -> tuple[int, int
     or construct the Hamiltonian directly, when the producer is known to write
     unsigned and the system is beta-rich.
     """
+    if ms2 > 0 and (nelec_total - ms2) % 2 and ms2 - 1 <= nelec_total:
+        # CP2K 2023.1-2026.1 write the multiplicity 2S+1 as MS2 (a singlet says MS2=1);
+        # as 2S it fails the parity check, as 2S+1 it is consistent.
+        warnings.warn(
+            f"{path.name}: MS2={ms2} has the wrong parity for NELEC={nelec_total}; reading "
+            f"it as the multiplicity 2S+1 (CP2K 2023.1-2026.1 write it so), i.e. 2S={ms2 - 1}."
+            " Pass nelec= if that is wrong.",
+            stacklevel=3,
+        )
+        ms2 -= 1
+    if ms2 == 0 and nelec_total % 2:
+        # CP2K 7.1-2022.x hard-code MS2=0 for every file, odd electron counts included.
+        raise ValueError(
+            f"{path.name}: MS2=0 with an odd NELEC={nelec_total} gives no spin split; pass "
+            "nelec=(n_alpha, n_beta) (import_fcidump --nelec_alpha/--nelec_beta)"
+        )
     if ms2 == 0:
         # Closed shell (or an equal-spin open shell): unambiguous.
         return (nelec_total // 2, nelec_total - nelec_total // 2)
@@ -256,6 +347,8 @@ def _read_header(path: Path) -> dict[str, Any]:
         if key == "ORBSYM" or not tokens:
             continue
         header[key] = _namelist_value(tokens[0])
+    if "NORB" not in header or "NELEC" not in header:
+        raise ValueError(f"{path.name}: no NORB/NELEC in an &FCI header; is it a FCIDUMP?")
     return header
 
 
@@ -292,8 +385,9 @@ def _is_uhf(header: dict[str, Any]) -> bool:
 
 
 def _ends_namelist(line: str) -> bool:
-    stripped = line.strip().upper()
-    return stripped.endswith(("/", "&END", "$END")) or stripped in ("/", "&END", "$END")
+    # Anywhere in the line, as PySCF's reader (" &END," and "... ISYM=1 /" both close it).
+    upper = line.upper()
+    return "/" in upper or "&END" in upper or "$END" in upper
 
 
 def _integral_lines(path: Path) -> list[tuple[float, int, int, int, int]]:
@@ -306,10 +400,16 @@ def _integral_lines(path: Path) -> list[tuple[float, int, int, int, int]]:
                     in_header = False
                 continue
             parts = line.split()
-            if len(parts) < 5:
+            if not parts:
                 continue
+            if len(parts) < 5:
+                raise ValueError(f"{path.name}: malformed integral line {line.strip()!r}")
             i, j, k, m = (int(x) for x in parts[1:5])
             rows.append((float(parts[0].replace("D", "E").replace("d", "e")), i, j, k, m))
+    if in_header:
+        raise ValueError(f"{path.name}: the &FCI header is never closed (no '/' or '&END')")
+    if not rows:
+        raise ValueError(f"{path.name}: no integral lines after the header")
     return rows
 
 
@@ -322,7 +422,12 @@ def _fill_eri(eri: np.ndarray, p: int, q: int, r: int, s: int, v: float, *, same
                 eri[c, d, a, b] = v
 
 
-def read_uhf(path: str | Path) -> EmbeddedHamiltonian:
+def read_uhf(
+    path: str | Path,
+    *,
+    nelec: tuple[int, int] | None = None,
+    alpha_index: str | None = None,
+) -> EmbeddedHamiltonian:
     """Read a ``UHF=1`` FCIDUMP into a spin-resolved :class:`EmbeddedHamiltonian`.
 
     ``h1``/``h2`` are filled with the spin average / the alpha block (the contract's
@@ -335,11 +440,16 @@ def read_uhf(path: str | Path) -> EmbeddedHamiltonian:
     header = _read_header(path)
     norb = int(header["NORB"])
     rows = _integral_lines(path)
+    spin_orbital = any(max(i, j, k, m) > norb for _v, i, j, k, m in rows)
+    # NECI/HANDE/Psi4 `UHF=T`: NORB counts spin orbitals, alpha/beta interleaved (2p-1, 2p),
+    # and only the core line has all-zero indices; the separated layout has >= 5 of them.
+    interleaved = not spin_orbital and sum(1 for r in rows if not any(r[1:])) <= 1
+    if interleaved:
+        return _read_uhf_interleaved(path, header, rows, nelec, alpha_index)
     eri = {k: np.zeros((norb,) * 4) for k in ("aa", "ab", "bb")}
     h1 = {k: np.zeros((norb, norb)) for k in ("a", "b")}
-    e_core = 0.0
+    e_core = float(header.get("ECORE", 0.0))  # a 0 0 0 0 line, if any, overrides it
 
-    spin_orbital = any(max(i, j, k, m) > norb for _v, i, j, k, m in rows)
     if spin_orbital:
         for v, i, j, k, m in rows:
             if i == j == k == m == 0:
@@ -390,16 +500,89 @@ def read_uhf(path: str | Path) -> EmbeddedHamiltonian:
             else:
                 _fill_eri(eri[kind], i - 1, j - 1, k - 1, m - 1, v, same_spin=kind != "ab")
 
+    layout = "spin-orbital" if spin_orbital else "separated"
+    return _uhf_hamiltonian(path, header, nelec, e_core, h1, eri, layout)
+
+
+def _read_uhf_interleaved(path, header, rows, nelec, alpha_index) -> EmbeddedHamiltonian:
+    """The NECI/HANDE/Psi4 ``UHF=T`` layout: ``NORB`` spin orbitals, ``2p-1``/``2p`` for
+    spatial orbital ``p``.  Which of the two is alpha differs by writer -- Psi4 puts alpha
+    on the odd index, NECI (``is_beta = btest(orb, 0)``) on the even one -- and the file
+    does not say, so ``alpha_index`` (``"odd"``/``"even"``) must be given unless the
+    alpha and beta blocks coincide, when the choice cannot change the Hamiltonian."""
+    if alpha_index not in (None, "odd", "even"):
+        raise ValueError(f"alpha_index must be 'odd' or 'even', got {alpha_index!r}")
+    nso = int(header["NORB"])
+    if nso % 2:
+        raise ValueError(f"{path.name}: interleaved UHF layout needs an even NORB, got {nso}")
+    n = nso // 2
+    eri = {k: np.zeros((n,) * 4) for k in ("aa", "ab", "bb")}
+    h1 = {k: np.zeros((n, n)) for k in ("a", "b")}
+    e_core = float(header.get("ECORE", 0.0))
+    for v, i, j, k, m in rows:
+        if i == j == k == m == 0:
+            e_core = v
+            continue
+        if j == k == m == 0:
+            continue  # an orbital energy ("eps i 0 0 0")
+        (p, sp), (q, sq) = divmod(i - 1, 2), divmod(j - 1, 2)
+        if k == 0 and m == 0:
+            if sp != sq:
+                if v:
+                    raise ValueError(f"{path.name}: one-electron line mixes spins: {i} {j}")
+                continue
+            block = h1["b" if sp else "a"]
+            block[p, q] = block[q, p] = v
+            continue
+        (r, sr), (s, ss) = divmod(k - 1, 2), divmod(m - 1, 2)
+        if sp != sq or sr != ss:
+            if v:
+                raise ValueError(f"{path.name}: a pair mixes spins: {i} {j} {k} {m}")
+            continue
+        if sp == sr:
+            _fill_eri(eri["bb" if sp else "aa"], p, q, r, s, v, same_spin=True)
+        elif sp == 0:
+            _fill_eri(eri["ab"], p, q, r, s, v, same_spin=False)
+        else:  # (bb|aa): transpose into (aa|bb)
+            _fill_eri(eri["ab"], r, s, p, q, v, same_spin=False)
+    # Read as odd = alpha; the other convention swaps the channels.
+    swapped = (eri["ab"].transpose(2, 3, 0, 1), h1["b"], h1["a"], eri["bb"], eri["aa"])
+    if alpha_index is None:
+        diff = max(
+            float(np.abs(h1["a"] - h1["b"]).max()),
+            float(np.abs(eri["aa"] - eri["bb"]).max()),
+            float(np.abs(eri["ab"] - swapped[0]).max()),
+        )
+        if diff > 1e-8:
+            raise ValueError(
+                f"{path.name}: interleaved UHF file with distinct alpha/beta blocks "
+                f"(max difference {diff:.1e}); its writer decides which index is alpha -- "
+                "pass alpha_index='odd' (Psi4) or 'even' (NECI/HANDE) "
+                "(import_fcidump --uhf_alpha_index)"
+            )
+    elif alpha_index == "even":
+        eri["ab"], h1["a"], h1["b"], eri["aa"], eri["bb"] = swapped
+    return _uhf_hamiltonian(path, header, nelec, e_core, h1, eri, "interleaved")
+
+
+def _uhf_hamiltonian(path, header, nelec, e_core, h1, eri, layout) -> EmbeddedHamiltonian:
+    """Assemble a read UHF file, with the sidecar / ``nelec`` precedence of :func:`read`."""
     sidecar = _sidecar_path(path)
+    override = _nelec_override(nelec, int(header["NELEC"]), path)
     if sidecar.exists():
         with np.load(sidecar, allow_pickle=False) as npz:
             e_core = float(npz["e_core"])
             nelec = tuple(int(x) for x in npz["nelec"])
             meta = json.loads(str(npz["meta_json"]))
+            digest = str(npz["fcidump_sha256"]) if "fcidump_sha256" in npz.files else None
+        _check_sidecar(path, sidecar, nelec, header, digest)
     else:
-        nelec = _nelec_from_header(int(header["NELEC"]), int(header.get("MS2", 0)), path)
+        nelec = override or _nelec_from_header(
+            int(header["NELEC"]), int(header.get("MS2", 0)), path
+        )
         meta = {}
-    meta = {**meta, "fcidump_uhf_layout": "spin-orbital" if spin_orbital else "separated"}
+    nelec = override or nelec
+    meta = {**meta, "fcidump_uhf_layout": layout}
     return EmbeddedHamiltonian(
         h1=0.5 * (h1["a"] + h1["b"]),
         h2=eri["aa"],

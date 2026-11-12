@@ -94,19 +94,6 @@ def test_unsigned_positive_ms2_warns_instead_of_refusing(tmp_path, rng):
         assert fcidump.read(path).nelec == (2, 1)
 
 
-def test_inconsistent_header_is_rejected(tmp_path, rng):
-    """``|MS2| > NELEC`` or a parity mismatch cannot be a spin split at all."""
-    ham = _random_ham(3, (2, 1), rng)
-    path = tmp_path / "bad.fcidump"
-    fcidump.write(ham, path)
-    path.with_suffix(".npz").unlink()
-    text = path.read_text().replace("MS2=1", "MS2=9")
-    path.write_text(text)
-
-    with pytest.raises(ValueError, match="inconsistent header"):
-        fcidump.read(path)
-
-
 def test_open_shell_roundtrip_uses_the_sidecar(tmp_path, rng):
     """With the sidecar, both spin orderings round-trip exactly.
 
@@ -279,7 +266,7 @@ def test_restricted_write_is_unchanged_by_the_spin_sidecar(tmp_path, rng):
     ham = _random_ham(3, (2, 1), rng)
     fcidump.write(ham, tmp_path / "job.fcidump")
     with np.load(tmp_path / "job.npz") as npz:
-        assert set(npz.files) == {"e_core", "nelec", "meta_json"}
+        assert set(npz.files) == {"e_core", "nelec", "meta_json", "fcidump_sha256"}
 
 
 _RESTRICTED_BODY = " 0.5 1 1 1 1\n 0.5 2 2 2 2\n-1.0 1 1 0 0\n-0.5 2 2 0 0\n 0.0 0 0 0 0\n"
@@ -392,3 +379,185 @@ def test_import_fcidump_rejects_an_inconsistent_spin_override(tmp_path, rng, cap
 def test_to_hartree_refuses_an_unknown_unit(rng):
     with pytest.raises(ValueError, match="unknown energy unit"):
         fcidump.to_hartree(_random_ham(2, (1, 1), rng), "ev")
+
+
+@pytest.mark.parametrize("uhf", [False, True], ids=["restricted", "uhf"])
+def test_cp2k_multiplicity_ms2_and_the_nelec_override(tmp_path, rng, uhf):
+    """CP2K 2023.1-2026.1 write MS2 = 2S+1 (a singlet says MS2=1, an odd NELEC-MS2): it is
+    read as the multiplicity, with a warning; an explicit nelec bypasses the header."""
+    path = tmp_path / "cp2k.fcidump"
+    ham = _random_ham(3, (2, 2), rng)
+    (fcidump.write_uhf if uhf else fcidump.write)(ham, path)
+    path.with_suffix(".npz").unlink(missing_ok=True)
+    path.write_text(path.read_text().replace("MS2=0", "MS2=1"))
+    with pytest.warns(UserWarning, match="multiplicity"):
+        assert fcidump.read(path).nelec == (2, 2)
+    assert fcidump.read(path, nelec=(3, 1)).nelec == (3, 1)
+    with pytest.raises(ValueError, match="does not add up"):
+        fcidump.read(path, nelec=(3, 2))
+
+
+@pytest.mark.parametrize("variant", ["d_exponents", "long_header", "no_commas", "orbital_energies"])
+def test_restricted_reader_takes_foreign_headers_and_number_formats(tmp_path, rng, variant):
+    """Molpro/NECI-style files PySCF's reader refuses: Fortran ``D`` exponents, a header
+    wrapped over more than 10 lines, a comma-less namelist, ``eps i 0 0 0`` lines."""
+    ham = _random_ham(3, (1, 1), rng)
+    path = tmp_path / "f.fcidump"
+    fcidump.write(ham, path)
+    path.with_suffix(".npz").unlink()
+    text = path.read_text()
+    if variant == "d_exponents":
+        head, _, body = text.partition("&END")
+        rows = [ln.split() for ln in body.splitlines() if ln.strip()]
+        text = (
+            head
+            + "&END\n"
+            + "".join(f"{float(r[0]):.16E} {' '.join(r[1:])}\n".replace("E", "D") for r in rows)
+        )
+    elif variant == "long_header":
+        text = text.replace("ISYM=1,", "ISYM=1,\n" + "  IUHF=0,\n" * 12, 1)
+    elif variant == "no_commas":
+        lines = text.splitlines()
+        lines[0] = lines[0].replace(",", " ")
+        text = "\n".join(lines) + "\n"
+    else:
+        core = text.rstrip().splitlines()[-1]
+        text = text.replace(core, "  -9.9 1 0 0 0\n  -8.8 2 0 0 0\n" + core)
+    path.write_text(text)
+    back = fcidump.read(path)
+    np.testing.assert_allclose(back.h1, ham.h1, atol=1e-14)
+    np.testing.assert_allclose(back.h2, ham.h2, atol=1e-14)
+    assert back.e_core == pytest.approx(ham.e_core, abs=1e-14) and back.nelec == (1, 1)
+
+
+def _restricted_file(tmp_path, rng):
+    ham = _random_ham(2, (1, 1), rng)
+    path = tmp_path / "r.fcidump"
+    fcidump.write(ham, path)
+    path.with_suffix(".npz").unlink()
+    return ham, path
+
+
+def test_header_ecore_and_header_terminators(tmp_path, rng):
+    """ECORE= in the header is the core energy when no 0 0 0 0 line follows; a terminator
+    with trailing text still closes the header."""
+    ham, path = _restricted_file(tmp_path, rng)
+    lines = path.read_text().splitlines()
+    body = [ln for ln in lines[4:] if not ln.split()[1:] == ["0", "0", "0", "0"]]
+    path.write_text("\n".join([lines[0], " ECORE=1.5,", " &END,", *body]) + "\n")
+    back = fcidump.read(path)
+    assert back.e_core == 1.5
+    np.testing.assert_allclose(back.h2, ham.h2, atol=1e-14)
+
+
+@pytest.mark.parametrize(
+    "bbaa, alpha_index",
+    [(False, "odd"), (True, "odd"), (False, "even")],
+    ids=["psi4", "psi4-bbaa", "neci"],
+)
+def test_interleaved_uhf_layout_of_neci_and_psi4(tmp_path, bbaa, alpha_index):
+    """NECI/HANDE/Psi4 ``UHF=.TRUE.``: NORB spin orbitals, alpha/beta interleaved, only a
+    core line with zero indices; Psi4 puts alpha on odd indices, NECI on even ones.  FCI
+    on the file must equal direct_uhf on the integrals, and with distinct alpha/beta
+    blocks the reader refuses to guess the parity."""
+    from pyscf import ao2mo, fci, gto, scf
+
+    from embasi_qiskit_integration.solvers import FCISolver
+
+    mol = gto.M(atom="O 0 0 0; H 0 0 1.0", basis="sto-3g", spin=1, verbose=0)
+    ca, cb = scf.UHF(mol).run().mo_coeff
+    n, hc = ca.shape[1], scf.hf.get_hcore(mol)
+    h1a, h1b = ca.T @ hc @ ca, cb.T @ hc @ cb
+    aa = ao2mo.restore(1, ao2mo.full(mol, ca), n)
+    bb = ao2mo.restore(1, ao2mo.full(mol, cb), n)
+    ab = ao2mo.general(mol, (ca, ca, cb, cb), compact=False).reshape((n,) * 4)
+    ref = fci.direct_uhf.kernel((h1a, h1b), (aa, ab, bb), n, mol.nelec)[0] + mol.energy_nuc()
+
+    alpha, beta = (lambda p: 2 * p + 1), (lambda p: 2 * p + 2)
+    if alpha_index == "even":
+        alpha, beta = beta, alpha
+    lines = [f"&FCI NORB={2 * n},NELEC={mol.nelectron},MS2=1,", " UHF=.TRUE.,", " /"]
+    for eri, f1, f2 in ((aa, alpha, alpha), (bb, beta, beta), (ab, alpha, beta)):
+        for i, j, k, m in np.ndindex(eri.shape):
+            if i >= j and k >= m and abs(eri[i, j, k, m]) > 1e-12:
+                idx = (
+                    (f2(k), f2(m), f1(i), f1(j))
+                    if bbaa and f1 is not f2
+                    else (f1(i), f1(j), f2(k), f2(m))
+                )
+                lines.append(f"{eri[i, j, k, m]:28.20E}" + "".join(f"{x:4d}" for x in idx))
+    for h, f in ((h1a, alpha), (h1b, beta)):
+        lines += [
+            f"{h[i, j]:28.20E}{f(i):4d}{f(j):4d}   0   0" for i, j in zip(*np.tril_indices(n))
+        ]
+    lines.append(f"{mol.energy_nuc():28.20E}   0   0   0   0")
+    path = tmp_path / "psi4.fcidump"
+    path.write_text("\n".join(lines) + "\n")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(ValueError, match="alpha_index"):
+            fcidump.read(path)
+        ham = fcidump.read(path, alpha_index=alpha_index)
+    assert ham.meta["fcidump_uhf_layout"] == "interleaved" and ham.norb == n
+    assert ham.nelec == (5, 4)
+    assert FCISolver().solve(ham).energy == pytest.approx(ref, abs=1e-10)
+
+
+_H = " &FCI NORB=2,NELEC={n},MS2={ms2},\n &END\n"
+_BODY = " 0.5 1 1 1 1\n 0.4 2 2 1 1\n-1.0 1 1 0 0\n 0.3 0 0 0 0\n"
+
+
+@pytest.mark.parametrize(
+    "text, match",
+    [
+        (_H.format(n=3, ms2=9) + _BODY, "inconsistent header"),
+        (_H.format(n=3, ms2=0) + _BODY, "odd NELEC=3"),  # CP2K 7.1-2022.x: MS2=0 always
+        (" &FCI NORB=2,NELEC=2,MS2=0,\n" + _BODY, "never closed"),
+        (_H.format(n=2, ms2=0) + _BODY + " 0.1 2 1 1\n", "malformed integral line"),
+        (_H.format(n=2, ms2=0) + " 0.5 1 1 1 1\n 0.4 2 2 1 1\n", "truncated"),
+        (" &FCI NELEC=2,\n &END\n" + _BODY, "no NORB/NELEC"),
+    ],
+    ids=["ms2-range", "odd-nelec-ms2-0", "unclosed", "short-line", "truncated", "no-norb"],
+)
+def test_broken_files_are_refused(tmp_path, text, match):
+    path = tmp_path / "bad.fcidump"
+    path.write_text(text)
+    with pytest.raises(ValueError, match=match):
+        fcidump.read(path)
+
+
+@pytest.mark.parametrize(
+    "nelec, legacy, match", [((1, 1), False, "hash mismatch"), ((2, 1), True, "3 electrons")]
+)
+def test_a_foreign_sidecar_is_refused(tmp_path, rng, nelec, legacy, match):
+    """By the FCIDUMP hash it records, or (a sidecar from before the hash) its electron count."""
+    from embasi_qiskit_integration import ipc
+
+    ipc.write_job(_random_ham(2, (1, 1), rng), tmp_path / "a")
+    ipc.write_job(_random_ham(2, nelec, rng), tmp_path / "b")
+    sidecar = tmp_path / "b" / "job.npz"
+    if legacy:
+        with np.load(sidecar) as npz:
+            old = {k: npz[k] for k in npz.files if k != "fcidump_sha256"}
+        np.savez(sidecar, **old)
+    sidecar.replace(tmp_path / "a" / "job.npz")
+    with pytest.raises(ValueError, match=match):
+        ipc.read_job(tmp_path / "a")
+
+
+def test_a_spin_dependent_job_is_exact_without_its_sidecar(tmp_path, rng):
+    """Jobs are written UHF=1, so losing job.npz cannot spin-average them."""
+    from embasi_qiskit_integration import ipc
+
+    ham = _random_ham(3, (2, 1), rng)
+    ham = ham.model_copy(
+        update={"h1a": ham.h1 + 0.1, "h1b": ham.h1 - 0.1, "h2_spin": (ham.h2,) * 3}
+    )
+    ipc.write_job(ham, tmp_path)
+    (tmp_path / "job.npz").unlink()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        back = ipc.read_job(tmp_path)
+    np.testing.assert_allclose(back.h1a, ham.h1a, atol=1e-14)
+    np.testing.assert_allclose(back.h1b, ham.h1b, atol=1e-14)

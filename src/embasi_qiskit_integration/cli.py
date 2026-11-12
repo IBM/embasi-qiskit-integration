@@ -236,6 +236,9 @@ class ImportFcidumpCommand(BaseSettings):
     # The FCIDUMP format has no unit field.  WEST/QDET writes Rydberg (pass `rydberg`);
     # CP2K, Molpro and PySCF write Hartree.
     energy_unit: Literal["hartree", "rydberg"] = "hartree"
+    # Interleaved UHF=T files only: which spin-orbital index is alpha (Psi4: odd,
+    # NECI/HANDE: even).  Needed only when the file's alpha and beta blocks differ.
+    uhf_alpha_index: Literal["odd", "even"] | None = None
 
     _exit_code: int = 0
 
@@ -252,8 +255,15 @@ class ImportFcidumpCommand(BaseSettings):
         if (self.nelec_alpha is None) != (self.nelec_beta is None):
             print("error: give --nelec_alpha and --nelec_beta together", file=sys.stderr)
             return 1
+        override = (
+            None
+            if self.nelec_alpha is None or self.nelec_beta is None
+            else (int(self.nelec_alpha), int(self.nelec_beta))
+        )
         try:
-            ham = fcidump.read(src)
+            # The override replaces the header's MS2 before it is checked, so a writer with
+            # an unknown MS2 convention can still be imported.
+            ham = fcidump.read(src, nelec=override, alpha_index=self.uhf_alpha_index)
         except Exception as exc:  # noqa: BLE001 - report any parse failure
             print(f"error: could not read {src}: {exc}", file=sys.stderr)
             return 1
@@ -275,16 +285,30 @@ class ImportFcidumpCommand(BaseSettings):
                 return 1
             updates["nelec"] = nelec
         ham = fcidump.to_hartree(ham.model_copy(update=updates), self.energy_unit)
-        from embasi_qiskit_integration.backends.cp2k import dropped_negative_integrals
+        from embasi_qiskit_integration.backends import cp2k
 
-        if dropped_negative_integrals(ham.h2):
+        if cp2k.dropped_negative_integrals(ham.h2):
             print(
                 "warning: this FCIDUMP has off-diagonal two-electron integrals but no "
-                "negative ones -- the signature of CP2K <= 7.1's signed EPS_INTEGRAL "
-                "screening, which drops every negative integral.  Regenerate it with a "
-                "negative EPS_INTEGRAL (backends.cp2k does) before trusting the energy.",
+                "negative ones, which a genuine set rarely shows -- likely CP2K <= 7.1's "
+                "signed EPS_INTEGRAL screening, which drops every negative integral.  "
+                "Regenerate it with a negative EPS_INTEGRAL (backends.cp2k does) before "
+                "trusting the energy.",
                 file=sys.stderr,
             )
+        elif cp2k.no_negative_couplings(ham.h2) and "fcidump_uhf_layout" not in ham.meta:
+            # Restricted files only: the count assumes CP2K's restricted layout.
+            written, expected = cp2k.missing_two_electron_integrals(src)
+            if written < expected:
+                # Too few couplings to judge by sign, but some integrals are absent: from
+                # CP2K <= 7.1 with a positive EPS_INTEGRAL that is the dropped-negative case.
+                print(
+                    f"note: {written} of {expected} unique two-electron integrals are "
+                    "present and none of the couplings is negative.  Fine from a writer "
+                    "that skips zeros; if this file is from CP2K <= 7.1 without a negative "
+                    "EPS_INTEGRAL, its negative integrals were dropped.",
+                    file=sys.stderr,
+                )
         import warnings
 
         with warnings.catch_warnings():

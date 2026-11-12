@@ -25,6 +25,7 @@ import numpy as np
 import pytest
 
 from embasi_qiskit_integration.backends import cp2k
+from embasi_qiskit_integration.contract import EmbeddedHamiltonian
 from embasi_qiskit_integration.hamiltonian import fcidump
 
 DATA = Path(__file__).parent / "data" / "cp2k"
@@ -83,23 +84,92 @@ def test_fci_on_the_corrected_fcidump():
     assert _fci(ham) == pytest.approx(-17.488435975, abs=1e-8)
 
 
-def test_cp2k71_signed_screen_is_detected_and_its_energy_is_wrong():
+def test_cp2k71_signed_screen_is_caught_by_completeness_and_its_energy_is_wrong():
     """The default 7.1 file shares every Coulomb/exchange integral -- so its determinant
-    still matches -- but has lost all negative couplings, and FCI is off by 0.17 Ha."""
+    still matches -- but has lost all negative couplings, and FCI is off by 0.17 Ha.
+    Only the integral count tells it apart: its two surviving couplings share one phase
+    parity, so a genuine file shows the same all-positive pattern for half the phases."""
     bad, good = fcidump.read(SIGNED), fcidump.read(GOOD)
-    assert cp2k.dropped_negative_integrals(bad.h2)
+    assert cp2k.missing_two_electron_integrals(SIGNED) == (34, 55)
+    assert cp2k.missing_two_electron_integrals(GOOD) == (55, 55)
+    assert not cp2k.dropped_negative_integrals(bad.h2)
     assert (bad.h2 < -1e-8).sum() == 0
     assert _det_energy(bad, 2) == pytest.approx(_det_energy(good, 2), abs=1e-7)
     assert abs(_fci(bad) - _fci(good)) > 0.1
 
 
+def _write_fake_cp2k(fcidump_src):
+    """A stand-in for CP2K that leaves ``fcidump_src`` and an energy line behind."""
+
+    def run(cmd, cwd, stdout, **kw):
+        shutil.copy(fcidump_src, Path(cwd) / "active.fcidump")
+        stdout.write(" ENERGY| Total FORCE_EVAL ( QS ) energy (a.u.):  -17.2\n")
+        return SimpleNamespace(returncode=0)
+
+    return run
+
+
+@pytest.mark.parametrize("src, ok", [(GOOD, True), (SIGNED, False)], ids=["complete", "screened"])
+def test_run_active_space_checks_the_fcidump_is_complete(tmp_path, monkeypatch, src, ok):
+    spec = cp2k.ActiveSpaceSpec(2, 2, 6)
+    if ok:
+        run = _run_offline(tmp_path, monkeypatch, spec, _write_fake_cp2k(src))
+        assert run.total_energy == pytest.approx(-17.2)
+    else:
+        with pytest.raises(RuntimeError, match="34 of the 55 unique"):
+            _run_offline(tmp_path, monkeypatch, spec, _write_fake_cp2k(src))
+
+
+def _water_631g_cas6():
+    from pyscf import ao2mo, gto, scf
+
+    mol = gto.M(atom="O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587", basis="6-31g", verbose=0)
+    mf = scf.RHF(mol).run()
+    c = mf.mo_coeff[:, mol.nelectron // 2 - 3 : mol.nelectron // 2 + 3]
+    return ao2mo.restore(1, ao2mo.kernel(mol, c), 6)
+
+
+def _phase_flips(h2):
+    import itertools
+
+    for signs in itertools.product([1, -1], repeat=h2.shape[0]):
+        s = np.asarray(signs)
+        yield np.einsum("pqrs,p,q,r,s->pqrs", h2, s, s, s, s)
+
+
+def test_dropped_negative_integrals_never_flags_a_genuine_set_whatever_the_phases():
+    """Orbital phases are arbitrary (they change with CP2K's thread count), so a correct
+    file must pass for every one of them; dropping the negatives must then be seen."""
+    for h2 in (fcidump.read(GOOD).h2, _water_631g_cas6()):
+        assert not any(cp2k.dropped_negative_integrals(g) for g in _phase_flips(h2))
+    assert all(
+        cp2k.dropped_negative_integrals(np.where(g < 0, 0.0, g))
+        for g in _phase_flips(_water_631g_cas6())
+    )
+
+
 def test_import_fcidump_warns_about_the_signed_screen(tmp_path, capsys):
     from embasi_qiskit_integration.cli import main
 
+    h2 = next(_phase_flips(_water_631g_cas6()))
+    for name, eri, warned in (("good", h2, False), ("bad", np.where(h2 < 0, 0.0, h2), True)):
+        ham = EmbeddedHamiltonian(h1=np.eye(6), h2=eri, e_core=0.0, nelec=(3, 3))
+        fcidump.write(ham, tmp_path / f"{name}.fcidump")
+        assert (
+            main(["import_fcidump", str(tmp_path / f"{name}.fcidump"), str(tmp_path / name)]) == 0
+        )
+        assert ("signed EPS_INTEGRAL" in capsys.readouterr().err) is warned
+
+
+def test_import_fcidump_notes_an_incomplete_all_positive_file(tmp_path, capsys):
+    """The real 7.1 file is too small to judge by sign (rank 1) but is incomplete:
+    import_fcidump says so as a note; the complete file gets nothing."""
+    from embasi_qiskit_integration.cli import main
+
     assert main(["import_fcidump", str(SIGNED), str(tmp_path / "bad")]) == 0
-    assert "signed EPS_INTEGRAL" in capsys.readouterr().err
+    assert "34 of 55 unique" in capsys.readouterr().err
     assert main(["import_fcidump", str(GOOD), str(tmp_path / "good")]) == 0
-    assert "signed EPS_INTEGRAL" not in capsys.readouterr().err
+    assert "unique" not in capsys.readouterr().err
 
 
 def test_dropped_negative_integrals_ignores_tiny_spaces_and_jk_only_tensors():

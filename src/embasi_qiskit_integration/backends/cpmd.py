@@ -17,7 +17,8 @@ Unlike QE it has **no native active-space route** either -- no ERIs, no FCIDUMP,
 WEST-like downfolding.  What it does have is Wannier localisation:
 
 * ``WANNIER_HAM`` (``&CPMD WANNIER DOS`` in a ``PROPERTIES`` run with ``&PROP
-  LOCALIZE``): the Kohn-Sham matrix over the *occupied* Wannier states, in eV;
+  LOCALIZE``): the Kohn-Sham matrix over the *occupied* Wannier states, in eV times
+  ``f/2`` (eV for a closed shell, half that for LSD; :func:`read_wannier_ham`);
 * ``WANNIER_CENTER`` / ``WC_SPREAD``: centres (bohr, wrapped into the box) and spreads;
 * ``IONS+CENTERS.xyz``: the atoms and the *unwrapped* centres, in Angstrom;
 * the KS eigenvalues printed by a ``KOHN-SHAM ENERGIES`` run.
@@ -93,17 +94,87 @@ def read_wannier_centers(path: str | Path, nstate: int) -> list[CenterBlock]:
     return blocks
 
 
-def read_wannier_ham(path: str | Path, nstate: int) -> np.ndarray:
+def read_occupations(output: str | Path) -> np.ndarray:
+    """Per-state occupations ``f`` from a CPMD output (its ``OCCUPATION`` header block).
+
+    Closed shell: one ``OCCUPATION`` list; LSD: ``ALPHA OCCUPATION`` then ``BETA
+    OCCUPATION``, returned concatenated (alpha first, CPMD's state order).
+    """
+    lines = Path(output).read_text().splitlines()
+    n = next(
+        (int(ln.split(":")[1]) for ln in lines if ln.strip().startswith("NUMBER OF STATES:")),
+        None,
+    )
+    if n is None:
+        raise ValueError(f"{output}: no 'NUMBER OF STATES:' line; is this CPMD output?")
+    occ: list[float] = []
+    for i, ln in enumerate(lines):
+        if ln.strip() not in ("OCCUPATION", "ALPHA OCCUPATION", "BETA OCCUPATION"):
+            continue
+        for row in lines[i + 1 :]:
+            try:
+                occ.extend(float(x) for x in row.split())
+            except ValueError:
+                break
+            if not row.split():
+                break
+        if len(occ) >= n:
+            break
+    if len(occ) != n:
+        raise ValueError(f"{output}: read {len(occ)} occupations for {n} states")
+    total = next(
+        (float(ln.split(":")[1]) for ln in lines if ln.strip().startswith("NUMBER OF ELECTRONS:")),
+        None,
+    )
+    if total is not None and abs(sum(occ) - total) > 1e-4:
+        # The F5.1 print hides a fraction near an integer (1.96 shows as 2.0); the
+        # electron count, printed to 5 decimals, does not.
+        raise ValueError(
+            f"{output}: the printed occupations sum to {sum(occ)} but NUMBER OF "
+            f"ELECTRONS is {total}; they are rounded, pass the exact occupations"
+        )
+    if any(f != round(f) for f in occ):
+        # Printed as F5.1: 2/3 shows as 0.7, which would scale WANNIER_HAM by 5% too much.
+        raise ValueError(
+            f"{output}: fractional occupations {occ} are printed to one decimal only; "
+            "pass the exact occupations to read_wannier_ham instead"
+        )
+    return np.asarray(occ)
+
+
+def read_wannier_ham(path: str | Path, nstate: int, occupations: Any) -> np.ndarray:
     """The last ``nstate x nstate`` Kohn-Sham matrix of ``WANNIER_HAM``, in Hartree.
 
-    CPMD writes it list-directed (rows may wrap across lines), in eV, and appends a
-    block per localisation; all numbers are read and the final block kept.
+    CPMD writes it list-directed (rows may wrap across lines) and appends a block per
+    localisation; all numbers are read and the final block kept.  Each entry is
+    ``-Ry <c0_i|c2_j>`` with the gradient ``c2_j`` scaled by the occupation ``f_j/2``,
+    i.e. ``f_j/2 * H_ij`` in eV: plain eV only for doubly occupied states.  The file
+    cannot tell an LSD run (``f = 1``, read as ``H/2`` yet still symmetric) from a closed
+    shell, so ``occupations`` (:func:`read_occupations`, or ``[2.0] * nstate``) are
+    required; all-2 occupations on a matrix with LSD's uncoupled alpha/beta blocks are
+    refused as a contradiction.
     """
     values = _floats(Path(path).read_text())
     size = nstate * nstate
     if not values or len(values) % size:
         raise ValueError(f"{path} has {len(values)} values, not a multiple of {nstate}^2")
-    h = np.array(values[-size:]).reshape(nstate, nstate) / _HARTREE_EV
+    raw = np.array(values[-size:]).reshape(nstate, nstate)
+    f = np.asarray(occupations, dtype=float).reshape(-1)
+    if f.shape != (nstate,) or np.any(f <= 0):
+        raise ValueError(f"need {nstate} positive occupations, got {f.tolist()}")
+    split = next(
+        (k for k in range(1, nstate) if not raw[:k, k:].any() and not raw[k:, :k].any()),
+        None,
+    )
+    if split is not None and np.all(f == 2.0):
+        # LSD stores alpha then beta with an exactly zero cross block (at any split, since
+        # an open shell has nsup != nsdown); read with f=2 it would come out as H/2.
+        raise ValueError(
+            f"{path}: states 1-{split} and {split + 1}-{nstate} do not couple at all, as "
+            "the alpha/beta blocks of an LSD run (f=1), yet the occupations say closed "
+            "shell; pass the run's occupations=read_occupations(<CPMD output>)"
+        )
+    h = raw / (0.5 * f[None, :] * _HARTREE_EV)
     asym = float(np.abs(h - h.T).max())
     if asym > 1e-6:
         raise ValueError(f"{path}: the Wannier Hamiltonian is not symmetric ({asym:.1e} Ha)")
@@ -165,13 +236,18 @@ class WannierSet:
         return np.linalg.eigvalsh(self.hamiltonian)
 
 
-def read_wannier(directory: str | Path) -> WannierSet:
+def read_wannier(
+    directory: str | Path, *, output: str | Path | None = None, occupations: Any = None
+) -> WannierSet:
     """Read and cross-check the Wannier output a CPMD ``LOCALIZE`` run left in ``directory``.
 
     The state count comes from ``WC_SPREAD``'s last header; ``WANNIER_CENTER``'s last
     block must carry the same spreads, and ``IONS+CENTERS.xyz`` the same number of
     centres -- three files CPMD writes separately, so a mismatch means a stale or
-    truncated file rather than a parse quirk.
+    truncated file rather than a parse quirk.  ``output`` is that run's CPMD output,
+    whose occupations scale ``WANNIER_HAM`` (required for LSD; see
+    :func:`read_wannier_ham`); ``occupations`` gives them directly (fractional ones,
+    or ``[2.0] * nstate`` for a closed shell).  One of the two is required.  For LSD the matrix is block diagonal, alpha first.
     """
     directory = Path(directory)
     spread = read_wc_spread(directory / "WC_SPREAD")[-1]
@@ -182,7 +258,13 @@ def read_wannier(directory: str | Path) -> WannierSet:
     xyz = read_ions_centers_xyz(directory / "IONS+CENTERS.xyz")
     if xyz.centers.shape != (n, 3):
         raise ValueError(f"{directory}: IONS+CENTERS.xyz has {len(xyz.centers)} centres, not {n}")
-    ham = read_wannier_ham(directory / "WANNIER_HAM", n)
+    if (output is None) == (occupations is None):
+        raise ValueError(
+            "give the run's CPMD output (output=) or its occupations (occupations=), "
+            "exactly one: WANNIER_HAM's scale depends on them (see read_wannier_ham)"
+        )
+    occ = occupations if output is None else read_occupations(output)
+    ham = read_wannier_ham(directory / "WANNIER_HAM", n, occ)
     return WannierSet(ham, spread.spreads, xyz.centers, xyz.symbols, xyz.positions)
 
 

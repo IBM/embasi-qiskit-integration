@@ -35,8 +35,9 @@ Input pitfalls this module handles (each one aborted a real CP2K run):
   depends on arbitrary orbital phases, so the FCIDUMP was silently wrong and its FCI
   energy even varied with the OpenMP thread count (water CAS(4e,4o): -17.3218 or
   -17.4807 Ha against the phase-invariant -17.4884 Ha).  :class:`ActiveSpaceSpec` writes
-  a negative ``EPS_INTEGRAL``, and :func:`dropped_negative_integrals` flags a file that
-  still shows the symptom;
+  a negative ``EPS_INTEGRAL``, which makes CP2K write every unique integral, and
+  :func:`run_active_space` checks that none is missing
+  (:func:`missing_two_electron_integrals`);
 * the ``&ACTIVE_SPACE`` keywords themselves changed: up to 2023.x ``INACTIVE_ELECTRONS``
   exists and, under UKS, ``ACTIVE_ORBITALS``/``INACTIVE_ELECTRONS`` are *per-spin lists*;
   from 2024.1 ``INACTIVE_ELECTRONS`` is gone (the inactive count is total minus active)
@@ -54,6 +55,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import warnings
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -375,14 +377,23 @@ def abort_message(output: str | Path) -> str | None:
     return None
 
 
-def dropped_negative_integrals(h2: Any, *, tol: float = 1e-6, min_couplings: int = 8) -> bool:
-    """True if ``h2`` looks like CP2K 7.1's signed screening threw its negative ERIs away.
+def _phase_rank(index_sets: list[tuple[int, int, int, int]]) -> int:
+    """GF(2) rank of the integrals' phase parities: orbital-phase flips can make
+    ``2^rank`` sign patterns of a fixed set, so all-positive by chance has odds ``2^-rank``."""
+    basis: list[int] = []
+    for idx in index_sets:
+        v = 0
+        for o in idx:
+            v ^= 1 << o
+        for b in basis:
+            v = min(v, v ^ b)
+        if v:
+            basis.append(v)
+    return len(basis)
 
-    Coulomb ``(pp|qq)`` and exchange ``(pq|pq)``-type integrals are never negative; every
-    other ``(pq|rs)`` takes the sign of arbitrary orbital phases, so a genuine set with
-    several such couplings essentially always contains negative ones.  ``min_couplings``
-    keeps tiny spaces, where all-positive can happen by chance, out of the alarm.
-    """
+
+def _couplings(h2: Any, tol: float) -> tuple[Any, Any]:
+    """``(h2, mask)`` of the canonical non-Coulomb/exchange integrals above ``tol``."""
     import numpy as np
 
     h2 = np.asarray(h2)
@@ -391,8 +402,63 @@ def dropped_negative_integrals(h2: Any, *, tol: float = 1e-6, min_couplings: int
     p, q, r, s = np.ogrid[:n, :n, :n, :n]
     coulomb = (p == q) & (r == s)
     exchange = ((p == r) & (q == s)) | ((p == s) & (q == r))
-    other = ~(coulomb | exchange) & (np.abs(h2) > tol)
-    return bool(other.sum() >= min_couplings and not (h2[other] < 0).any())
+    canonical = (p >= q) & (r >= s) & (p * (p + 1) // 2 + q >= r * (r + 1) // 2 + s)
+    return h2, ~(coulomb | exchange) & (np.abs(h2) > tol) & canonical
+
+
+def no_negative_couplings(h2: Any, *, tol: float = 1e-6) -> bool:
+    """Whether ``h2`` has non-Coulomb/exchange integrals and none of them is negative."""
+    h2, other = _couplings(h2, tol)
+    return bool(other.any() and not (h2[other] < 0).any())
+
+
+def dropped_negative_integrals(
+    h2: Any, *, tol: float = 1e-6, max_false_alarm: float = 0.125
+) -> bool:
+    """True if ``h2`` looks like CP2K 7.1's signed screening threw its negative ERIs away.
+
+    Coulomb ``(pp|qq)`` and exchange ``(pq|pq)``-type integrals are never negative; every
+    other ``(pq|rs)`` carries the sign ``s_p s_q s_r s_s`` of arbitrary orbital phases.  A
+    genuine set shows no negative one for at most ``2^-rank`` of the phase choices
+    (:func:`_phase_rank`), so the alarm needs that to be ``<= max_false_alarm``: one
+    distinct coupling, or several sharing one phase product, never fires.  A file alone
+    cannot be certain; :func:`run_active_space` checks completeness exactly instead.
+    """
+    import numpy as np
+
+    if not no_negative_couplings(h2, tol=tol):
+        return False
+    h2, other = _couplings(h2, tol)
+    rank = _phase_rank([tuple(i) for i in np.argwhere(other)])
+    return bool(2.0**-rank <= max_false_alarm)
+
+
+def missing_two_electron_integrals(path: str | Path) -> tuple[int, int]:
+    """``(written, expected)`` unique two-electron integrals of a CP2K FCIDUMP.
+
+    With a negative ``EPS_INTEGRAL`` CP2K writes every unique integral, zeros included, so
+    ``written < expected`` means a screen still dropped some -- phase-independent, unlike
+    :func:`dropped_negative_integrals`.  A ``UHF=1`` file counts its (aa|aa), (bb|bb) and
+    (aa|bb) blocks.
+    """
+    from embasi_qiskit_integration.hamiltonian import fcidump as _fcidump
+
+    path = Path(path)
+    header = _fcidump._read_header(path)
+    n = int(header["NORB"])
+    uhf = _fcidump._is_uhf(header)
+    seen: set[tuple] = set()
+    for _v, i, j, k, m in _fcidump._integral_lines(path):
+        if k == 0 and m == 0:
+            continue
+        bra, ket = (max(i, j), min(i, j)), (max(k, m), min(k, m))
+        same = (bra[0] > n) == (ket[0] > n)
+        if same and ket > bra:
+            bra, ket = ket, bra
+        seen.add((bra, ket))
+    npair = n * (n + 1) // 2
+    unique = npair * (npair + 1) // 2
+    return len(seen), (2 * unique + npair * npair) if uhf else unique
 
 
 @dataclass(frozen=True)
@@ -480,13 +546,22 @@ def run_active_space(
         raise RuntimeError(f"CP2K exited with status {proc.returncode}; see {out}")
     if not fcidump.is_file():
         raise RuntimeError(f"CP2K finished but wrote no FCIDUMP; see {out}")
-    from embasi_qiskit_integration.hamiltonian import fcidump as _fcidump
-
-    if dropped_negative_integrals(_fcidump.read(fcidump).h2):
-        raise RuntimeError(
-            f"{fcidump} holds off-diagonal two-electron integrals but no negative ones: "
-            "CP2K dropped them (signed EPS_INTEGRAL screening, CP2K <= 7.1).  This input "
-            "sets a negative EPS_INTEGRAL to prevent it; check the CP2K version."
+    if spec.eps_integral < 0:
+        written, expected = missing_two_electron_integrals(fcidump)
+        if written < expected:
+            raise RuntimeError(
+                f"{fcidump} holds {written} of the {expected} unique two-electron integrals "
+                "although the input set a negative EPS_INTEGRAL, which keeps them all: a "
+                "screen still dropped some (CP2K <= 7.1 drops every negative one); check "
+                "the CP2K version and the &ERI section of the output."
+            )
+    elif layout.version is None or layout.version < (8, 0):
+        warnings.warn(
+            f"EPS_INTEGRAL={spec.eps_integral:g} on CP2K "
+            f"{'unknown' if layout.version is None else '%d.%d' % layout.version}: its signed "
+            "screen drops every negative two-electron integral, so the FCIDUMP is wrong; "
+            "keep the default negative EPS_INTEGRAL.",
+            stacklevel=2,
         )
     return ActiveSpaceRun(fcidump=fcidump, output=out, total_energy=read_total_energy(out))
 

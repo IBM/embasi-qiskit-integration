@@ -62,7 +62,8 @@ def write_job(ham: EmbeddedHamiltonian, job_dir: str | Path) -> Path:
     job_dir = Path(job_dir)
     job_dir.mkdir(parents=True, exist_ok=True)
     path = job_dir / f"{JOB_STEM}.fcidump"
-    fcidump.write(ham, path)
+    # A spin-dependent job is written UHF=1, exact even if its sidecar goes missing.
+    fcidump.write(ham, path, uhf=ham.is_spin_dependent)
     return path
 
 
