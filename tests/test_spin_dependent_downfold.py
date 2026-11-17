@@ -78,25 +78,33 @@ def test_spin_dependent_solve_preserves_the_sector_and_rdm_identities():
     assert float(np.trace(res.rdm1)) == pytest.approx(n, abs=1e-9)
 
 
-def test_fcidump_warns_that_it_cannot_carry_the_pair(tmp_path):
-    """The format has one integral block; the sector survives, the pair does not."""
+def test_fcidump_keeps_the_pair_in_the_sidecar(tmp_path):
+    """A restricted FCIDUMP holds one integral block, so it gets the spin-averaged h1 --
+    but the .npz sidecar carries the pair, so read() restores it exactly.  (This test
+    used to pin the pair being *lost*, which is what the sidecar now fixes.)"""
     from embasi_qiskit_integration.hamiltonian import fcidump
 
     ham = _ham(spin_dependent=True)
-    with pytest.warns(UserWarning, match="FCIDUMP format cannot represent"):
+    with pytest.warns(UserWarning, match="restricted FCIDUMP cannot represent"):
         fcidump.write(ham, tmp_path / "h.fcidump")
 
     back = fcidump.read(tmp_path / "h.fcidump")
-    assert back.nelec == NELEC  # sector preserved
-    assert not back.is_spin_dependent  # but the pair is gone, as warned
+    assert back.nelec == NELEC
+    assert back.is_spin_dependent
+    np.testing.assert_allclose(back.h1a, ham.h1a, atol=1e-12)
+    np.testing.assert_allclose(back.h1b, ham.h1b, atol=1e-12)
     np.testing.assert_allclose(back.h1, ham.h1, atol=1e-10)
+
+    # Without the sidecar the FCIDUMP alone is restricted: the pair really is absent there.
+    (tmp_path / "h.npz").unlink()
+    assert not fcidump.read(tmp_path / "h.fcidump").is_spin_dependent
 
 
 def test_fcidump_does_not_warn_without_a_pair(tmp_path, recwarn):
     from embasi_qiskit_integration.hamiltonian import fcidump
 
     fcidump.write(_ham(spin_dependent=False), tmp_path / "h.fcidump")
-    assert not [w for w in recwarn if "FCIDUMP format cannot represent" in str(w.message)]
+    assert not [w for w in recwarn if "cannot represent" in str(w.message)]
 
 
 # --------------------------------------------------------------------------- #

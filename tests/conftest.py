@@ -10,7 +10,10 @@
 
 from __future__ import annotations
 
+import functools
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -79,6 +82,14 @@ def _statevector_aer_in_tests(request, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_cr, "_DEFAULT_AER_METHOD", TEST_AER_METHOD)
 
 
+@functools.cache
+def mpi_usable() -> bool:
+    """Whether ``mpi4py`` loads an MPI library, probed in a subprocess: a failed load in
+    this process leaves mpi4py's import hook raising on later imports (pyomo's, too)."""
+    probe = subprocess.run([sys.executable, "-c", "import mpi4py.MPI"], capture_output=True)
+    return probe.returncode == 0
+
+
 def require_module(name: str, reason: str) -> object:
     """``pytest.importorskip`` that also skips when the module imports but is unusable.
 
@@ -89,6 +100,8 @@ def require_module(name: str, reason: str) -> object:
     """
     import importlib
 
+    if name.split(".")[0] == "embasi" and not mpi_usable():  # EmbASI imports mpi4py
+        pytest.skip(f"{reason} (mpi4py cannot load an MPI library)")
     try:
         return importlib.import_module(name)
     except ImportError:

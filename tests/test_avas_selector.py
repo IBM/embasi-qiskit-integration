@@ -18,6 +18,7 @@ import pyscf
 import pytest
 from pyscf.mcscf import avas
 
+from embasi_qiskit_integration.backends.pyscf import PySCFBasis
 from embasi_qiskit_integration.embedding import build_selector
 from embasi_qiskit_integration.projection_embedding_adapter import ProjectionEmbeddingAdapter
 from embasi_qiskit_integration.selectors import avas_ao_projector
@@ -44,7 +45,7 @@ def _stub(mf, a_spin=0):
 
     adapter = object.__new__(_Stub)
     adapter.p = SimpleNamespace(A_spin=a_spin)
-    adapter.ints = SimpleNamespace(mol=mol)
+    adapter.ints = PySCFBasis(mol)
     return adapter, overlap
 
 
@@ -285,7 +286,7 @@ def _spin_stub(mol, focks, c_occ):
         mo_coeffs_A_LL={(0, 0): c_occ[0], (1, 0): c_occ[1]},
         mo_coeffs_B_LL={(0, 0): env, (1, 0): env},
     )
-    ad.ints = SimpleNamespace(mol=mol)
+    ad.ints = PySCFBasis(mol)
     return ad
 
 
