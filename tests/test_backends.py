@@ -364,8 +364,8 @@ def test_refused_qm_code_reports_its_reason_before_embasi_is_imported(monkeypatc
 
     monkeypatch.setattr(sys, "argv", ["prog"])
     monkeypatch.setattr(builtins, "__import__", no_embasi)
-    with pytest.raises(NotImplementedError, match="DFT-in-DFT only"):
-        build_adapter(EmbeddingWorkflow(_cli_parse_args=False, qm_code="siesta"), parallel=False)
+    with pytest.raises(NotImplementedError, match="plane-wave code"):
+        build_adapter(EmbeddingWorkflow(_cli_parse_args=False, qm_code="espresso"), parallel=False)
 
 
 def test_make_backend_refuses_an_unknown_code():
@@ -388,11 +388,11 @@ def test_pyscf_only_settings_are_declared_and_refused_for_another_backend():
         "df_auxbasis",
     }
     check_backend_settings("pyscf", SimpleNamespace(scf_newton=True, density_fit=True))
-    check_backend_settings("siesta", SimpleNamespace(scf_newton=False, init_guess=None))
-    with pytest.raises(ValueError, match="--scf_newton is a pyscf option.*--qm_code siesta"):
-        check_backend_settings("siesta", SimpleNamespace(scf_newton=True))
+    check_backend_settings("cp2k", SimpleNamespace(scf_newton=False, init_guess=None))
+    with pytest.raises(ValueError, match="--scf_newton is a pyscf option.*--qm_code cp2k"):
+        check_backend_settings("cp2k", SimpleNamespace(scf_newton=True))
     with pytest.raises(ValueError, match="--df_auxbasis is a pyscf option"):
-        check_backend_settings("siesta", SimpleNamespace(df_auxbasis="cc-pvdz-ri"))
+        check_backend_settings("cp2k", SimpleNamespace(df_auxbasis="cc-pvdz-ri"))
 
 
 def test_make_backend_refuses_integrals_without_capabilities(monkeypatch):

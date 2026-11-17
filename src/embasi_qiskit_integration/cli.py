@@ -285,6 +285,30 @@ class ImportFcidumpCommand(BaseSettings):
                 return 1
             updates["nelec"] = nelec
         ham = fcidump.to_hartree(ham.model_copy(update=updates), self.energy_unit)
+        from embasi_qiskit_integration.backends import cp2k
+
+        if cp2k.dropped_negative_integrals(ham.h2):
+            print(
+                "warning: this FCIDUMP has off-diagonal two-electron integrals but no "
+                "negative ones, which a genuine set rarely shows -- likely CP2K <= 7.1's "
+                "signed EPS_INTEGRAL screening, which drops every negative integral.  "
+                "Regenerate it with a negative EPS_INTEGRAL (backends.cp2k does) before "
+                "trusting the energy.",
+                file=sys.stderr,
+            )
+        elif cp2k.no_negative_couplings(ham.h2) and "fcidump_uhf_layout" not in ham.meta:
+            # Restricted files only: the count assumes CP2K's restricted layout.
+            written, expected = cp2k.missing_two_electron_integrals(src)
+            if written < expected:
+                # Too few couplings to judge by sign, but some integrals are absent: from
+                # CP2K <= 7.1 with a positive EPS_INTEGRAL that is the dropped-negative case.
+                print(
+                    f"note: {written} of {expected} unique two-electron integrals are "
+                    "present and none of the couplings is negative.  Fine from a writer "
+                    "that skips zeros; if this file is from CP2K <= 7.1 without a negative "
+                    "EPS_INTEGRAL, its negative integrals were dropped.",
+                    file=sys.stderr,
+                )
         import warnings
 
         with warnings.catch_warnings():
