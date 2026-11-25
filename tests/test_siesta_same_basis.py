@@ -27,16 +27,18 @@ import numpy as np
 import pytest
 
 # PySCF (and its h5py) must load before libsiesta/NetCDF, as in the other real
-# SIESTA tests; the reference integrals are computed with PySCF.
-if os.environ.get("SIESTA_QCOMP_REAL") == "1":
+# SIESTA tests; the reference integrals are computed with PySCF.  Do not import
+# EmbASI/mpi4py at collection time on CI, where no MPI runtime is installed.
+_OPT_IN = os.environ.get("SIESTA_QCOMP_REAL") == "1" and not bool(os.environ.get("CI"))
+if _OPT_IN:
     pytest.importorskip("pyscf.gto")
+    from embasi_qiskit_integration.backends._embasi_compat import install_siesta_adapter  # noqa: E402
 
-from embasi_qiskit_integration.backends import siesta as S
-from embasi_qiskit_integration.backends._embasi_compat import install_siesta_adapter
-from embasi_qiskit_integration.backends.callback import LayerEvaluator
-from embasi_qiskit_integration.backends._siesta_qcomp import SiestaEriProvider
+from embasi_qiskit_integration.backends import siesta as S  # noqa: E402
+from embasi_qiskit_integration.backends.callback import LayerEvaluator  # noqa: E402
+from embasi_qiskit_integration.backends._siesta_qcomp import SiestaEriProvider  # noqa: E402
 
-from _qcomp_basis import ao_table, eri_value, parse_orbgauss, self_eri
+from _qcomp_basis import ao_table, eri_value, parse_orbgauss, self_eri  # noqa: E402
 
 pytestmark = [
     pytest.mark.siesta_real,

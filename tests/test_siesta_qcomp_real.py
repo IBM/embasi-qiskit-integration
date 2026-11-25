@@ -23,15 +23,20 @@ import numpy as np
 import pytest
 
 # Load h5py via PySCF before libsiesta, but only when this opt-in module can run.
-pyscf_fci = pytest.importorskip("pyscf.fci") if os.environ.get("SIESTA_QCOMP_REAL") == "1" else None
+_OPT_IN = os.environ.get("SIESTA_QCOMP_REAL") == "1" and not bool(os.environ.get("CI"))
+if _OPT_IN:
+    pyscf_fci = pytest.importorskip("pyscf.fci")
+    from embasi.embedding import ProjectionEmbedding  # noqa: E402
+    from embasi_qiskit_integration.backends._embasi_compat import (  # noqa: E402
+        install_siesta_adapter,
+        prepare_projection_embedding,
+    )
+else:
+    pyscf_fci = None
+
 from ase.build import molecule  # noqa: E402
-from embasi.embedding import ProjectionEmbedding  # noqa: E402
 
 from embasi_qiskit_integration.backends import siesta as S  # noqa: E402
-from embasi_qiskit_integration.backends._embasi_compat import (  # noqa: E402
-    install_siesta_adapter,
-    prepare_projection_embedding,
-)
 from embasi_qiskit_integration.backends.base import (  # noqa: E402
     CAP_ARBITRARY_DM_VEFF,
     CAP_ERI,

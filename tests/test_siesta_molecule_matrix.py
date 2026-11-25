@@ -118,12 +118,12 @@ import pytest
 _OPT_IN = os.environ.get("SIESTA_QCOMP_REAL") == "1" and not bool(os.environ.get("CI"))
 if _OPT_IN:
     pytest.importorskip("pyscf.fci")
+    from embasi_qiskit_integration.backends._embasi_compat import (  # noqa: E402
+        install_siesta_adapter,
+        prepare_projection_embedding,
+    )
 
 from embasi_qiskit_integration.backends import siesta as S  # noqa: E402
-from embasi_qiskit_integration.backends._embasi_compat import (  # noqa: E402
-    install_siesta_adapter,
-    prepare_projection_embedding,
-)
 from embasi_qiskit_integration.backends.base import (  # noqa: E402
     CAP_ARBITRARY_DM_VEFF,
     CAP_ERI,
