@@ -467,6 +467,12 @@ def projection_energy_from_state(
     )
     e_high_a -= footing_shift
 
+    # The live path subtracts the backend's total-energy reference (SIESTA's
+    # same-density offset); carry it in the snapshot too, or a two-process
+    # assembly silently drops a ~1 Ha pseudopotential reference.
+    if "high_level_reference" in state:
+        e_high_a -= float(_array("high_level_reference"))
+
     return ProjectionEnergy(
         e_low_total=float(_array("e_low_total")),
         e_low_A=float(_array("e_low_a")),
@@ -1051,6 +1057,12 @@ class ProjectionEmbeddingAdapter:
         state["enuc_full"] = np.asarray(float(self.ints.energy_nuc()))
         state["e_low_total"] = np.asarray(e_low_ab)
         state["e_low_a"] = np.asarray(e_low_a)
+        # SIESTA's same-density reference is part of the energy, not an array in
+        # the live embedding object; carry it so an out-of-process assembly
+        # subtracts the same offset as projection_energy().
+        reference = getattr(self.ints, "high_level_reference_energy", None)
+        if callable(reference):
+            state["high_level_reference"] = np.asarray(float(reference(self.p.A_LL)))
         # Per-spin state, when there is any.  Without this an out-of-process open-shell
         # loop silently degrades to the spin-summed arrays -- it would restore, assemble a
         # plausible restricted Fock and report a wrong energy with nothing to flag it.
@@ -3564,6 +3576,15 @@ class ProjectionEmbeddingAdapter:
             + np.einsum("ij,ji->", dm_hl, self.ints.hcore() - hcore_a)
         )
         e_high_a -= footing_shift
+
+        # Put a bare-Hamiltonian WF total on the low-level code's total-energy
+        # reference.  SIESTA's DFT total carries the pseudopotential and
+        # double-counting terms; the external FCI does not.  The backend
+        # subtracts the full same-density offset, not just ``Ena``.  PySCF
+        # (and the test stand-ins) return zero here.
+        reference = getattr(self.ints, "high_level_reference_energy", None)
+        if callable(reference):
+            e_high_a -= float(reference(self.p.A_LL))
 
         e_low_ab, e_low_a = self._low_level_energies()
         return ProjectionEnergy(

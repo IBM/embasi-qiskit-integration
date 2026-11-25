@@ -66,6 +66,139 @@ def _solve_sci_batch_from_reference(
     return results
 
 
+#: ``sci-solvers`` solvers whose constructor accepts ``compute_rdm2=True``.
+#: Torch-SCI needs it for the spin-summed RDMs SQD consumes; SBD gates its RDMs
+#: the same way; the general-algebra family builds the 2-RDM only on request.
+#: PySCF's constructor uses ``with_rdm2`` (and defaults it on), while
+#: truncated-Davidson defaults the callable's ``compute_rdm2`` to True.
+_RDM2_KWARG = {
+    "torch_sci": "compute_rdm2",
+    "sbd": "compute_rdm2",
+    "arpack": "compute_rdm2",
+    "davidson": "compute_rdm2",
+    "lobpcg": "compute_rdm2",
+    "primme": "compute_rdm2",
+    "slepc": "compute_rdm2",
+    "evsl": "compute_rdm2",
+    "pyscf_davidson": "compute_rdm2",
+}
+
+
+def resolve_sci_solver(name: str, spin_sq: float | None, torch_sci_kwargs: dict | None):
+    """Return the ``sci_solver`` callable for qiskit-addon-sqd.
+
+    ``"qiskit"`` wraps the package's PySCF selected-CI batch solver with the
+    aufbau starting vector.  Every other name is dispatched through
+    IBM/sci-solvers' :func:`~sci_solvers.energy_solvers.factory.create_solver`
+    (``torch_sci`` is the default in :class:`SQDSolver`); importing the package
+    is deferred so the optional ``sci-solvers`` extra is only required when
+    selected.  ``torch_sci_kwargs`` is forwarded only to ``torch_sci`` --
+    the other solvers have different constructor options.
+
+    ``symmetrize_spin=False`` is deliberate: qiskit-addon-sqd already passes
+    separate alpha/beta CI-string batches, and the open-shell SQD path must not
+    merge them.  A solver that needs closed-shell spin symmetry can still be
+    configured through its own options.
+    """
+    if name == "qiskit":
+        import functools
+
+        return functools.partial(_solve_sci_batch_from_reference, spin_sq=spin_sq)
+    try:
+        from sci_solvers.energy_solvers.factory import AVAILABLE_SOLVERS, create_solver
+    except ImportError as exc:  # pragma: no cover - optional extra
+        raise ImportError(
+            f"sci_solver={name!r} needs the optional `sci-solvers` extra: "
+            "uv sync --extra sci-solvers"
+        ) from exc
+    if name not in AVAILABLE_SOLVERS:
+        raise ValueError(
+            f"unknown sci_solver {name!r}; available: 'qiskit', {', '.join(AVAILABLE_SOLVERS)}"
+        )
+
+    if name == "torch_sci":
+        kwargs = dict(torch_sci_kwargs or {})
+        import torch
+
+        # The engine defaults to CUDA.  Auto-detect instead: CUDA, then Apple
+        # MPS, then CPU.  An explicit device/devices in torch_sci_kwargs wins.
+        # MPS has no float64, so select float32 there unless the caller chose a
+        # dtype; on CUDA/CPU the engine's float64 default is unchanged.
+        device = kwargs.get("device")
+        if device is None and not kwargs.get("devices"):
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif getattr(torch.backends, "mps", None) is not None and (
+                torch.backends.mps.is_available()
+            ):
+                device = "mps"
+            else:
+                device = "cpu"
+            kwargs["device"] = device
+        if str(device).startswith("mps"):
+            kwargs.setdefault("dtype", torch.float32)
+            # torch-sci rejects a tighter residual on MPS (there is no float64);
+            # 1e-5 is its own documented floor and avoids a full iteration budget.
+            kwargs.setdefault("davidson_tolerance", 1e-5)
+        else:
+            # The engine's 1e-4 Davidson residual leaves ~1e-6 errors in the
+            # spin-resolved RDMs, too loose for the embedding feedback.
+            kwargs.setdefault("davidson_tolerance", 1e-8)
+        # The factory's qiskit-compatible default differs from the engine's;
+        # make the choice explicit (and silence its warning).
+        kwargs.setdefault("apply_ab_projection", False)
+        # macOS: if qiskit-aer was imported before the package-level OpenMP
+        # preload, its bundled libomp is already loaded and torch must stay
+        # single-threaded to avoid the duplicate-runtime segfault.  Normally
+        # preload_torch_openmp() ran first and this is a no-op.
+        from embasi_qiskit_integration._openmp import preload_torch_openmp
+
+        if not preload_torch_openmp():
+            torch.set_num_threads(1)
+    else:
+        kwargs = {}
+    kwargs.setdefault("symmetrize_spin", False)
+    rdm2_kwarg = _RDM2_KWARG.get(name)
+    if rdm2_kwarg is not None:
+        kwargs.setdefault(rdm2_kwarg, True)
+
+    # The unified interface exposes the qiskit-addon-sqd callable and returns
+    # SCIResult objects (torch's raw __call__ returns EigenStates instead).
+    try:
+        solver = create_solver(name, **kwargs)
+    except ValueError as exc:
+        raise ValueError(
+            f"unknown sci_solver {name!r}; available: 'qiskit', {', '.join(AVAILABLE_SOLVERS)}"
+        ) from exc
+    return solver.sci_solver_callable
+
+
+def _normalise_rdm1(rdm1: np.ndarray, nelec: float) -> np.ndarray:
+    """Symmetrise ``rdm1`` and remove float32 particle-number drift.
+
+    Rewriting the trace is only a numerical clean-up: a deviation larger than
+    ``1e-4`` means the solve itself is wrong, so leave it for the workflow's
+    particle-number check to report instead of hiding it.
+    """
+    rdm1 = 0.5 * (np.asarray(rdm1, dtype=float) + np.asarray(rdm1, dtype=float).T)
+    trace = float(np.trace(rdm1))
+    if trace > 0.0 and abs(trace - nelec) < 1e-4:
+        rdm1 = rdm1 * (nelec / trace)
+    return rdm1
+
+
+def _normalise_rdm1_pair(pair: np.ndarray, nelec: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    """Symmetrise and trace-normalise each spin block of an RDM pair."""
+    out = []
+    for rdm, target in zip(pair, nelec, strict=True):
+        rdm = 0.5 * (np.asarray(rdm, dtype=float) + np.asarray(rdm, dtype=float).T)
+        trace = float(np.trace(rdm))
+        if trace > 0.0 and abs(trace - target) < 1e-4:
+            rdm = rdm * (float(target) / trace)
+        out.append(rdm)
+    return out[0], out[1]
+
+
 def run_sqd(
     ham: EmbeddedHamiltonian,
     counts: dict[str, int],
@@ -78,6 +211,8 @@ def run_sqd(
     initial_occupancies: tuple[np.ndarray, np.ndarray] | None = None,
     include_configurations=None,
     seed: int | None = None,
+    sci_solver: str = "qiskit",
+    torch_sci_kwargs: dict | None = None,
 ) -> SolverResult:
     """Run SQD on measurement ``counts`` for the active-space ``ham``.
 
@@ -112,6 +247,10 @@ def run_sqd(
         include_configurations: configurations to force into every subspace (e.g. the
             Hartree-Fock determinant), as the addon's ``include_configurations``.
         seed: RNG seed (int) for the SQD sampling — deterministic when set.
+        sci_solver: ``"qiskit"`` (default here) for the aufbau-starting PySCF
+            selected-CI path, ``"torch_sci"`` for IBM/sci-solvers, or any other
+            name from ``sci_solvers.energy_solvers.factory.AVAILABLE_SOLVERS``.
+        torch_sci_kwargs: Constructor options forwarded to ``torch_sci`` only.
 
     Returns:
         :class:`SolverResult` with total energy, spin-summed ``rdm1``/``rdm2``,
@@ -151,10 +290,9 @@ def run_sqd(
 
     rng = np.random.default_rng(seed) if seed is not None else None
 
-    import functools
-
-    # Always our own batch solver, for its starting vector (see its docstring).
-    sci_solver = functools.partial(_solve_sci_batch_from_reference, spin_sq=spin_sq)
+    # Subspace diagonalizer.  The default keeps our aufbau-starting PySCF
+    # selected-CI wrapper; "torch_sci" uses IBM/sci-solvers' TorchSCISolver.
+    solver_callable = resolve_sci_solver(sci_solver, spin_sq, torch_sci_kwargs)
 
     extra: dict = {}
     if initial_occupancies is not None:
@@ -191,7 +329,7 @@ def run_sqd(
         num_batches=num_batches,
         max_iterations=max_iterations,
         symmetrize_spin=symmetrize_spin,
-        sci_solver=sci_solver,
+        sci_solver=solver_callable,
         callback=_callback,
         seed=rng,
         **extra,
@@ -204,18 +342,39 @@ def run_sqd(
         spin_square = None
 
     energy = float(result.energy) + ham.e_core
-    rdm1 = np.asarray(result.rdm1)
-    rdm2 = np.asarray(result.rdm2) if result.rdm2 is not None else None
+    rdm1 = np.asarray(result.rdm1, dtype=float)
+    rdm2 = np.asarray(result.rdm2, dtype=float) if result.rdm2 is not None else None
 
     rdm1a: np.ndarray | None = None
     rdm1b: np.ndarray | None = None
     try:
-        pair = np.asarray(result.sci_state.rdm(rank=1, spin_summed=False))
-    except Exception:  # pragma: no cover - older addon without the spin-resolved rdm
+        # qiskit-addon-sqd's make_rdm1s operates in float64; upcast a float32
+        # MPS amplitude array before building the RDMs.
+        state = result.sci_state
+        amplitudes = np.asarray(state.amplitudes)
+        if amplitudes.dtype != np.float64:
+            from qiskit_addon_sqd.fermion import SCIState
+
+            state = SCIState(
+                amplitudes=amplitudes.astype(np.float64),
+                ci_strs_a=state.ci_strs_a,
+                ci_strs_b=state.ci_strs_b,
+                norb=state.norb,
+                nelec=state.nelec,
+            )
+        pair = np.asarray(state.rdm(rank=1, spin_summed=False), dtype=float)
+    except Exception:  # pragma: no cover - state without a spin-resolved 1-RDM
         pair = None
     if pair is not None and pair.shape == (2, norb, norb):
-        if np.allclose(pair[0] + pair[1], rdm1, atol=1e-8):
-            rdm1a, rdm1b = pair[0], pair[1]
+        # The pair and the spin-summed RDM are built from the same SCI state;
+        # a float32 solver (MPS has no float64) leaves them agreeing only to
+        # float32 precision.  Make the spin-resolved pair authoritative:
+        # qiskit's RDM builder runs in float64, so it is the better-conditioned
+        # source once normalised.
+        rdm1a, rdm1b = _normalise_rdm1_pair(pair, ham.nelec)
+        rdm1 = rdm1a + rdm1b
+    if rdm1a is None:
+        rdm1 = _normalise_rdm1(rdm1, sum(ham.nelec))
 
     # Extract SQD subspace dimension: the actual number of configurations diagonalized.
     # Per qiskit-addon-sqd's docstring, "the full dimension of the SCI subspace is the
@@ -237,6 +396,13 @@ def run_sqd(
 
     diagnostics = {
         "solver": "qiskit-addon-sqd",
+        "sci_solver": (
+            "torch-sci-solver"
+            if sci_solver == "torch_sci"
+            else "qiskit-solve-sci"
+            if sci_solver == "qiskit"
+            else f"sci-solvers:{sci_solver}"
+        ),
         "iteration_energies": iteration_totals,
         "n_iterations": len(iteration_totals),
         "n_distinct_bitstrings": len(counts),

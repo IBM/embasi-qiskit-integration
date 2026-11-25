@@ -82,6 +82,13 @@ class LayerEvaluator:
         # re-run as neutral -- and for an odd charge PySCF refuses the Mole outright
         # (electron count and spin no longer have the same parity).
         self._layer.input_total_charge = float(charge)
+        # TODO(embasi-siesta-shim): delete this call with backends/_embasi_compat.py
+        # once EmbASI sets the non-SCF correction state itself.  Non-SCF-corrected
+        # codes (SIESTA, FHI-aims) need the fragment electron count and
+        # basis_info EmbASI only sets inside ProjectionEmbedding.
+        from embasi_qiskit_integration.backends._embasi_compat import prime_layer
+
+        prime_layer(self._layer)
 
     def _wrap(self, dm: DensityArg) -> Any:
         from embasi.ks_array import SpinKpointArray
@@ -159,11 +166,24 @@ class CallbackIntegrals:
         cheap_evaluations: declare ``arbitrary_dm_veff`` (evaluations are cheap enough to
             sit inside an SCF loop -- true for an in-process code, not for a file-driven
             one).
+        arbitrary_dm_veff: override the ``arbitrary_dm_veff`` declaration independently
+            of cost.  A SIESTA evaluation can evaluate ``veff`` at an arbitrary density
+            (one ASI run), which the WF downfold needs even though each run is expensive.
+            Defaults to ``cheap_evaluations``.
         scf_status: ``layer -> dict | None`` for EmbASI layers (``None``: no flag).
         hl_status: ``() -> dict`` for the high-level mean field.
         layer_footing: ``layer -> (hcore, E_nuc)`` for an EmbASI layer; ``None`` uses
             this backend's own supersystem ``hcore``/``E_nuc`` (right since EmbASI's
             ``ghosts=0``: every layer integrates on the supersystem frame).
+        nuclear_energy: ``() -> E_nuc`` when the code does not expose the bare ion-ion
+            repulsion through a zero-density energy.  SIESTA's ASI energy is an SCF
+            total, not ``E_nuc``; the backend computes it from the pseudopotential
+            valence charges instead.  ``None`` uses the zero-density energy (PySCF).
+        high_level_reference: ``layer -> energy`` added to the high-level WF total
+            so it lands on the low-level code's total-energy reference.  SIESTA's
+            bare valence FCI lacks the pseudopotential/double-counting reference
+            that its DFT total contains; the backend supplies the full
+            ``E_bare(D_A) - E_low(A)`` offset.  ``None`` adds zero (PySCF).
     """
 
     def __init__(
@@ -179,9 +199,12 @@ class CallbackIntegrals:
         ll_spin_resolved: bool = False,
         eri_provider: EriProvider | None = None,
         cheap_evaluations: bool = False,
+        arbitrary_dm_veff: bool | None = None,
         scf_status: Callable[[Any], dict[str, Any] | None] | None = None,
         hl_status: Callable[[], dict[str, Any]] | None = None,
         layer_footing: Callable[[Any], tuple[np.ndarray, float]] | None = None,
+        nuclear_energy: Callable[[], float] | None = None,
+        high_level_reference: Callable[[Any], float] | None = None,
     ):
         self._eval_ll = eval_ll
         self._eval_hl = eval_hl
@@ -197,20 +220,29 @@ class CallbackIntegrals:
         self._ll_spin_resolved = bool(ll_spin_resolved)
         self._eri = eri_provider
         self._cheap = bool(cheap_evaluations)
+        self._arbitrary_dm_veff = (
+            self._cheap if arbitrary_dm_veff is None else bool(arbitrary_dm_veff)
+        )
         self._scf_status = scf_status
         self._hl_status = hl_status
         self._layer_footing = layer_footing
+        self._nuclear_energy = nuclear_energy
+        self._high_level_reference = high_level_reference
         self._zero: dict[str, Evaluation] = {}
 
     # ---------------- capabilities ---------------- #
     @property
     def capabilities(self) -> frozenset[str]:
         caps = {CAP_HCORE, CAP_ENERGY_ELEC}
-        if self._eval_hf is not None:
+        # Exact exchange comes either from a UHF evaluator or from the AO ERIs
+        # (K[dm] is a direct contraction; no separate HF mean field needed).
+        if self._eval_hf is not None or (
+            self._eri is not None and callable(getattr(self._eri, "jk", None))
+        ):
             caps.add(CAP_EXACT_EXCHANGE)
         if self._eri is not None:
             caps.add(CAP_ERI)
-        if self._cheap:
+        if self._arbitrary_dm_veff:
             caps.add(CAP_ARBITRARY_DM_VEFF)
         return frozenset(caps)
 
@@ -277,6 +309,8 @@ class CallbackIntegrals:
         return h0[0]
 
     def energy_nuc(self) -> float:
+        if self._nuclear_energy is not None:
+            return float(self._nuclear_energy())
         return self._at_zero("ll").energy
 
     def energy_elec_ll(self, dm: np.ndarray) -> float:
@@ -315,19 +349,34 @@ class CallbackIntegrals:
             raise ValueError("the HF evaluator must be unrestricted (two spin channels)")
         return h[0] - h0[0], h[1] - h0[1]
 
+    def _eri_jk(self, dm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """``(J[dm], K[dm])`` from the AO ERI provider, when it supports it."""
+        if self._eri is None or not callable(getattr(self._eri, "jk", None)):
+            raise MissingCapabilityError(
+                "this backend's QM code has no exact exchange (no UHF evaluator and "
+                "no ERI-based J/K)"
+            )
+        return self._eri.jk(np.asarray(dm))
+
     def get_jk(self, dm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """``(J[dm], K[dm])`` from one UHF evaluation at ``(dm, 0)``."""
-        v_a, v_b = self._hf_pair(dm, np.zeros_like(dm))
-        return v_b, v_b - v_a
+        """``(J[dm], K[dm])`` from a UHF evaluation or directly from the AO ERIs."""
+        if self._eval_hf is not None:
+            v_a, v_b = self._hf_pair(dm, np.zeros_like(dm))
+            return v_b, v_b - v_a
+        return self._eri_jk(dm)
 
     def get_k(self, dm: np.ndarray) -> np.ndarray:
         return self.get_jk(np.asarray(dm))[1]
 
     def veff_hf(self, dm: np.ndarray) -> np.ndarray:
-        # Restricted J - K/2 at a 2-occupancy dm == the UHF potential at (dm/2, dm/2).
-        d = 0.5 * np.asarray(dm)
-        v_a, _v_b = self._hf_pair(d, d)
-        return v_a
+        """Restricted ``J - K/2`` at a 2-occupancy ``dm``."""
+        if self._eval_hf is not None:
+            # The UHF potential at (dm/2, dm/2) is J - K/2.
+            d = 0.5 * np.asarray(dm)
+            v_a, _v_b = self._hf_pair(d, d)
+            return v_a
+        j, k = self._eri_jk(dm)
+        return j - 0.5 * k
 
     def veff_uhf(self, dm_a, dm_b) -> tuple[np.ndarray, np.ndarray, float]:
         d_a, d_b = np.asarray(dm_a), np.asarray(dm_b)
@@ -360,3 +409,9 @@ class CallbackIntegrals:
         if self._layer_footing is not None:
             return self._layer_footing(layer)
         return self.hcore(), self.energy_nuc()
+
+    def high_level_reference_energy(self, layer: Any) -> float:
+        """High-level total-energy reference for ``layer`` (zero unless configured)."""
+        if self._high_level_reference is None:
+            return 0.0
+        return float(self._high_level_reference(layer))

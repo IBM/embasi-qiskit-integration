@@ -1,79 +1,73 @@
 # embasi-qiskit-integration
 
 Integration library coupling **[EmbASI](https://github.com/tamm-cci/EmbASI)**
-(projection-based QM/QM embedding via ASI) with the **Qiskit** stack
-(`qiskit-fermions`, `qiskit-addon-sqd`, `ffsim`) to run **Sample-based Quantum
-Diagonalization (SQD)** as the high-level solver inside an embedding workflow.
+projection-based embedding with the **Qiskit** stack (`qiskit-fermions`,
+`qiskit-addon-sqd`, `ffsim`) to run **Sample-based Quantum Diagonalization (SQD)**
+inside an embedding workflow.
 
-The entire quantum side (integrals → circuit → sampling → SQD → energy + RDMs)
-runs and is tested **without** EmbASI, FHI-aims, network access, or quantum
-hardware. EmbASI is only required to close the embedding loop (Phase 8).
+The quantum path (integrals → circuit → sampling → SQD → energy and RDMs) runs and
+is tested without EmbASI, FHI-aims, network access or quantum hardware. EmbASI is
+only needed to close the embedding loop.
 
-## Prerequisites
+## Requirements
 
-- **Python ≥ 3.10** (developed and tested on 3.12).
+- **Python 3.11+**. Use 3.12+ for the `sci-solvers` extra and for `--extra all`;
+  the commands below use 3.12.
 - **[uv](https://docs.astral.sh/uv/)** for environment management (recommended).
-- **A Rust toolchain** — *only* needed if you install the optional `fermions`
-  extra on a platform without a prebuilt `qiskit-fermions` wheel. PyPI ships
-  `abi3` wheels for macOS (x86_64/arm64), manylinux (x86_64/aarch64), and
-  Windows, so most users need no Rust at all. On an unsupported platform pip
-  falls back to the source distribution, which compiles a native extension:
-
-  ```bash
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-  source "$HOME/.cargo/env"
-  rustc --version   # confirm it is on PATH
-  ```
-
-  On macOS you can alternatively `brew install rust`. The core quantum path
-  (`quantum` extra) never requires it.
+- **Rust** only if `qiskit-fermions` has no prebuilt wheel for your platform.
+  PyPI ships wheels for macOS, manylinux and Windows, so most users need none;
+  the core quantum path never needs Rust.
 
 ## Installation
 
-The core package (`numpy`, `scipy`, `pyscf`, `pydantic`, `pydantic-settings`)
-covers the classical path only (`FCISolver`, integrals, FCIDUMP I/O). Everything
-else is an extra:
+The core package (numpy, scipy, PySCF, pydantic, pydantic-settings) covers the
+classical path only (`FCISolver`, integrals, FCIDUMP I/O). Everything else is an
+extra:
 
 | Extra | Installs | Needed for |
 |---|---|---|
 | `quantum` | `qiskit`, `qiskit-aer`, `qiskit-addon-sqd`, `ffsim` | `SQDSolver`, Aer sampling |
-| `fermions` | `qiskit-fermions>=0.3.1,<0.4` | building SqDRIFT circuits (any non-mock SQD run) |
-| `relabel` | `pyomo`, `highspy`, `ortools` | [mode relabeling](#mode-relabeling-optimize); **required by `SQDSolver`'s default `optimize=True`** |
-| `hardware` | `qiskit-ibm-runtime`, `samplomatic` | `--sampler runtime`, readout characterisation |
-| `embed` | EmbASI (from git, `qm-code-adapter` branch) + `ase`, `asi4py`, `mpi4py`, `scalapack4py` | `scripts/embedding_workflow.py`, the EmbASI-marked tests |
-| `mpi` | `mpich` (Linux only) | an MPI runtime for `mpi4py` on hosts with none — see below |
+| `fermions` | `qiskit-fermions>=0.3.1,<0.4` | SqDRIFT circuits (any non-mock SQD run) |
+| `relabel` | `pyomo`, `highspy`, `ortools` | [mode relabeling](#mode-relabeling-optimize); required by `SQDSolver`'s default `optimize=True` |
+| `sci-solvers` | `sci-solvers` + `torch-sci-solver[sqd]` from [IBM/sci-solvers](https://github.com/IBM/sci-solvers); pulls `torch`; Python ≥3.12 | non-`qiskit` `--sci_solver` choices (default `torch_sci`) |
+| `hardware` | `qiskit-ibm-runtime`, `samplomatic` | `RuntimeSampler`, readout characterisation |
+| `embed` | EmbASI (git, `qm-code-adapter`) and its ASI stack (`ase`, `asi4py`, `mpi4py`, `scalapack4py`) | `scripts/embedding_workflow.py`, EmbASI-marked tests |
+| `siesta` | `asi4py` git pin (ASI flavour 3) + `h5py` | `--qm_code siesta` (SIESTA itself is not a Python dependency) |
+| `mpi` | `mpich` (Linux) | an MPI runtime when the host has none |
 | `chem` | `rdkit` | SMILES-derived charges in `.xyz` metadata |
-| `dev` | `pytest`, `ruff`, `mypy`, `pre-commit`, `rdkit` | tests and lint |
-| `all` | `quantum` + `fermions` + `relabel` + `hardware` + `embed` | every runtime path (not `mpi`, `chem`, `dev`) |
+| `dev` | `pytest`, `pytest-cov`, `ruff`, `mypy`, `pre-commit`, `rdkit` | tests and lint |
+| `all` | `quantum` + `fermions` + `relabel` + `hardware` + `embed` + `siesta` + `sci-solvers` | every runtime path (not `mpi`, `chem`, `dev`) |
 
-Install from the lockfile with uv (recommended; tested on Python 3.12):
+`sci-solvers` is the only extra that installs torch (transitively). Install from
+the lockfile with uv:
 
 ```bash
 uv sync --python 3.12 --extra all --extra dev    # everything
 uv sync --python 3.12 --extra all --extra mpi    # Linux host without a system MPI
-uv sync --python 3.12 --extra quantum --extra fermions --extra relabel   # quantum path only
+uv sync --python 3.12 --extra quantum --extra fermions --extra relabel \
+    --extra sci-solvers                          # quantum path only
 source .venv/bin/activate                         # optional, instead of `uv run`
 ```
 
-`uv sync` removes packages not in the selected extras, so name every extra you need
-each time. Without uv: `pip install -e ".[all,dev]"`.
+`uv sync` removes packages not in the selected extras, so name every extra you
+need each time. Without uv: `pip install -e ".[all,dev]"`.
 
 **MPI.** EmbASI imports `mpi4py`, which needs an MPI library at import time
-(otherwise: `RuntimeError: cannot load MPI library`). Use a system MPI where one
-exists (e.g. Homebrew `open-mpi` on macOS); otherwise add the `mpi` extra, which
-bundles MPICH. Don't add it on a cluster whose own `mpirun` you use: the bundled
-library takes precedence and every rank runs as rank 0 of 1.
+(otherwise `RuntimeError: cannot load MPI library`). Use a system MPI where one
+exists (for example Homebrew `open-mpi` on macOS); on a Linux host without one,
+add the `mpi` extra (bundled MPICH). Do not add it on a cluster whose own
+`mpirun` you use: the bundled library takes precedence and every rank runs as
+rank 0 of 1.
 
-## Quickstart
+## Usage
 
-Generate the frozen N2 CAS(8o, 10e) test integrals (committed under
-`tests/data`, regenerate with):
+### Classical reference (FCI)
+
+The committed test data is N2/6-31G CAS(8o, 10e); regenerate it with:
 
 ```bash
 uv run python scripts/make_test_data.py   # writes n2_8o10e.{fcidump,npz} + mock_counts.json
 ```
-
-### 1. Classical reference (FCISolver)
 
 ```python
 from embasi_qiskit_integration.hamiltonian import fcidump
@@ -81,43 +75,77 @@ from embasi_qiskit_integration.solvers import FCISolver
 
 ham = fcidump.read("tests/data/n2_8o10e.fcidump")
 res = FCISolver().solve(ham)
-print(res.energy)  # -108.9585095430 Ha; res.rdm1 / res.rdm2 populated
+print(res.energy)  # -108.9585095430 Ha; res.rdm1 / res.rdm2 are populated
 ```
 
-### 2. SQD with Aer (noiseless)
+The SQD snippets below reuse this `ham`.
+
+### SQD with Aer
 
 ```python
 from embasi_qiskit_integration.circuit_run.aer import AerSampler
 from embasi_qiskit_integration.solvers import SQDSolver
 
-# SQDSolver builds the SqDRIFT ansatz, samples it, and runs the SQD loop.
-# (AerSampler + SqDRIFT needs the `quantum` + `fermions` + `relabel` extras.)
 res = SQDSolver(AerSampler(), shots=100_000, seed=24).solve(ham)
-print(res.energy)  # within 2e-3 Ha of FCI; res.diagnostics carries provenance
+print(res.energy)  # within 2e-3 Ha of FCI
 ```
 
-For CI / offline runs, replay frozen counts with `MockSampler` instead of
-`AerSampler` — same interface, fully deterministic.
+`SQDSolver` defaults to `sci_solver="torch_sci"` (the `sci-solvers` extra) and
+`optimize=True` (the `relabel` extra). Pass `sci_solver="qiskit"` for
+qiskit-addon-sqd's PySCF path. For an offline, deterministic run,
+`MockSampler("tests/data/mock_counts.json")` has the same sampler interface.
 
-**Aer is a family of simulators, not one.** `AerSampler` defaults to
-`matrix_product_state`, which reaches registers `statevector` cannot: on an entangling
-chain at 2000 shots, 30 qubits takes 0.01 s under MPS against 23.94 s under
-`statevector`, whose memory doubles per qubit.
+#### Torch-SCI subspace diagonalizer
+
+The default SQD subspace diagonalizer is IBM/sci-solvers' PyTorch-native
+`torch_sci`. Add the extra to the same sync as the rest of the quantum path; it
+requires Python ≥3.12:
+
+```bash
+uv sync --python 3.12 --extra quantum --extra fermions --extra relabel --extra sci-solvers
+```
 
 ```python
-AerSampler(method="statevector")  # exact, small spaces
-AerSampler(method="matrix_product_state", mps_max_bond_dimension=64)  # capped MPS
+res = SQDSolver(
+    AerSampler(),
+    shots=100_000,
+    seed=24,
+    sci_solver="torch_sci",              # the default
+    torch_sci_kwargs={"mode": "tpb"},
+).solve(ham)
+print(res.diagnostics["sci_solver"])     # "torch-sci-solver"
 ```
 
-From the CLI: `--aer_method statevector` or `--mps_max_bond_dimension 64`. The method is
-validated against the installed Aer, so a typo fails immediately, and it is recorded in
-`res.diagnostics["sampler_method"]`. Seeds do not reproduce across methods.
+```bash
+uv run embasi-qiskit-integration solve <jobdir> --sci_solver torch_sci
+```
 
-### 3. SQD on real quantum hardware
+The device auto-detects CUDA, then Apple MPS, then CPU; override it with
+`--torch_sci_device cuda|mps|cpu`. MPS runs in float32 because it has no float64.
+`torch_sci_mode` is `tpb` (default) or `gdb`, and `--torch_sci_apply_ab_projection`
+exposes the engine's αβ projection. Without the extra, the torch path raises an
+install hint and its test skips.
 
-The sampler is the only thing that changes.
+#### Aer simulation methods
 
-**Set up credentials once** (needs the `hardware` extra, included in `all`):
+`AerSampler` defaults to `matrix_product_state`, which is memory-frugal and
+reaches wider registers than `statevector`; use `statevector` for exact, small
+spaces. Cap the MPS bond dimension with `mps_max_bond_dimension`:
+
+```python
+AerSampler(method="statevector")
+AerSampler(method="matrix_product_state", mps_max_bond_dimension=64)
+```
+
+From the CLI: `--aer_method statevector`, `--mps_max_bond_dimension 64`,
+`--mps_truncation_threshold`. The method is validated against the installed Aer
+and recorded in `res.diagnostics["sampler_method"]`; seeds do not reproduce
+across methods.
+
+### SQD on real quantum hardware
+
+The sampler is the only thing that changes. Configure credentials once (needs the
+`hardware` extra):
 
 ```python
 from qiskit_ibm_runtime import QiskitRuntimeService
@@ -125,188 +153,130 @@ from qiskit_ibm_runtime import QiskitRuntimeService
 QiskitRuntimeService.save_account(channel="ibm_quantum_platform", token="<IBM_TOKEN>")
 ```
 
-or export `QISKIT_IBM_TOKEN` in your environment. Then swap in `RuntimeSampler`:
+or export `QISKIT_IBM_TOKEN`. Then:
 
 ```python
 from embasi_qiskit_integration.circuit_run.runtime import RuntimeSampler
 from embasi_qiskit_integration.solvers import SQDSolver
 
-sampler = RuntimeSampler()  # least-busy real backend
+sampler = RuntimeSampler()                          # least-busy real backend
 # sampler = RuntimeSampler(backend="ibm_kingston")  # or pick one explicitly
-# sampler = RuntimeSampler(optimization_level=2)    # ISA-transpile level (default 3)
+# sampler = RuntimeSampler(optimization_level=2)    # ISA transpile level (default 3)
 res = SQDSolver(sampler, shots=100_000).solve(ham)
 ```
 
-`RuntimeSampler` resolves a backend from `QiskitRuntimeService` (an explicit
-`backend=`, else `least_busy`), transpiles the circuits to that backend's ISA with
-`optimization_level` (default **3**), and submits them as a single `SamplerV2`
-job — no other code changes. Note that a real device queues jobs, so a full SQD
-run can take a while.
+`RuntimeSampler` resolves a backend (an explicit `backend=`, else `least_busy`),
+transpiles every circuit to that backend's ISA with `optimization_level`, and
+submits the batch as one `SamplerV2` job.
 
-To rehearse the hardware path offline, name a simulated device — it resolves
-locally and needs no credentials:
+To rehearse the hardware path offline, name a simulated device. Any `Fake*`
+backend class exported by `qiskit_ibm_runtime.fake_provider` works by name, for
+example `FakeMarrakesh` or `FakeNighthawk`; it resolves locally and needs no
+credentials:
 
 ```python
-sampler = RuntimeSampler(backend="FakeManilaV2")
+sampler = RuntimeSampler(backend="FakeMarrakesh")
 ```
 
-**On real hardware, enable measurement twirling.** `SamplerV2` leaves it off, so
-construct the sampler with it on (the CLI enables it for you — see §4):
+**Measurement twirling.** `SamplerV2` leaves it off, so enable it on hardware:
 
 ```python
 sampler = RuntimeSampler(options={"twirling": {"enable_measure": True}})
 ```
 
-Readout error is the channel this pipeline is most sensitive to: a flipped bit
-changes a sampled determinant's Hamming weight, so SQD's postselection discards
-that shot — wasting budget *and* biasing the subspace toward whichever
-configurations happened to survive, which moves the energy rather than just its
-variance. `build_sampler` takes the same `options`, so the shared dispatch can
-reach it too.
+Readout error is the channel SQD is most sensitive to: a flipped bit changes a
+determinant's Hamming weight, so SQD postselects the shot away, wasting budget and
+biasing the subspace.
 
-**Noise-aware layout selection** (`enable_readout_characterisation=True`) measures
-the device before submitting instead of trusting its reported calibration:
+**Readout characterisation.** `RuntimeSampler(enable_readout_characterisation=True)`
+submits a short samplomatic twirled measure-only job (300 randomizations × 25
+shots), prunes qubits above `readout_error_threshold` (default 0.03; relaxed by
+×1.5 if no chain remains), ranks the surviving 1-D chains by joint readout
+fidelity `prod(1 - error)`, and pins the best as `initial_layout`. It costs one
+extra job, is off by default, and is skipped with a warning on simulated
+backends. The chosen layout and backend noise are recorded on
+`sampler.hardware_characterisation`. There is no sampler-side
+`resilience_level` (an Estimator option); passing one raises.
 
-```python
-sampler = RuntimeSampler(enable_readout_characterisation=True)
-```
+### CLI
 
-It submits a short `samplomatic` twirled measure-only job (300 randomizations × 25
-shots), derives the per-qubit readout error from the twirl-corrected shots, deletes
-every qubit above `readout_error_threshold` (0.03) from the coupling map, searches
-the survivors for 1-D chains of the circuit's width, ranks them by joint readout
-fidelity `prod(1 - error)`, and pins the winner as an explicit `initial_layout`.
-When pruning fragments the lattice the threshold relaxes by ×1.5 (warning when it
-does) until a chain exists.
-
-This matters for the same reason twirling does: a flipped readout bit changes a
-determinant's Hamming weight, SQD postselects the shot away, and the surviving
-sample is biased — so *which physical qubits you land on* moves the energy. Qiskit's
-default layout passes optimize against calibration data that can be hours stale.
-
-Costs one extra short job, and is **off by default**. It is refused on simulated
-backends, whose "measured" readout error is just their configured noise model. The
-chosen layout, its score, the rejected qubits and the backend's reported noise are
-recorded on `sampler.hardware_characterisation` after each run. Note the chain
-search assumes a **1-D** layout, which suits the SqDRIFT/LUCJ circuits here.
-
-Quick smoke test that credentials + submission work (a 2-qubit Bell circuit, no
-SQD):
-
-```python
-from qiskit import QuantumCircuit
-
-qc = QuantumCircuit(2)
-qc.h(0)
-qc.cx(0, 1)
-qc.measure_all()
-print(RuntimeSampler().sample(qc, shots=1024))  # -> counts dict from hardware
-```
-
-### 4. Two-process CLI handoff
-
-The CLI defaults to the **SQD pipeline on hardware** (`--solver sqd --sampler
-runtime`), so a bare `solve` needs configured IBM Quantum credentials (see §3).
-Swap the sampler for `aer` (local simulation) or `mock` (frozen replay) to run
-offline:
+The CLI's `solve` is process B of a two-process handoff: process A writes
+`<jobdir>/job.fcidump` (plus the `.npz` sidecar), then:
 
 ```bash
-# Process A writes <jobdir>/job.fcidump, then:
-uv run embasi-qiskit-integration solve <jobdir>                       # sqd on hardware (default)
-uv run embasi-qiskit-integration solve <jobdir> \
-    --backend ibm_kingston --optimization_level 3                     # pick a backend explicitly
-uv run embasi-qiskit-integration solve <jobdir> --backend FakeManilaV2 # simulated device, no credentials
-uv run embasi-qiskit-integration solve <jobdir> --sampler aer         # local noiseless simulation
+uv run embasi-qiskit-integration solve <jobdir>                       # sqd + runtime (default)
+uv run embasi-qiskit-integration solve <jobdir> --backend ibm_kingston
+uv run embasi-qiskit-integration solve <jobdir> --backend FakeMarrakesh  # simulated, no credentials
+uv run embasi-qiskit-integration solve <jobdir> --sampler aer          # local noiseless
 uv run embasi-qiskit-integration solve <jobdir> --sampler mock \
-    --counts tests/data/mock_counts.json --seed 24                    # offline, deterministic
-uv run embasi-qiskit-integration solve <jobdir> --solver fci          # classical reference
-# -> writes <jobdir>/result.npz (or result.ERROR on failure)
+    --counts tests/data/mock_counts.json --seed 24                     # frozen replay
+uv run embasi-qiskit-integration solve <jobdir> --solver fci           # classical reference
 ```
 
-Defaults are `--shots 10000` per circuit, `--optimization_level 1`, `--seed 42`.
+A bare `solve` uses the runtime sampler and needs configured credentials; use
+`--backend FakeMarrakesh`, `--sampler aer`, or `--sampler mock` to run offline.
+Output is `<jobdir>/result.npz` (or `result.ERROR` on failure). CLI defaults are
+`--shots 1000` per circuit, `--optimization_level 1`, `--seed 42`; `--watch`
+waits for `job.fcidump` (default timeout 300 s). SQD defaults to
+`sci_solver="torch_sci"` (the `sci-solvers` extra); pass `--sci_solver qiskit`
+for qiskit-addon-sqd's PySCF path.
 
-**`--sqd_method` picks how the SqDRIFT ansatz is built** — `qdrift` (the default) or
-`exact`. It is the CLI name for the `method=` argument in §2/[Ansatz](#ansatz), and it
-is accepted by both `solve` and `scripts/embedding_workflow.py`:
+**`--sqd_method`** selects how the SqDRIFT ansatz is built (also accepted by
+`scripts/embedding_workflow.py`):
+
+- `exact`: one full-evolution circuit per `--evolution_time`; `--num_randomizations`
+  and `--num_groups` are ignored.
+- `qdrift` (default): `--num_randomizations` (default 500) circuits per
+  `(evolution_time, num_groups)`, each sampled at `--shots` and pooled. The real
+  budget is `len(evolution_time) * len(num_groups) * num_randomizations * shots`.
+  With the defaults (three evolution times, one `num_groups=10` point, 500
+  randomizations) a bare run builds 1500 circuits and 500 relabel solves; narrow
+  the axes before pointing it at hardware.
 
 ```bash
-uv run embasi-qiskit-integration solve <jobdir> --sqd_method exact    # one full-evolution circuit per time
-uv run embasi-qiskit-integration solve <jobdir> --sqd_method qdrift \
-    --num_randomizations 500 --num_groups 10 --evolution_time 1,2,3  # swept ensemble (default)
-uv run embasi-qiskit-integration solve <jobdir> --sqd_method qdrift \
-    --num_randomizations 100 --num_groups 15 --evolution_time 1.0     # one (time, num_groups) point
+uv run embasi-qiskit-integration solve <jobdir> --sqd_method exact
+uv run embasi-qiskit-integration solve <jobdir> --evolution_time 1.0 \
+    --num_groups 15 --num_randomizations 100
 ```
-
-- `exact` synthesises **one** exact time-evolution circuit per `--evolution_time`. Deepest
-  circuit, no ensemble, and `--num_randomizations` / `--num_groups` are ignored.
-- `qdrift` draws an **ensemble** of `--num_randomizations` randomized circuits per
-  `(evolution_time, num_groups)` combination, samples each at `--shots`, and pools the
-  counts of the whole sweep into one SQD run. The real shot budget is therefore
-  `len(evolution_time) * len(num_groups) * num_randomizations * shots`, not `shots`,
-  which at a fixed total budget is substantially more accurate than a single deep circuit.
-
-The qDRIFT knobs only bite under `--sqd_method qdrift`: `--num_randomizations` (default
-**500**) is the ensemble size, `--num_groups` (default **10**) the length of the
-randomized product inside each circuit, and `--evolution_time` (default **1,2,3**) the
-evolution time. `--evolution_time` and `--num_groups` are lists (`1,2,3`, `'[1, 2, 3]'`
-or a repeated flag; a single value is a one-point list) and are swept as a cartesian
-product. With the defaults a bare `--shots 1000` run submits **1500 circuits** (3 × 1 ×
-500) and builds 500 relabel solves (the three times share each draw) — narrow the
-sweep, e.g. `--evolution_time 1.0 --num_groups 15 --num_randomizations 100`, before
-pointing it at real hardware.
 
 **Error suppression (runtime sampler only).** `--measure_twirling` defaults to
-**true** here — unlike bare `SamplerV2`, because a bare `solve` targets hardware
-and readout error is what SQD is most sensitive to (see §3). Idle-qubit
-`--dynamical_decoupling` is off by default.
-`--sampler_options` takes any other `SamplerV2` option as JSON, merged over the two
-flags one level deep:
+true here, unlike bare `SamplerV2`; `--dynamical_decoupling` is off by default.
+`--sampler_options` takes any other `SamplerV2` option as JSON and merges it over
+those flags one level deep:
 
 ```bash
-uv run embasi-qiskit-integration solve <jobdir> --measure_twirling false        # opt out
-uv run embasi-qiskit-integration solve <jobdir> --dynamical_decoupling true     # deep circuits
+uv run embasi-qiskit-integration solve <jobdir> --measure_twirling false
+uv run embasi-qiskit-integration solve <jobdir> --dynamical_decoupling true
 uv run embasi-qiskit-integration solve <jobdir> \
-    --sampler_options '{"twirling": {"num_randomizations": 64}}'                # refine twirling
+    --sampler_options '{"twirling": {"num_randomizations": 64}}'
 uv run embasi-qiskit-integration solve <jobdir> \
-    --enable_readout_characterisation true --readout_error_threshold 0.03       # measure, then pin a layout
+    --enable_readout_characterisation true --readout_error_threshold 0.03
 ```
 
-**Circuit-generation knobs.** `--optimize` / `--time_limit` / `--relabel_solver` /
-`--cpsat_workers` / `--cpsat_deterministic` control mode relabeling,
-`--per_time_randomization` seeds each evolution time's draws separately, and
-`--workers` shards circuit construction across processes (see §2 above);
-`--workers 0` uses one per CPU. Generation progress and the relabel hit rate are
-reported through the standard `logging` module under the
-`embasi_qiskit_integration` logger — a zero-permutation run warns, so
-"optimization silently did nothing" is visible:
+**Circuit-generation knobs.** `--optimize`, `--time_limit`, `--relabel_solver`,
+`--cpsat_workers`, `--cpsat_deterministic`, `--per_time_randomization` and
+`--workers` control relabeling and parallel generation (`--workers 0` means one
+per CPU). Progress and the relabel hit rate go through the
+`embasi_qiskit_integration` logger (`logging.basicConfig(level=logging.INFO)`); a
+zero-permutation run warns.
 
-```python
-import logging
+### Demos and embedding workflow
 
-logging.basicConfig(level=logging.INFO)
-```
-
-### Demos
-
-[`scripts/sqd_prototype.py`](scripts/sqd_prototype.py) runs the whole
-quantum path (integrals → SqDRIFT → Aer → SQD → energy vs FCI) and asserts the
-delta is ≤ 2e-3 Ha:
+[`scripts/sqd_prototype.py`](scripts/sqd_prototype.py) runs the whole quantum
+path (integrals → SqDRIFT → Aer → SQD → energy vs FCI) and asserts the delta is
+at most 2e-3 Ha. Without `qiskit-fermions` it replays `mock_counts.json`:
 
 ```bash
 uv run python scripts/sqd_prototype.py
 ```
 
 [`scripts/embedding_workflow.py`](scripts/embedding_workflow.py) runs the full
-embedding flow against **real EmbASI** — EmbASI low-level embedding → extract an
-active-space Hamiltonian → solve with SQD/FCI → assemble the
-projection-based-embedding energy → feed the 1-RDM back. It drives a live
-`embasi.embedding.ProjectionEmbedding` (methanol monomer, OH active fragment,
-HF-in-PBE, sto-3g), so it needs EmbASI installed (see below).
-
-By default it takes the **WF-in-DFT** path (`--xc_hl HF`: an HF mean field plus an
-active-space quantum solve, with the `concentric-cl` selector), so the default run
-genuinely exercises the SQD pipeline. A Kohn-Sham `--xc_hl` (PBE0/PBE) instead
-routes DFT-in-DFT, where the solver and selector are inert.
+embedding flow against real EmbASI: low-level embedding → active-space
+Hamiltonian → SQD/FCI → projection-based-embedding energy → 1-RDM feedback. It
+drives a live `embasi.embedding.ProjectionEmbedding` (methanol monomer, OH active
+fragment, HF-in-PBE, sto-3g), so it needs EmbASI (the `embed` extra) and the
+quantum-path extras, including `relabel` for the default `optimize=True` and
+`sci-solvers` for the default `torch_sci` diagonalizer.
 
 ```bash
 uv run python scripts/embedding_workflow.py                        # WF-in-DFT: sqd + aer (default)
@@ -316,53 +286,34 @@ uv run python scripts/embedding_workflow.py --solver fci           # classical F
 uv run python scripts/embedding_workflow.py --xc_hl PBE0           # DFT-in-DFT (solver inert)
 ```
 
-### Per-cycle diagnostics to CSV (`--diagnostics_csv`)
+By default it takes the WF-in-DFT path (`--xc_ll PBE`, `--xc_hl HF`) with the
+`concentric-cl` selector. A Kohn-Sham `--xc_hl` (PBE0/PBE) routes DFT-in-DFT,
+where the solver and selector are inert.
 
-The outer loop's per-cycle log normally only goes to the console. `--diagnostics_csv
-<path>` additionally appends **one row per outer-loop cycle** to a CSV, so a sweep over
-geometries or samplers lands in something you can load with pandas instead of parsing
-stdout:
+#### Per-cycle diagnostics to CSV (`--diagnostics_csv`)
+
+`--diagnostics_csv <path>` appends one row per outer-loop cycle (off by default):
 
 ```bash
-uv run python scripts/embedding_workflow.py --xyz data/12.inp --active_atoms '[0,1]' \
-    --max_cycles 30 --sqd_method qdrift --shots 1000 \
-    --diagnostics_csv output/diagnostics.csv
+uv run python scripts/embedding_workflow.py --xyz mol.xyz --active_atoms '[0,1]' \
+    --max_cycles 30 --shots 1000 --diagnostics_csv output/diagnostics.csv
 ```
 
-It is **off by default** (`None`). Behaviour worth knowing before you point it at a
-sweep:
-
-- **Append, not overwrite.** The header is written only when the file is missing or
-  empty, so pointing many runs at one path accumulates them — that is the intended use,
-  and `run_id` (a per-run UUID) is what separates them. To get a fresh file, delete it
-  or name a new one.
-- **Flushed every row**, so a run killed at cycle 17 still leaves 17 usable rows.
-- **Never fatal.** A bad path or missing datum is caught, reported as
-  `[diagnostics] skipped cycle N: ...`, and the embedding continues. A missing value is
-  an empty cell rather than an error.
-- **Rank 0 only**, so an `mpirun` run writes one row per cycle, not one per rank.
-- Parent directories are created for you.
-
-Each row carries the run/geometry identity (`run_id`, `geometry_file`,
-`geometry_parameter`, `algorithm`, `backend_name`), the cycle state (`cycle`,
-`converged`, `total_cycles`), the active space (`cas_norb`, `cas_nelec`,
-`active_space_indices`, `selector`, `selected_virtuals`, `frozen_occupied`, `norb`,
-`nelec_alpha`, `nelec_beta`), every term of the embedding energy (`E_solver`,
-`E_low_total`, `E_low_A`, `E_high_A`, `e_core`, `correction`, `footing_shift`,
-`projector_leak`, `p_b_leak`, `embedding_energy`), the convergence deltas (`delta_E`,
-`max_delta_gamma_A`), the density (`rdm1_trace`, `natural_occupations`, `rdm1`) and, for
-SQD runs, `number_unique_bitstrings` and `final_sqd_subspace_dimension` (both empty under
-`--solver fci`). Array-valued columns are JSON-encoded with floats rounded to 3 decimals.
-The authoritative column list is `DIAGNOSTICS_CSV_COLUMNS` in
+The file is appended to, not overwritten: the header is written only when the
+file is missing or empty, and `run_id` (a per-run UUID) separates runs. Rows are
+flushed immediately, so a killed run keeps its completed cycles. A bad path or
+missing datum is caught and reported as `[diagnostics] skipped cycle N: ...`;
+only rank 0 writes, and parent directories are created. Columns cover run and
+geometry identity, cycle state, active space, energy terms, convergence/density
+and SQD subspace size; the authoritative list is `DIAGNOSTICS_CSV_COLUMNS` in
 [`diagnostics_csv.py`](src/embasi_qiskit_integration/diagnostics_csv.py).
+`--output_path` instead appends one summary line per run.
 
-`--diagnostics_csv` is distinct from `--output_path`, which appends one summary line per
-*run* rather than per cycle.
+#### Starting from an `.xyz`
 
-### Starting from an `.xyz`
-
-Both workflows default to their built-in geometry (the s26 methanol monomer above,
-and N2 for `make_test_data.py`). Pass `--xyz` to run on your own structure instead:
+Both scripts have built-in geometries (methanol monomer for
+`embedding_workflow.py`, N2 for `make_test_data.py`); pass `--xyz` to use your
+own:
 
 ```bash
 uv run python scripts/embedding_workflow.py --xyz mol.xyz --active_atoms '[1,5]'
@@ -370,26 +321,23 @@ uv run python scripts/make_test_data.py --xyz tests/data/methanol.xyz \
     --basis sto-3g --ncas 4 --nelecas 4 --stem methanol_4o4e
 ```
 
-The file is a standard `.xyz` whose comment line carries `;`-separated metadata, so a
-geometry brings its own charge (see
-[`molecule/geometry.py`](src/embasi_qiskit_integration/molecule/geometry.py)):
+The comment line carries `;`-separated metadata:
 
-```
+```text
 6
 smiles=CO; charge=0
 C     0.000000    0.000000    0.000000
 ...
 ```
 
-`charge=` and `smiles=` are both optional. When both are given they are cross-checked
-and a contradiction is refused, rather than silently picking one — the charge sets
-`nelec`, so guessing would solve a different electronic state. Reading the charge off
-the SMILES needs the `chem` extra (rdkit); without it the `charge=` field is used on
-its own. `--active_atoms` indexes into the `.xyz` atom order.
+`charge=` and `smiles=` are optional. If both are given they are cross-checked
+and a contradiction is refused rather than silently picking one. SMILES-derived
+charge needs the `chem` extra (rdkit); without it, use `charge=`.
+`--active_atoms` indexes the `.xyz` atom order.
 
-It is MPI-safe (the solve runs on rank 0 and the result is broadcast), so it can
-be driven the way real EmbASI runs — under `mpirun` (needs the `embed` extra for
-`mpi4py`, and an MPI library matching that `mpirun`; see [Installation](#installation)):
+The workflow is MPI-safe (the solve runs on rank 0 and the result is broadcast),
+so it can be driven under `mpirun` like a real EmbASI run (needs `mpi4py` from
+the `embed` extra and a matching MPI library; see [Installation](#installation)):
 
 ```bash
 mpirun -n 2 uv run python scripts/embedding_workflow.py --solver sqd
@@ -398,256 +346,323 @@ mpirun -n 2 uv run python scripts/embedding_workflow.py --solver sqd
 ## Ansatz
 
 The primary sampling ansatz is **SqDRIFT** (`circuit_generator/sqdrift.py`, via
-`qiskit-fermions`); the LUCJ ansatz is currently on hold.
+`qiskit-fermions`); LUCJ is on hold (`build_lucj_circuit` raises).
 
-`method="qdrift"` produces an *ensemble* of randomized circuits instead of one
+`method="qdrift"` samples an *ensemble* of randomized circuits instead of one
 exact-evolution circuit. Each is sampled at `shots` and the counts are pooled, so
-the total budget is `num_randomizations * shots` — at a fixed budget this is
-substantially more accurate than a single circuit:
+the total budget is `num_randomizations * shots` per `(time, num_groups)` point:
 
 ```python
 res = SQDSolver(AerSampler(), shots=5_000, method="qdrift", num_randomizations=4).solve(ham)
 ```
 
-Seeded generation is reproducible across processes: randomization `i` is drawn
-with seed `seed + i`, and the Hamiltonian's term groups are relabelled into a
-canonical order so a given seed always maps to the same physical group.
+Seeded generation is reproducible across processes: randomization `i` uses seed
+`seed + i`, and the Hamiltonian's term groups are relabelled into a canonical
+order so a seed always maps to the same physical group.
 
-### Mode relabeling (`optimize`)
+### Mode relabeling (optimize)
 
-`optimize=True` (the default of `SQDSolver` and of `scripts/embedding_workflow.py
---optimize`; the `solve` CLI's `--optimize` instead defaults to "on if the `relabel`
-extra is installed") runs
-`qiskit-fermions`' `RelabelModes` pass, which reorders the fermionic modes to
-minimize the span of the sampled excitations. That shortens the synthesised
-circuits substantially — on N2 CAS(8o,10e) the per-draw depth dropped from
-390/202/413 to 369/153/273 across three randomizations.
-
-The catch, and the reason this is not just a free win: **a relabeled circuit
-samples bitstrings in the permuted mode order.** Used as-is the occupations land
-on the wrong orbitals — measured against an unpermuted reference the raw counts
-have a total variation distance of ~1.0, i.e. an entirely disjoint distribution.
-`SQDSolver` handles both ends of this for you:
-
-- the reference determinant is prepared in each circuit's own permuted order
-  (`resolve_initial_state` reads `metadata["permutation"]`), and
-- each circuit's counts are mapped back to the original order **before** the
-  ensemble is pooled (`circuit_run.permutation.unpermute_counts_list`) — pooling
-  first would mix mutually inconsistent mode orders.
-
-Building circuits yourself means owning that second step:
+`optimize=True` (the default of `SQDSolver` and `scripts/embedding_workflow.py`;
+the `solve` CLI enables it when the `relabel` extra is installed) runs
+`qiskit-fermions`' `RelabelModes` pass, reordering fermionic modes to shorten
+each circuit. A relabeled circuit samples in the permuted mode order, so the
+reference determinant must be prepared in that order and the counts mapped back
+before pooling. `SQDSolver` does both; if you build circuits yourself, you must
+unpermute:
 
 ```python
+from embasi_qiskit_integration.circuit_generator.sqdrift import build_sqdrift_circuits
 from embasi_qiskit_integration.circuit_run import unpermute_counts_list
+from embasi_qiskit_integration.circuit_run.aer import AerSampler
 
-result = build_sqdrift_circuits(ham, method="qdrift", num_randomizations=8)
-counts = sampler.run(result.circuits, shots)
-counts = unpermute_counts_list(counts, result.permutations)  # required!
+result = build_sqdrift_circuits(
+    ham, method="qdrift", num_randomizations=8, include_initial_state=True
+)
+counts = AerSampler().run(result.circuits, 10_000)
+counts = unpermute_counts_list(counts, result.permutations)  # required
 ```
 
-Requesting `optimize=True` without the `relabel` extra raises instead of silently
-producing unpermuted circuits.
+`relabel_solver` is `cpsat` (default; OR-Tools) or `highs`, each capped by
+`time_limit` (10 s); CP-SAT's parallel search (`cpsat_workers`, default 1) wins
+above roughly 16 modes. Relabeling buys little under noiseless Aer, so pass
+`--optimize False` there and keep it on for hardware. The permutation is cached
+per draw, so a time sweep solves each draw once; `per_time_randomization=True`
+gives each time its own draws, `relabel_cache=False` disables the cache, and
+`cpsat_deterministic=True` makes CP-SAT reproducible but weaker. Tied optima can
+otherwise vary between runs. On macOS, import `highspy` before `ortools` if you
+import both directly; the CP-SAT backend already does.
 
-**The permutation is cached per draw.** The relabel model depends only on the
-excitations a qDRIFT draw sampled, never on `time` (which only scales the angles), so
-by default randomization `i` gathers the same excitations, and gets the same
-permutation, at every time. The permutation is cached by a content hash of that
-model (excitation set, mode count, backend and solver settings), so a three-time
-sweep solves each model once instead of three times. A sharded build (`workers > 1`)
-shares the cache between its workers through a temporary directory, with a lock so a
-model is solved by one worker while the others wait for it;
-`relabel_cache_dir=<path>` keeps that directory, so a repeated build reuses its
-solves (safe to delete). When a time limit leaves the optimum unproven, the first
-permutation found is kept for every time.
+### Parallel generation (workers)
 
-Each solve is capped at `time_limit` seconds (default 10); above ~16 modes neither
-backend proves the optimum and the solve runs to the limit, so relabeling dominates an
-SQD solve. Under noiseless Aer it buys
-nothing — on N2 CAS(8o,10e), 40 circuits took 405 s with it and 5 s without (at a
-10 s limit), at the same energy — so pass `--optimize False` there, and keep it on
-for hardware. HiGHS picks its own threading; `highs_deterministic=True` pins each
-solve to one thread, which narrows (but does not remove) the run-to-run variation in
-which tied optimum it returns. `relabel_cache=False` turns the permutation cache off
-and solves every circuit afresh.
-
-**`per_time_randomization=True`** draws each time independently, from a seed hashed
-from `(seed, i, time)`, so every time is its own sample (more independent circuits,
-and no cross-time cache hits). It changes the seeds even for a single-time run. The
-default `False` keeps the `seed + i` draws.
-
-**`relabel_solver="cpsat"`** (the default; `"highs"` is the MILP through pyomo +
-HiGHS) solves the default objective with OR-Tools CP-SAT.
-At about 16 modes it proves the optimum in under a second, where HiGHS needs 30–60 s
-to match it. Above that neither solver proves the optimum within a minute, and
-CP-SAT's edge comes from its parallel search: on 8 threads it gives far shallower
-circuits than HiGHS, on 1 thread it ties or loses. Measured 2-qubit depth after
-relabeling, real qDRIFT draws (`num_groups=20`), mean of 3:
-
-| modes | no relabel | HiGHS 5 s | HiGHS 60 s | CP-SAT 1 thread 60 s | CP-SAT 8 threads 5 s |
-| ----- | ---------- | --------- | ---------- | -------------------- | -------------------- |
-| 16    | 474        | 297       | 209        | 210                  | 208                  |
-| 32    | 887        | 847       | 738        | 615                  | 575                  |
-| 64    | 1547       | 813       | 448        | 632                  | 232                  |
-| 120   | 2706       | 1485      | 736        | 688                  | 271                  |
-
-`cpsat_workers` (default 1) is its thread count per solve, and multiplies with
-`workers`. On a large active space give CP-SAT more threads, lowering `workers` to
-about cores / `cpsat_workers`. With `workers` near the core count each solve effectively runs on
-one thread, where CP-SAT has no advantage.
-
-```python
-build_sqdrift_circuits(ham, method="qdrift", relabel_solver="cpsat", cpsat_workers=4)
-```
-
-**Reproducibility.** The excitation-span model is degenerate (many orderings tie),
-and neither backend is guaranteed to pick the same tied optimum on every run: HiGHS,
-pinned here to one thread, was still seen to return a different optimum on a repeated
-solve of one model in one process, and CP-SAT on several threads races its workers
-(one 16-mode model gave 6 different permutations in 6 runs). Within a build the cache
-makes every circuit of a draw use one permutation. Across builds,
-`cpsat_deterministic=True` switches CP-SAT to interleaved search, which is
-reproducible but searches less well (10–20% worse objective at 32 modes, and 8×
-longer to prove the optimum at 16 modes); it is part of the cache key and has no
-effect with `highs`. A `relabel_cache_dir` reused between builds also pins the
-permutations it holds.
-
-On macOS, a process that runs both backends must import `highspy` before `ortools`:
-the OR-Tools wheel bundles its own HiGHS, and with it loaded first a later HiGHS
-solve can segfault. The CP-SAT backend does this itself; a script that imports
-`ortools` on its own should import `highspy` first.
-
-### Parallel generation (`workers`)
-
-`workers=N` shards a combination's randomizations into contiguous seed-chunks,
-one per worker process. Because each randomization is an independently seeded
-draw, the output is byte-identical to the sequential build — only faster (N2
-CAS(8o,10e), 8 draws with relabeling: 81.5s → 12.5s at `workers=8`). A
-process-local operator cache keeps the expensive operator construction to once
-per worker. `workers=0` means one per CPU — on a batch-scheduler node that is the
-whole node, not your allocation, so give an explicit count there. Keep `workers` at or
-below the cores you actually have: each relabel solve is wall-clock limited, so an
-oversubscribed one can stop at a different permutation and change the sampled counts.
-`scripts/embedding_workflow.py` takes `--workers` (default 1).
-
-Workers are spawned, so a *script* using `workers > 1` must guard its entry point
-with `if __name__ == "__main__":` (the standard `multiprocessing` requirement);
-without it the workers fail with `BrokenProcessPool`. Notebooks and the CLI are
-unaffected.
+`workers=N` shards each combination's randomizations into contiguous seed-chunks
+across processes; the output is byte-identical to the sequential build.
+`workers=0` means one per CPU, which on a batch node is the whole node, so give
+an explicit count there. Keep `workers` at or below the cores you have: relabel
+solves are wall-clock limited, so an oversubscribed one can stop at a different
+permutation and change the sampled counts. Scripts using `workers > 1` need the
+usual `if __name__ == "__main__":` guard; notebooks and the CLI do not.
 
 ## Package layout
-
-The quantum path is split into two packages, so either half can be swapped out
-independently:
 
 | package | role |
 | --- | --- |
 | `circuit_generator/` | integrals → fermionic operator → mapped circuit (`operator.py`, `sqdrift.py`, `hf.py`) |
-| `circuit_run/` | circuits → measured counts (`prep.py`, `backend.py`, `counts.py`, and the samplers) |
+| `circuit_run/` | circuits → measured counts (`prep.py`, `backend.py`, `counts.py`, samplers) |
 
-The seam between them is deliberate: the generator emits *bare* evolution
-circuits, and `circuit_run.prep.resolve_initial_state` picks the reference
-determinant and prepends it at run time. Precedence is an explicit
+The generator emits bare evolution circuits; `circuit_run.prep.resolve_initial_state`
+prepends the reference at run time. Precedence is an explicit
 `initial_state_bitstring`, else Hartree-Fock from the active-space electron
-counts; a circuit that already carries its own reference state (flagged in
-`metadata["initial_state_included"]`) is left alone.
+counts; a circuit that already includes its state
+(`metadata["initial_state_included"]`) is left alone.
+
+### Initial state and bit order
 
 ```python
-# sample a chosen determinant instead of the HF reference — no circuit rebuild
-# N2 CAS(8o,10e) is 5 alpha + 5 beta; this is its HF determinant written out:
-res = SQDSolver(AerSampler(), initial_state_bitstring="0001111100011111").solve(ham)
+# N2 CAS(8o,10e) HF determinant (5 alpha + 5 beta); optimize=False keeps the mode order.
+res = SQDSolver(
+    AerSampler(), initial_state_bitstring="0001111100011111", optimize=False
+).solve(ham)
 ```
 
-**Bit order:** the string is MSB-left (matching `get_counts()`), so its *last*
-character is qubit 0. Since the alpha block sits on the low qubits, the **rightmost
-`n_orbitals` characters are alpha** and the leftmost are beta — mirrored from how
-the string reads. A `n_alpha == n_beta` case looks the same either way, so the
-asymmetric example is the one to reason from: for `n_orbitals=8` with 5 alpha and
-3 beta, the determinant is `"0000011100011111"` (alpha on qubits 0–4, beta on
-8–10). Cross-check against `hf_prep_circuit` if unsure — a swapped block silently
-populates the wrong spin sector, and SQD will then postselect every shot away.
+The string is MSB-left (matching `get_counts()`), so its *last* character is
+qubit 0. The alpha block sits on the low qubits, so the **rightmost `n_orbitals`
+characters are alpha** and the leftmost are beta. For `n_orbitals=8` with 5 alpha
+and 3 beta, the determinant is `"0000011100011111"` (alpha on qubits 0-4, beta on
+8-10). Check against `hf_prep_circuit` if unsure: a swapped block silently
+populates the wrong spin sector, and SQD then postselects every shot away.
+`initial_state_bitstring` cannot be combined with `optimize=True`.
 
 ## Development
 
-Enable the [pre-commit](https://pre-commit.com/) hooks (ruff lint + format,
-plus basic file hygiene) once after cloning — they mirror the CI checks:
-
-```bash
-uv run pre-commit install          # installs the git hook
-uv run pre-commit run --all-files  # optional: run against the whole tree
-```
+`uv run pre-commit install` enables the [pre-commit](https://pre-commit.com/)
+hooks (ruff lint + format, plus file hygiene) that mirror the CI checks.
 
 ## Testing
 
-The default suite runs the entire quantum + classical path with no EmbASI,
-FHI-aims, network, or hardware — the EmbASI-marked tests are auto-skipped:
+`uv run pytest -q` runs the quantum and classical paths with no EmbASI, FHI-aims,
+network or hardware (EmbASI-marked tests auto-skip);
+`uv run ruff check src && uv run mypy src` lints.
+
+### EmbASI-marked tests
+
+The `@pytest.mark.embasi` tests only run when `EMBASI_AVAILABLE=1`, and they build
+a real `embasi.embedding.ProjectionEmbedding`. Install EmbASI via the `embed`
+extra (it pulls `ase`, `asi4py`, `mpi4py` and `scalapack4py`; `mpi4py` needs an
+MPI library, see [Installation](#installation)):
 
 ```bash
-uv run pytest -q                      # EmbASI tests auto-skipped
-uv run ruff check src && uv run mypy src
+uv sync --python 3.12 --extra all --extra dev
+EMBASI_AVAILABLE=1 uv run pytest -m embasi -q
 ```
 
-### Running the EmbASI-marked tests
+Provide an FHI-aims shared library through the ASI API (typically `ASI_LIB_PATH`
+pointing at `libaims.so`). FHI-aims requires a licence and is not needed for
+anything else here; without a completed embedding run the real-EmbASI smoke test
+skips itself with an explanatory message.
 
-The `@pytest.mark.embasi` tests only run when `EMBASI_AVAILABLE=1`, and they
-build a real `embasi.embedding.ProjectionEmbedding`. The package's own logic
-(orbital bookkeeping, downfolding, the outer loop, MPI orchestration) is covered
-in the default suite via small PySCF-backed test doubles, so you only need this
-to exercise the real embedding backend.
+## SIESTA backend (WF-in-DFT)
 
-1. **Install EmbASI** via the `embed` extra (EmbASI is not on PyPI; this pulls
-   it from git plus `ase`, `asi4py`, `mpi4py` and `scalapack4py` — and `mpi4py`
-   needs an MPI library, see [Installation](#installation)):
+`--qm_code siesta` is **WF-in-DFT only**: PBE (`--xc_ll`) is the low-level
+environment, the high level is a wavefunction calculation (`--xc_hl HF`; the
+correlated solve is SQD or FCI), and the two-electron integrals come from
+SIESTA-QCOMP. EmbASI drives SIESTA in-process through ASI flavour 3.
 
-   ```bash
-   uv sync --extra all --extra dev
-   ```
+The ASI interface requires a **neutral, unpolarized Gamma-point calculation on a
+single MPI rank**. The backend refuses charged systems, a non-HF `--xc_hl`,
+`--spin`/`--unrestricted`, `--relax_hf` (SIESTA has no pure-HF functional), a
+multi-rank run, and a non-default Gaussian `--basis` (use `--siesta_basis`).
 
-2. **Provide a QM driver.** EmbASI communicates with a QM package through the
-   ASI API; the supported driver is **FHI-aims**, built as a shared library and
-   exposed via `asi4py` (typically the `ASI_LIB_PATH` environment variable
-   pointing at `libaims.so`). See the
-   [EmbASI docs](https://tamm-cci.github.io/EmbASI/index.html) and the
-   [ASI templates](https://gitlab.com/pvst/asi) for building it. This step
-   requires an FHI-aims license and is not needed for anything else in this
-   project.
+**SIESTA is not a Python dependency.** The `siesta` extra installs only the ASI
+wrapper (`asi4py` 1.4.10 from ASI main; PyPI's 1.4.9 maps flavours 0-2 only) and
+`h5py`. Build SIESTA with
+`-DSIESTA_WITH_ASI=ON -DSIESTA_WITH_QCOMP=ON -DSIESTA_WITH_HYBRIDXC=ON -DBUILD_SHARED_LIBS=ON`
+and libint 1.x with `MAX_AM_ERI=5`; see
+[`scripts/patches/README.md`](scripts/patches/README.md) for the NetCDF and
+reinitialization details, or use the Docker harness below. Point `ASI_LIB_PATH`
+at the resulting `libsiesta.so` (or `.dylib`) and `SIESTA_PP_PATH` at the
+`<Element>.psml` pseudopotentials. No `siesta` executable is needed: the library
+is loaded in-process. SIESTA itself is GPL-3.0 and is not vendored here.
 
-3. **Run the marked tests:**
+### Run the workflow
 
-   ```bash
-   EMBASI_AVAILABLE=1 uv run pytest -m embasi -q
-   ```
+From the repository root:
 
-   Without a completed FHI-aims embedding run the real-EmbASI smoke test skips
-   itself with an explanatory message; with the driver in place it exercises the
-   extraction/feedback path against live EmbASI matrices.
+```bash
+# Runtime extras (`sci-solvers` provides torch-sci; `dev` runs the tests below).
+uv sync --python 3.12 --extra quantum --extra fermions --extra sci-solvers \
+    --extra embed --extra siesta --extra dev
 
-## References & citation
+export ASI_LIB_PATH=/path/to/libsiesta.so
+export SIESTA_PP_PATH=/path/to/pseudopotentials
 
-This library couples the **EmbASI** projection-based embedding framework to the
-Qiskit SQD stack. The embedding formalism — the DFT-in-DFT and WF-in-DFT energy
-expressions, the level-shift projector, and the reference results this package's
-docstrings cite as "the paper" (Eq. 2, 6, 8, 19; §2.2; Fig. 3B) — is described
-in:
+# H2O with A = O (atom 0): the validated 6e / 7-orbital active space.
+cat > water.xyz <<'EOF'
+3
+water
+O  0.000000  0.000000  0.117300
+H  0.000000  0.757200 -0.469200
+H  0.000000 -0.757200 -0.469200
+EOF
+
+uv run python scripts/embedding_workflow.py \
+    --qm_code siesta --xc_ll PBE --xc_hl HF --spin 0 \
+    --xyz water.xyz --active_atoms '[0]' \
+    --a_nmos 3 --selector none --n_virtual 4 \
+    --siesta_basis DZP --siesta_mesh_cutoff 200 \
+    --solver sqd --sampler aer --optimize False --max_cycles 1
+```
+
+The default subspace diagonalizer is `torch_sci` (the sync above installs
+`sci-solvers`). `--max_cycles 1` is one embedding pass; drop it for the
+self-consistent outer loop (default 15). `--optimize False` skips relabeling,
+which buys nothing under noiseless Aer; on hardware leave it on and add the
+`relabel` extra. Use `--solver fci` for a classical cross-check, or
+`--sampler runtime` for hardware (add the `hardware` extra). If PySCF's h5py
+clashes with the HDF5 that libsiesta/NetCDF loads, import PySCF before SIESTA or
+run the solve through the two-process handoff (`--handoff two-process`; see
+[CLI](#cli)). The default qDRIFT sweep is three evolution times, one
+`num_groups=10` point, and 500 randomizations per cycle (1500 circuits); narrow
+`--evolution_time` / `--num_groups` / `--num_randomizations` for a quicker run.
+
+### Docker harness
+
+Without a local QCOMP build, the harness clones the private `qcomp-5.4-asi`
+branch over SSH, applies the maintained FFT-reinit patch, builds libint/SIESTA in
+a cached image and volume, and runs the real WF test (25-45 min cold, about 5 min
+warm). The image builds and uses its own MPI-enabled HDF5/NetCDF stack.
+
+```bash
+SIESTA_DOCKER_INTEGRATION=1 uv run pytest -q tests/test_siesta_docker_integration.py
+```
+
+It skips without Docker, on CI, or when the default SSH clone has no `~/.ssh`;
+set `SIESTA_DOCKER_REMOTE` to override the remote. See
+[`docker/siesta-asi/README.md`](docker/siesta-asi/README.md) for the cache, logs
+and reset instructions.
+
+To run a test directly against the cached image, use the tag the harness prints
+(the SHA-12 of `docker/siesta-asi/Dockerfile` plus
+`scripts/build_parallel_netcdf.sh`):
+
+```bash
+docker run --rm \
+  --mount type=bind,src="$PWD",dst=/repo,readonly \
+  --mount type=volume,src=embasi-siesta-asi-cache,dst=/cache \
+  -e SIESTA_QCOMP_REAL=1 \
+  -e ASI_LIB_PATH=/cache/build/Src/libsiesta.so \
+  -e SIESTA_PP_PATH=/cache/siesta/Tests/Pseudos \
+  -e PYTHONPATH=/repo/src \
+  -e LD_LIBRARY_PATH=/cache/build/Src:/opt/parallel-netcdf/lib:/opt/parallel-netcdf/hdf5/lib \
+  -e TMPDIR=/cache/pytest-tmp \
+  -w /cache/work "embasi-siesta-asi-builder:<tag>" \
+  /cache/venv/bin/pytest -q /repo/tests/test_siesta_qcomp_real.py
+```
+
+### Native build
+
+For a native build without Docker, use
+[`scripts/build_siesta_native.sh`](scripts/build_siesta_native.sh) (Linux and
+macOS; see [`scripts/BUILD_SIESTA_NATIVE.md`](scripts/BUILD_SIESTA_NATIVE.md)).
+It produces the same ASI/QCOMP `libsiesta` for local development:
+
+```bash
+scripts/build_siesta_native.sh --parallel-netcdf
+```
+
+The script builds a cached MPI HDF5/NetCDF-C/NetCDF-Fortran stack; alternatively,
+point `NC_CONFIG`/`NF_CONFIG`/`NETCDF_ROOT` at an existing parallel installation.
+
+### Opt-in real tests
+
+These need a QCOMP build (`ASI_LIB_PATH`, `SIESTA_PP_PATH`), local or in the
+Docker image:
+
+```bash
+SIESTA_QCOMP_REAL=1 uv run pytest -q \
+    tests/test_siesta_qcomp_real.py tests/test_siesta_same_basis.py \
+    tests/test_siesta_molecule_matrix.py
+SIESTA_ASI_REAL=1 uv run pytest -q tests/test_siesta_asi_real.py
+```
+
+All of them skip on CI.
+
+### Validation status
+
+Proven against a real H2O/PBE/DZP QCOMP build (A=O, `--a_nmos 3`, 6 electrons in
+7 A orbitals; `tests/test_siesta_qcomp_real.py`) and the H2O/H2/CH4/NH3 matrix
+(`tests/test_siesta_molecule_matrix.py`):
+
+- electron count and active-space size;
+- active orbitals S-orthonormal (`C_active^T S C_active = I`);
+- density trace (`Tr[S D_A] = N_A`, plus the total and A+B sums);
+- zero projector leak in the active space;
+- Hermitian `h1`, and every chemists'-notation `h2` permutation symmetry;
+- the energy-assembly identity
+  `total = e_low_total - e_low_A + e_high_A + correction`;
+- same-pseudopotential FCI: `pyscf.fci.direct_spin1.kernel` runs directly on the
+  SIESTA `h1`/`h2`/`e_core` (pseudopotential included) and agrees with
+  `FCISolver` to 1e-9 Ha;
+- QCOMP ERIs against an exact PySCF primitive-Gaussian reconstruction of the
+  same `sphi` basis, including stored off-diagonal quartets (H2O and CH4; H2 has
+  no stored quartet confined to one of its equivalent H atoms;
+  `tests/test_siesta_same_basis.py`).
+
+Only exact same-pseudopotential/same-basis comparisons are made. PySCF cannot
+read SIESTA's PSML pseudopotential format, so no all-electron Gaussian low-level
+PBE reference is used. QCOMP screens ERIs, so stored values and absolute FCI
+totals are not bit-for-bit reproducible; the quartet count and the invariants are
+stable, and the same-basis test checks stored off-diagonal entries rather than
+treating absent ones as zeros.
+
+### Removing the temporary shim
+
+`--qm_code siesta` works today only because this repository ships a temporary
+compatibility shim. It exists until EmbASI/SIESTA provide the required adapter
+and interface upstream. The shim is self-contained in this repository, is
+exercised only by the SIESTA path, and can be deleted once upstream support
+lands. The removable pieces are:
+
+- `src/embasi_qiskit_integration/backends/_embasi_compat.py` and its call sites:
+  `install_siesta_adapter()` in `backends/siesta.py`,
+  `prepare_projection_embedding()` in `embedding.py`, `prime_layer()` in
+  `backends/callback.py`, and the `write_inputfiles` alias in `backends/siesta.py`;
+- every marker tagged `TODO(embasi-siesta-shim)` (grep the tag; the module
+  docstring has the full checklist), including the shim-marked cases in
+  `tests/test_siesta_asi.py`;
+- `same_density_reference_energy` and the shim's input-density capture in
+  `backends/siesta.py`, once upstream EmbASI/ASI exposes `E_bare(D_A)` and the
+  low-level layer energy through one API;
+- the `asi4py` git pin in the `siesta` extra and the matching `[tool.uv.sources]`
+  override (`TODO(asi4py-1.4.10)`), once `asi4py >= 1.4.10` is on PyPI;
+- the FFT-reinitialization patch in `scripts/patches/`
+  (`TODO(siesta-asi-embasi-fixes)`), once that fix is merged upstream.
+
+## References
+
+The embedding formalism (the DFT-in-DFT and WF-in-DFT energy expressions, the
+level-shift projector, and the reference results cited in the package
+docstrings) is described in:
 
 > G. Bramley, P. Stishenko, O. van Vuren, V. Blum, and A. J. Logsdail,
 > *A General Pythonic Framework for DFT-in-DFT and WF-in-DFT Embedding*,
 > ChemRxiv (2025), preprint. DOI: [10.26434/chemrxiv-2025-c23jf](https://doi.org/10.26434/chemrxiv-2025-c23jf).
 
 If you use this integration, please cite the EmbASI paper above. The projection /
-level-shift embedding scheme it implements originates with:
+level-shift embedding scheme originates with:
 
 > F. R. Manby, M. Stella, J. D. Goodpaster, and T. F. Miller III,
 > *A Simple, Exact Density-Functional-Theory Embedding Scheme*,
-> J. Chem. Theory Comput. **8**, 2564–2568 (2012).
+> J. Chem. Theory Comput. **8**, 2564-2568 (2012).
 > DOI: [10.1021/ct300544e](https://doi.org/10.1021/ct300544e).
 
 EmbASI itself is developed at <https://github.com/tamm-cci/EmbASI>.
 
 ## License
 
-This project is licensed under the [Apache License 2.0](LICENSE). Every source file carries an SPDX license header:
+This project is licensed under the [Apache License 2.0](LICENSE). Every source
+file carries an SPDX license header:
 
-```
+```text
 # Copyright IBM Corp. 2026
 # SPDX-License-Identifier: Apache-2.0
 ```

@@ -373,6 +373,12 @@ def build_adapter(cfg: EmbeddingSetup, *, parallel: bool) -> ProjectionEmbedding
         **({"scf_stability": True} if cfg.scf_stability else {}),
         parallel=parallel,
     )
+    # TODO(embasi-siesta-shim): delete this call with backends/_embasi_compat.py
+    # once EmbASI assigns AB_LL.input_fragment_nelectrons before
+    # construct_embedding_potential runs AB_LL.run_scf().
+    from embasi_qiskit_integration.backends._embasi_compat import prepare_projection_embedding
+
+    prepare_projection_embedding(projection)
     integrals = backend.integrals
     return ProjectionEmbeddingAdapter(
         projection, integrals, mu=cfg.mu, unrestricted=cfg.unrestricted
@@ -650,8 +656,9 @@ class EmbeddingWorkflow(BaseSettings):
     active_atoms: list[int] = [1, 5]  # O and its hydroxyl H -> the OH fragment
     # QM code behind the embedding (see `embasi_qiskit_integration.backends`).  "pyscf"
     # (default) calls PySCF directly; "pyscf-callback" runs the same calculators through the
-    # generic EmbASI-callback route; "siesta" is DFT-in-DFT only and waits on an EmbASI
-    # adapter.  Each backend's own options are refused for the others.
+    # generic EmbASI-callback route; "siesta" is WF-in-DFT only (--xc_hl HF, PBE low level)
+    # through SIESTA's ASI flavour 3 + QCOMP ERIs, needing $ASI_LIB_PATH and asi4py >= 1.4.10.
+    # Each backend's own options are refused for the others.
     qm_code: Literal["pyscf", "pyscf-callback", "siesta"] = "pyscf"
     # --qm_code siesta only: NAO basis size and real-space mesh cutoff (Ry).
     siesta_basis: str = "DZP"
@@ -679,7 +686,9 @@ class EmbeddingWorkflow(BaseSettings):
     # the pair.
     spin_downfold: bool = False
 
-    a_nmos: int | None = None  # Fixes the number of electrons selected by SPADE
+    # Fixes the number of A spatial orbitals selected by SPADE (3 -> 6 electrons
+    # for a closed-shell fragment).  None uses the automatic singular-value gap.
+    a_nmos: int | None = None
     # EmbASI's partition.  "UNO-SPADE" runs SPADE on the doubly occupied unrestricted
     # natural orbitals only and puts every fractional/singly occupied one in A, so the
     # environment is one closed-shell orbital set shared by both spins (with it, a_nmos
@@ -810,6 +819,13 @@ class EmbeddingWorkflow(BaseSettings):
 
     # --- solver / sampling --- #
     solver: Literal["sqd", "fci"] = "sqd"
+    # SQD subspace diagonalizer: IBM/sci-solvers' TorchSCISolver (default), or
+    # qiskit-addon-sqd's selected-CI.  The extra is `sci-solvers`.
+    sci_solver: str = "torch_sci"
+    # None auto-detects CUDA, then Apple MPS, then CPU.
+    torch_sci_device: str | None = None
+    torch_sci_mode: Literal["tpb", "gdb"] = "tpb"
+    torch_sci_apply_ab_projection: bool = False
     handoff: Literal["in-process", "two-process"] = "in-process"
     sampler: SamplerKind = "aer"
     # Which Aer simulator: `--sampler aer` alone does not pin one, and None takes the
@@ -1583,6 +1599,12 @@ class EmbeddingWorkflow(BaseSettings):
             highs_deterministic=self.highs_deterministic,
             workers=self.workers,
             spin_sq=self.target_s2,
+            sci_solver=self.sci_solver,
+            torch_sci_kwargs={
+                "mode": self.torch_sci_mode,
+                "apply_ab_projection": self.torch_sci_apply_ab_projection,
+                **({"device": self.torch_sci_device} if self.torch_sci_device else {}),
+            },
         )
 
     def _solve(self, ham, solver, *, rank, log) -> SolverResult:

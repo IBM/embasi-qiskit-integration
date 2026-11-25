@@ -364,8 +364,13 @@ def test_refused_qm_code_reports_its_reason_before_embasi_is_imported(monkeypatc
 
     monkeypatch.setattr(sys, "argv", ["prog"])
     monkeypatch.setattr(builtins, "__import__", no_embasi)
-    with pytest.raises(NotImplementedError, match="DFT-in-DFT only"):
-        build_adapter(EmbeddingWorkflow(_cli_parse_args=False, qm_code="siesta"), parallel=False)
+    # A refused SIESTA configuration must fail with its own reason, not the
+    # mpi4py/EmbASI import error (--xc_hl HF is now the WF route, so use spin).
+    with pytest.raises(NotImplementedError, match="unpolarized"):
+        build_adapter(
+            EmbeddingWorkflow(_cli_parse_args=False, qm_code="siesta", spin=1, unrestricted=True),
+            parallel=False,
+        )
 
 
 def test_make_backend_refuses_an_unknown_code():
