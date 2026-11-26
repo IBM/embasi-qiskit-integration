@@ -37,9 +37,7 @@ from embasi_qiskit_integration.reference_protocol import (
     variational_hf_in_dft,
 )
 
-_CAPABILITIES = frozenset(
-    {CAP_HCORE, CAP_EXACT_EXCHANGE, CAP_ARBITRARY_DM_VEFF, CAP_ENERGY_ELEC}
-)
+_CAPABILITIES = frozenset({CAP_HCORE, CAP_EXACT_EXCHANGE, CAP_ARBITRARY_DM_VEFF, CAP_ENERGY_ELEC})
 
 
 class OscillatingIntegrals:
@@ -138,9 +136,7 @@ def test_plain_fixed_point_cycles_and_raises():
 def test_damped_mixing_converges_where_the_plain_map_cycles():
     ints = OscillatingIntegrals()
     history: list[SCFIteration] = []
-    dm, fock, energy, iterations = _run(
-        ints, stabilization="mixing", max_iter=120, history=history
-    )
+    dm, fock, energy, iterations = _run(ints, stabilization="mixing", max_iter=120, history=history)
 
     assert iterations < 120
     assert history[-1].converged
@@ -307,9 +303,7 @@ def test_iteration_diagnostics_are_emitted_and_finite():
 def test_potential_and_energy_share_one_evaluation_per_density():
     """Each density is evaluated once, with veff and energy paired."""
     ints = OscillatingIntegrals()
-    _dm, _fock, _energy, iterations = _run(
-        ints, stabilization="mixing", max_iter=120
-    )
+    _dm, _fock, _energy, iterations = _run(ints, stabilization="mixing", max_iter=120)
 
     # Initial density plus one new density per accepted iteration.
     evaluations = iterations + 1
@@ -329,9 +323,7 @@ def test_auto_detects_the_callback_backend_cost_marker():
             density = np.diag(density)
         return Evaluation((density.copy(),), np.eye(2), float(np.trace(density)))
 
-    expensive = CallbackIntegrals(
-        evaluator, evaluator, None, nao=2, cheap_evaluations=False
-    )
+    expensive = CallbackIntegrals(evaluator, evaluator, None, nao=2, cheap_evaluations=False)
     cheap = CallbackIntegrals(evaluator, evaluator, None, nao=2, cheap_evaluations=True)
     assert _external_evaluations(expensive) is True
     assert _external_evaluations(cheap) is False

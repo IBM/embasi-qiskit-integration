@@ -294,9 +294,7 @@ def _validate_stabilization(stabilization: str) -> Stabilization:
     allowed = {"auto", "legacy", "mixing", "anderson", "none"}
     value = str(stabilization).strip().lower()
     if value not in allowed:
-        raise ValueError(
-            f"stabilization must be one of {sorted(allowed)}, got {stabilization!r}"
-        )
+        raise ValueError(f"stabilization must be one of {sorted(allowed)}, got {stabilization!r}")
     return cast(Stabilization, value)
 
 
@@ -405,8 +403,7 @@ def variational_hf_in_dft(
         raise ValueError("conv_tol and density_tol must be positive")
     if converge_on not in {"energy_and_density", "density"}:
         raise ValueError(
-            "converge_on must be 'energy_and_density' or 'density', "
-            f"got {converge_on!r}"
+            f"converge_on must be 'energy_and_density' or 'density', got {converge_on!r}"
         )
     if history_size < 2:
         raise ValueError(f"history_size must be at least 2, got {history_size}")
@@ -457,9 +454,7 @@ def variational_hf_in_dft(
         veff_hf = ints.veff_hf(dm)
 
         fock = h + veff_hf + (fock_ll_total - fock_ll_a) + p_b
-        e_hf = float(
-            np.einsum("ij,ji->", h, dm) + 0.5 * np.einsum("ij,ji->", veff_hf, dm)
-        )
+        e_hf = float(np.einsum("ij,ji->", h, dm) + 0.5 * np.einsum("ij,ji->", veff_hf, dm))
         energy = float(e_hf + e_ll_total - e_ll_a + e_nuc)
         try:
             _eps, coefficients = sla.eigh(fock, s)
@@ -590,18 +585,13 @@ def variational_hf_in_dft(
                 previous = anderson_points[-2]
                 latest = anderson_points[-1]
                 denominator = float(np.einsum("ij,ij->", previous.residual, previous.residual))
-                if (
-                    denominator > _PSD_FLOOR
-                    and previous.residual_norm > 10.0 * density_tol
-                ):
+                if denominator > _PSD_FLOOR and previous.residual_norm > 10.0 * density_tol:
                     lambda_eff = (
                         float(np.einsum("ij,ij->", latest.residual, previous.residual))
                         / denominator
                     )
                     if np.isfinite(lambda_eff) and -2.0 < lambda_eff < 0.98:
-                        target = np.clip(
-                            alpha / (1.0 - lambda_eff), 0.15, 0.9
-                        )
+                        target = np.clip(alpha / (1.0 - lambda_eff), 0.15, 0.9)
                         adjusted = float(np.clip(0.5 * alpha + 0.5 * target, 0.15, 0.9))
                         if abs(adjusted - alpha) > 0.03:
                             emit(
@@ -664,11 +654,7 @@ def variational_hf_in_dft(
             dDmax=dDmax,
             residual=new.residual_norm,
             step_norm=step_norm,
-            mode=(
-                "anderson"
-                if used_anderson
-                else ("mixing" if mode == "anderson" else mode)
-            ),
+            mode=("anderson" if used_anderson else ("mixing" if mode == "anderson" else mode)),
             mix_alpha=step_alpha,
             converged=converged,
         )
@@ -679,8 +665,7 @@ def variational_hf_in_dft(
             f"SCF-in-SCF iter {iteration:3d}: E={new.energy:.10f} Ha "
             f"dE={delta_energy:+.3e} dDmax={dDmax:.3e} "
             f"residual={new.residual_norm:.3e} step={step_norm:.3e} "
-            f"mode={record.mode}"
-            + ("" if step_alpha is None else f" alpha={step_alpha:.3f}")
+            f"mode={record.mode}" + ("" if step_alpha is None else f" alpha={step_alpha:.3f}")
         )
 
         if new.residual_norm < best_point.residual_norm:
@@ -703,9 +688,11 @@ def variational_hf_in_dft(
             # Adaptive damping / rollback.
             # -------------------------------------------------------------- #
             assert alpha is not None
-            if new.residual_norm > rollback_factor * max(
-                best_point.residual_norm, _PSD_FLOOR
-            ) and new.residual_norm > 100.0 * density_tol and best_point is not new:
+            if (
+                new.residual_norm > rollback_factor * max(best_point.residual_norm, _PSD_FLOOR)
+                and new.residual_norm > 100.0 * density_tol
+                and best_point is not new
+            ):
                 alpha = max(alpha * 0.5, 0.05)
                 anderson_points = [best_point]
                 stall = 0
@@ -744,9 +731,7 @@ def variational_hf_in_dft(
                 and current.residual_norm > 100.0 * density_tol
             )
             diverged = (
-                current.residual_norm > rollback_factor * max(
-                    best_point.residual_norm, _PSD_FLOOR
-                )
+                current.residual_norm > rollback_factor * max(best_point.residual_norm, _PSD_FLOOR)
                 and current.residual_norm > 100.0 * density_tol
             )
             if cycle or stagnated or diverged:
@@ -765,10 +750,7 @@ def variational_hf_in_dft(
                     f"(alpha={alpha:.3f}, residual={best_point.residual_norm:.3e})"
                 )
 
-    message = (
-        f"variational HF-in-DFT SCF for subsystem A did not converge in {max_iter} "
-        "iterations"
-    )
+    message = f"variational HF-in-DFT SCF for subsystem A did not converge in {max_iter} iterations"
     if allow_unconverged:
         warnings.warn(
             message + "; returning the last density (allow_unconverged=True)",
