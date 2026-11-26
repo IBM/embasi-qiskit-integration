@@ -437,8 +437,11 @@ def build_selector(
       CL locality pre-filter then APC ranking, see
       ``ProjectionEmbeddingAdapter.build_orbitals_apc_concentric``,
     * ``avas`` -> an ``orbital_builder``: occupied and virtual blocks projected onto
-      the fragment's ``avas_ao_labels`` AOs, see
+      the fragment's ``avas_ao_labels`` AOs in a MINAO reference basis, see
       ``ProjectionEmbeddingAdapter.build_orbitals_avas``,
+    * ``ao-avas`` -> the same builder with the target AOs matched in the *working*
+      basis (``selectors.fragment_ao_projector``); labels are optional (None targets
+      every AO of the active fragment, the portable SIESTA path),
     * ``none`` -> ``(None, None, None)``.
 
     A rotation cannot be expressed as a column-index ``Selector``, so ``spade``
@@ -492,22 +495,48 @@ def build_selector(
             )
 
         return None, None, _uno_builder
-    if cfg.selector == "avas":
-        if not cfg.avas_ao_labels:
-            raise ValueError(
-                "--selector avas requires --avas_ao_labels, the target valence AOs "
-                '(e.g. \'["C 2p", "O 2p"]\' or \'["Fe 3d"]\')'
-            )
-        from embasi_qiskit_integration.selectors import avas_ao_projector
+    if cfg.selector in ("avas", "ao-avas"):
+        from embasi_qiskit_integration.selectors import (
+            avas_ao_projector,
+            fragment_ao_projector,
+        )
 
         # After the atom reorder the active atoms come first, so the targets are
         # restricted to the fragment's own copies of the labelled AOs.
-        ao_projector = avas_ao_projector(
-            emb.ints,
-            cfg.avas_ao_labels,
-            atoms=range(len(cfg.active_atoms)),
-            minao=cfg.avas_minao,
-        )
+        fragment_atoms = range(len(cfg.active_atoms))
+        if cfg.selector == "avas":
+            if not cfg.avas_ao_labels:
+                raise ValueError(
+                    "--selector avas requires --avas_ao_labels, the target valence AOs "
+                    '(e.g. \'["C 2p", "O 2p"]\' or \'["Fe 3d"]\')'
+                )
+            ao_projector = avas_ao_projector(
+                emb.ints,
+                cfg.avas_ao_labels,
+                atoms=fragment_atoms,
+                minao=cfg.avas_minao,
+            )
+            projector_label = f"minao:{cfg.avas_minao}"
+        else:
+            # Same-basis sibling: no MINAO capability, and no AO labels at all are
+            # needed when the backend cannot report shell labels (SIESTA).  In that
+            # case every AO of the active fragment is the target -- on a
+            # pseudopotential/NAO basis those are valence functions.
+            ao_projector = fragment_ao_projector(emb.ints, cfg.avas_ao_labels, atoms=fragment_atoms)
+            projector_label = "working-basis fragment AOs"
+            if log is not None:
+                if cfg.avas_ao_labels:
+                    log(
+                        "   [selector] ao-avas: target AOs "
+                        f"{list(cfg.avas_ao_labels)} on the active fragment"
+                    )
+                else:
+                    log(
+                        "   [selector] ao-avas: no --avas_ao_labels; targeting every AO "
+                        "of the active fragment (portable SIESTA/NAO choice)"
+                    )
+
+        selector_name = cfg.selector
 
         def _avas_builder(
             emb,
@@ -517,30 +546,44 @@ def build_selector(
             n_frozen_occ=cfg.n_frozen_occ,
             use_relaxed=use_relaxed,
             spin=False,
+            selector_name=selector_name,
+            projector_label=projector_label,
         ):
             if spin:
                 # Per-spin: each channel selected on its own; only norb is shared, so the
                 # threshold cut (which cannot promise a common count) is not available.
                 if max_size is None:
                     raise ValueError(
-                        "--selector avas with --spin_downfold needs --avas_max_size, as "
-                        "(nelec,norb) or (nelec_alpha,nelec_beta,norb): the two channels are "
-                        "selected independently but must share an active-orbital count, "
-                        "which a per-channel threshold cannot guarantee"
+                        f"--selector {selector_name} with --spin_downfold needs "
+                        "--avas_max_size, as (nelec,norb) or (nelec_alpha,nelec_beta,norb): "
+                        "the two channels are selected independently but must share an "
+                        "active-orbital count, which a per-channel threshold cannot guarantee"
                     )
-                return emb.build_orbitals_avas_spin(
+                orbitals = emb.build_orbitals_avas_spin(
                     ao_projector=ao_projector,
                     max_size=max_size,
                     n_frozen_occ=n_frozen_occ,
                     use_relaxed=use_relaxed,
                 )
-            return emb.build_orbitals_avas(
-                ao_projector=ao_projector,
-                threshold=threshold,
-                max_size=max_size,
-                n_frozen_occ=n_frozen_occ,
-                use_relaxed=use_relaxed,
-            )
+            else:
+                orbitals = emb.build_orbitals_avas(
+                    ao_projector=ao_projector,
+                    threshold=threshold,
+                    max_size=max_size,
+                    n_frozen_occ=n_frozen_occ,
+                    use_relaxed=use_relaxed,
+                )
+            # Record how the target AO space was defined, for the run log / diagnostics.
+            # The builder is the single place that knows; build_orbitals_avas only sees
+            # an opaque metric.  Spin returns a per-channel info dict; annotate both.
+            info = getattr(emb, "_avas_info", None)
+            if isinstance(info, dict):
+                info["selector"] = selector_name
+                info["projector"] = projector_label
+                for channel in info.get("channels", ()):
+                    channel["selector"] = selector_name
+                    channel["projector"] = projector_label
+            return orbitals
 
         return None, None, _avas_builder
     from embasi_qiskit_integration.selectors import (
@@ -663,6 +706,10 @@ class EmbeddingWorkflow(BaseSettings):
     # --qm_code siesta only: NAO basis size and real-space mesh cutoff (Ry).
     siesta_basis: str = "DZP"
     siesta_mesh_cutoff: float = 200.0
+    # SIESTA PAO.EnergyShift in eV.  A smaller value gives less-confined,
+    # more diffuse NAOs; 0.1 eV is the ASE/SIESTA default, 0.01-0.05 eV is a
+    # tighter near-limit setting.
+    siesta_energy_shift: float = 0.1
     basis: str = "sto-3g"  # matches the EmbASI developers' example
     xc_ll: str = "PBE"
     # HF high level -> the WF-in-DFT path (the SQD integration this package is
@@ -698,21 +745,27 @@ class EmbeddingWorkflow(BaseSettings):
     # projects onto the fragment's valence p AOs (same chemical orbitals at every geometry),
     # "apc-fragment" ranks fragment-local orbitals by APC, "apc" ranks all of A by APC.
     uno_fill: Literal["avas", "apc-fragment", "apc"] = "avas"
-    # ``--uno_fill avas`` and ``--selector avas``: the fragment AOs projected onto, as PySCF
-    # AVAS labels (e.g. ["Fe 3d", "C 2p", "O 2p"]); restricted to the fragment's atoms.
-    # Required by ``--selector avas``.  For the UNO fill, None -> the fragment's p shells
-    # (right for C/N/O pi and sigma bonds, not for a transition metal).
+    # ``--uno_fill avas``, ``--selector avas`` and ``--selector ao-avas``: the fragment AOs
+    # projected onto, as AO labels (e.g. ["Fe 3d", "C 2p", "O 2p"]); restricted to the
+    # fragment's atoms.  Required by ``--selector avas`` (MINAO labels).  For
+    # ``--selector ao-avas`` the labels are matched in the working basis; None targets
+    # every AO of the active fragment, the portable fallback for SIESTA (whose ASI
+    # descriptors report no shell labels).  For the UNO fill, None -> the fragment's p
+    # shells (right for C/N/O pi and sigma bonds, not for a transition metal).
     avas_ao_labels: list[str] | None = None
-    # ``--selector avas`` only: keep orbitals whose weight on the target AOs exceeds this
-    # (PySCF's default), and match the labels in this minimal reference basis.
+    # ``--selector avas``/``ao-avas``: keep orbitals whose weight on the target AOs
+    # exceeds this (PySCF's default).  ``avas`` matches the labels in this minimal
+    # reference basis; ``ao-avas`` ignores it (same working basis).
     avas_threshold: float = 0.2
     avas_minao: str = "minao"
-    # ``--selector avas`` only: a fixed (nelec, norb) active space filled with the
+    # ``--selector avas``/``ao-avas``: a fixed (nelec, norb) active space filled with the
     # highest-weight orbitals instead of the threshold cut, so the size cannot change
     # between cycles or along a scan.  Singly occupied orbitals count towards both and
     # are always kept.  None -> the threshold sets the size.  With --spin_downfold the
     # alpha and beta channels are selected independently to a common norb and this is
     # required; (nelec_alpha, nelec_beta, norb) sets the per-spin split explicitly.
+    # For ``ao-avas`` this is the recommended mode: the occupied candidates left after
+    # ``n_frozen_occ`` are ranked by fragment-AO weight, not by canonical energy.
     avas_max_size: tuple[int, ...] | None = None
     # UNO-SPADE only: fix the number of doubly occupied natural orbitals in the environment,
     # so B is the same size at every geometry of a scan (A takes the rest).  The doubly
@@ -736,6 +789,10 @@ class EmbeddingWorkflow(BaseSettings):
     # (`init_guess`, `init_guess_breaksym`, `scf_newton`, `density_fit`, `df_auxbasis` are
     # PySCF-backend options; `scf_max_cycle` is honoured by every backend.)
     scf_max_cycle: int | None = None  # SCF iteration cap (PySCF default 50)
+    # PySCF only: write SCF checkpoints here.  EmbASI runs several SCFs per geometry
+    # (AB_LL, A_LL, ...), so the last SCF written wins; the file is still a valid
+    # PySCF chkfile for the final layer and can seed a later `init_guess`.
+    scf_chkfile_out: Path | None = None
     # Starting guess for each SCF: "minao" (PySCF default), "atom", "huckel", "1e", ...
     init_guess: str | None = None
     # Unrestricted runs at 2S = 0 only: how PySCF breaks alpha/beta symmetry in the guess.
@@ -752,6 +809,11 @@ class EmbeddingWorkflow(BaseSettings):
     scf_stability: bool = False
 
     # --- active space: solver budget only, not embedding physics --- #
+    # ``avas``/``ao-avas``: the lowest ``n_frozen_occ`` occupied orbitals are excluded
+    # from the AO-weighted candidate pool and always frozen; with a fixed
+    # ``avas_max_size`` the remaining occupied candidates are ranked by target-AO weight
+    # and the rest become the core.  Set it to the true core count (e.g. 2 for the N/C
+    # 1s pair in an all-electron basis); 0 is right for a pseudopotential basis.
     n_frozen_occ: int = 0
     n_virtual: int | None = None  # solver-budget cap; None -> the selector's own count
     #   (``mulliken``: per-fragment cap; ``spade``: after the σ² gap; ``concentric-cl``:
@@ -767,9 +829,21 @@ class EmbeddingWorkflow(BaseSettings):
     # supersedes ``n_frozen_occ``.  ``avas`` keeps the occupied and virtual orbitals that
     # project onto ``avas_ao_labels`` above ``avas_threshold``, or the highest-weight ones up
     # to ``avas_max_size`` (``n_frozen_occ`` sets its core, ``n_virtual`` is not used).
+    # ``ao-avas`` is the same selection with the target AOs matched in the *working* basis
+    # instead of a MINAO reference (see ``fragment_ao_projector``).  It is the portable
+    # AO-defined option: without labels it targets every AO of the active fragment, which
+    # works on SIESTA's NAO basis, and with ``avas_max_size`` it keeps fixed occupied and
+    # virtual counts ranked by fragment-AO weight rather than by canonical energy.
     # ``none`` disables.  See ``selectors`` for the papers.
     selector: Literal[
-        "none", "mulliken", "spade", "concentric-cl", "apc-concentric", "uno", "avas"
+        "none",
+        "mulliken",
+        "spade",
+        "concentric-cl",
+        "apc-concentric",
+        "uno",
+        "avas",
+        "ao-avas",
     ] = "concentric-cl"
     # ``concentric-cl``/``apc-concentric`` only: Fock shell expansions after shell 0.
     # 0 keeps just the fragment-spanned shell; higher values grow the candidate space
@@ -784,6 +858,8 @@ class EmbeddingWorkflow(BaseSettings):
     # outer loop.  "reference": the reference implementation's single-shot protocol -- a
     # variational HF-in-DFT SCF-in-SCF for A, then the active-space correlation on top
     # (see reference_protocol); needs --max_cycles 1, --n_frozen_occ and --n_virtual.
+    # The reference path builds its own canonical concentric active space, so it ignores
+    # --selector (including ao-avas); the benchmark runner refuses that combination.
     wf_in_dft_energy: Literal["first-order", "reference"] = "first-order"
     # ``apc-concentric`` only: APC's active-space budget, as (nelec, norb).  Required
     # when selector="apc-concentric"; inert otherwise.
@@ -820,7 +896,8 @@ class EmbeddingWorkflow(BaseSettings):
     # --- solver / sampling --- #
     solver: Literal["sqd", "fci"] = "sqd"
     # SQD subspace diagonalizer: IBM/sci-solvers' TorchSCISolver (default), or
-    # qiskit-addon-sqd's selected-CI.  The extra is `sci-solvers`.
+    # qiskit-addon-sqd's selected-CI.  A spin-dependent Hamiltonian
+    # automatically uses the torch-sci spin-orbital path.
     sci_solver: str = "torch_sci"
     # None auto-detects CUDA, then Apple MPS, then CPU.
     torch_sci_device: str | None = None
@@ -928,7 +1005,14 @@ class EmbeddingWorkflow(BaseSettings):
         # SPADE/Pipek-Mezey localisation, and the embedded Fock all run in here.
         emb.run_low_level(a_nmos=self.a_nmos)
         if self.wf_in_dft_energy == "reference":
-            output = self._reference_wf_in_dft(emb, rank=rank, log=log)
+            output = self._reference_wf_in_dft(
+                emb,
+                rank=rank,
+                log=log,
+                run_id=run_id,
+                geometry_file=geometry_file,
+                geometry_parameter=geometry_parameter,
+            )
             if self.output_path is not None:
                 with self.output_path.open("a") as out:
                     out.write(f"{self.xyz}; {output.total}\n")
@@ -962,7 +1046,9 @@ class EmbeddingWorkflow(BaseSettings):
 
         return output
 
-    def _reference_wf_in_dft(self, emb, *, rank, log):
+    def _reference_wf_in_dft(
+        self, emb, *, rank, log, run_id: str, geometry_file: str, geometry_parameter: float | None
+    ):
         """Single-shot WF-in-DFT with the reference implementation's energy.
 
         See :mod:`~embasi_qiskit_integration.reference_protocol`: a variational HF-in-DFT
@@ -998,6 +1084,36 @@ class EmbeddingWorkflow(BaseSettings):
         result = self._solve(ham, self._build_solver(), rank=rank, log=log)
         correlation = result.energy - info.e_variational
         log(f"   E_solver + e_core = {result.energy:.6f} Ha (correlation {correlation:.6f} Ha)")
+        if self.diagnostics_csv is not None and rank == 0:
+            from embasi_qiskit_integration.diagnostics_csv import append_diagnostics_row
+
+            append_diagnostics_row(
+                self.diagnostics_csv,
+                {
+                    "run_id": run_id,
+                    "geometry_file": geometry_file,
+                    "geometry_parameter": geometry_parameter,
+                    "algorithm": "FCI" if self.solver == "fci" else "SQD",
+                    "backend_name": "",
+                    "cycle": 0,
+                    "converged": True,
+                    "total_cycles": 1,
+                    "cas_norb": int(ham.norb),
+                    "cas_nelec": int(sum(ham.nelec)),
+                    "selector": "reference",
+                    "norb": int(ham.norb),
+                    "nelec_alpha": int(ham.nelec[0]),
+                    "nelec_beta": int(ham.nelec[1]),
+                    "E_solver": float(result.energy),
+                    "E_low_total": float(info.e_variational),
+                    "E_low_A": 0.0,
+                    "E_high_A": float(correlation),
+                    "e_core": float(ham.e_core),
+                    "correction": 0.0,
+                    "embedding_energy": float(info.e_variational + correlation),
+                    "rdm1_trace": float(np.trace(result.rdm1)),
+                },
+            )
         return ProjectionEnergy(
             e_low_total=info.e_variational,
             e_low_A=0.0,
@@ -1081,7 +1197,8 @@ class EmbeddingWorkflow(BaseSettings):
         whose coefficients adapt to the residual history; ``mix_alpha`` still governs the
         bootstrap cycle and any singular subspace.
 
-        ``orbital_builder`` (``selector="apc-concentric"``, ``"avas"`` or ``"uno"``) bypasses
+        ``orbital_builder`` (``selector="apc-concentric"``, ``"avas"``, ``"ao-avas"``
+        or ``"uno"``) bypasses
         ``emb.build_orbitals`` entirely: the builder calls it internally and returns the
         finished ``EmbeddedOrbitals``, so ``selector``/``virtual_localizer`` are ``None``
         with it.
@@ -1114,9 +1231,10 @@ class EmbeddingWorkflow(BaseSettings):
                         f"spin_downfold=True does not support selector={self.selector!r}: "
                         "index selection (mulliken) ranks columns against one spin-summed "
                         "Fock, which mixes the channels. Use --selector none, spade, "
-                        "concentric-cl, apc-concentric, uno or avas, or cap with --n_virtual."
+                        "concentric-cl, apc-concentric, uno, avas or ao-avas, or cap with "
+                        "--n_virtual."
                     )
-                if orbital_builder is not None and self.selector == "avas":
+                if orbital_builder is not None and self.selector in ("avas", "ao-avas"):
                     # Independent per-channel selection (`build_orbitals_avas_spin`): no
                     # pairing, so the principal cosines are the only cross-spin check.
                     spin_orbitals = orbital_builder(emb, spin=True)
@@ -1127,9 +1245,10 @@ class EmbeddingWorkflow(BaseSettings):
                         w_occ_s = " ".join(f"{w:.3f}" for w in w_occ) or "-"
                         w_virt_s = " ".join(f"{w:.3f}" for w in w_virt) or "-"
                         log(
-                            f"   selector=avas {name}: kept {ch['n_active_occ']} occupied "
-                            f"(weights {w_occ_s}) and {ch['n_active_virt']} virtual "
-                            f"(weights {w_virt_s}); froze {ch['n_frozen']}"
+                            f"   selector={self.selector} {name}: kept "
+                            f"{ch['n_active_occ']} occupied (weights {w_occ_s}) and "
+                            f"{ch['n_active_virt']} virtual (weights {w_virt_s}); "
+                            f"froze {ch['n_frozen']}"
                         )
                     log(
                         f"   alpha/beta active spaces: principal cosines "
@@ -1202,7 +1321,7 @@ class EmbeddingWorkflow(BaseSettings):
                 log(f"   {orbitals}")
             if self.spin_downfold:
                 pass  # already logged per channel above
-            elif orbital_builder is not None and self.selector == "avas":
+            elif orbital_builder is not None and self.selector in ("avas", "ao-avas"):
                 info = emb._avas_info
                 w_occ = " ".join(
                     f"{w:.3f}" for w in info["occ_weights"][::-1][: info["n_active_occ"]]
@@ -1213,8 +1332,10 @@ class EmbeddingWorkflow(BaseSettings):
                     if self.avas_max_size is None
                     else f"max_size={self.avas_max_size}"
                 )
+                labels = self.avas_ao_labels or "<all fragment AOs>"
                 log(
-                    f"   selector=avas ({self.avas_ao_labels}, {cut}) "
+                    f"   selector={self.selector} ({labels}, {cut}; "
+                    f"{info.get('projector', '?')}) "
                     f"kept {info['n_active_occ']} occupied (weights {w_occ or '-'}), "
                     f"{info['n_somo']} singly occupied and {info['n_active_virt']} virtual "
                     f"(weights {w_virt or '-'}); froze {orbitals.inactive.size} occupied"

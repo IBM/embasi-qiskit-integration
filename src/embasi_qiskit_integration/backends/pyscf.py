@@ -12,6 +12,7 @@ through the :class:`~embasi_qiskit_integration.backends.base.AOIntegrals` protoc
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -399,6 +400,46 @@ class PySCFIntegrals(PySCFBasis):
 # --------------------------------------------------------------------------- #
 # Calculator construction (``--qm_code pyscf``)
 # --------------------------------------------------------------------------- #
+def _preserve_scf_state_on_deepcopy(mf: Any, chkfile: str | None = None) -> None:
+    """Keep PySCF runtime state that its pickle protocol drops across EmbASI copies.
+
+    PySCF's ``__getstate__`` excludes ``chkfile``, ``_opt`` and related attributes,
+    and ``__setstate__`` nulls them.  EmbASI deepcopies each SCF object for every
+    layer, so:
+    * a requested checkpoint would disappear (the ``--scf_chkfile_out`` bug), and
+    * ``_opt=None`` leaves the direct-SCF path broken for larger Gaussian bases
+      (``AttributeError: 'NoneType' object has no attribute 'get'`` on def2-TZVP).
+
+    Preserve both in a private subclass; the SCF type is otherwise unchanged.
+    """
+    base = type(mf)
+    original_get = base.__getstate__
+    original_set = base.__setstate__
+
+    class _EmbasiSCF(base):  # type: ignore[misc, valid-type]
+        __module__ = base.__module__
+
+        def __getstate__(self):
+            state = original_get(self)
+            state["_embasi_opt"] = self._opt
+            if chkfile:
+                state["_embasi_chkfile"] = chkfile
+            return state
+
+        def __setstate__(self, state):
+            opt = state.pop("_embasi_opt", None)
+            saved_chkfile = state.pop("_embasi_chkfile", None)
+            original_set(self, state)
+            self._opt = opt
+            if saved_chkfile:
+                self.chkfile = saved_chkfile
+
+    _EmbasiSCF.__name__ = base.__name__
+    mf.__class__ = _EmbasiSCF
+    if chkfile:
+        mf.chkfile = str(chkfile)
+
+
 def _pyscf_mean_fields(atoms: Any, charge: int, cfg: Any) -> tuple[Any, Any, Any]:
     """``(mol, mf_ll, mf_hl)`` for ``atoms``, configured from the workflow settings.
 
@@ -441,6 +482,14 @@ def _pyscf_mean_fields(atoms: Any, charge: int, cfg: Any) -> tuple[Any, Any, Any
     # Read with a default so drivers whose settings predate the flag are unaffected.
     if getattr(cfg, "scf_newton", False):
         mf_ll = mf_ll.newton()
+    chkfile = getattr(cfg, "scf_chkfile_out", None)
+    path: str | None = None
+    if chkfile:
+        resolved = Path(chkfile).expanduser()
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        path = str(resolved)
+    for mf in (mf_ll, mf_hl):
+        _preserve_scf_state_on_deepcopy(mf, path)
     return mol, mf_ll, mf_hl
 
 
@@ -448,6 +497,7 @@ def _pyscf_mean_fields(atoms: Any, charge: int, cfg: Any) -> tuple[Any, Any, Any
     "pyscf",
     backend_only_settings={
         "scf_newton": False,
+        "scf_chkfile_out": None,
         "init_guess": None,
         "init_guess_breaksym": None,
         "density_fit": False,

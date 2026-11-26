@@ -229,6 +229,11 @@ class CallbackIntegrals:
         self._nuclear_energy = nuclear_energy
         self._high_level_reference = high_level_reference
         self._zero: dict[str, Evaluation] = {}
+        # Last density -> mean-field channels per level.  The WF workflow reads
+        # veff_ll(gamma_A) twice in one energy assembly (h_emb then v_emb); the
+        # evaluator is deterministic, so reuse it instead of another ASI/SCF run.
+        self._veff_cache: dict[str, tuple[tuple[bytes, ...], tuple[np.ndarray, ...]]] = {}
+        self._eval_cache: dict[str, tuple[tuple[bytes, ...], Evaluation]] = {}
 
     # ---------------- capabilities ---------------- #
     @property
@@ -314,14 +319,35 @@ class CallbackIntegrals:
         return self._at_zero("ll").energy
 
     def energy_elec_ll(self, dm: np.ndarray) -> float:
-        return self._eval_ll(np.asarray(dm)).energy - self._at_zero("ll").energy
+        return self._evaluate("ll", np.asarray(dm)).energy - self._at_zero("ll").energy
 
     # ---------------- mean-field potentials ---------------- #
+    @staticmethod
+    def _density_key(dm: DensityArg) -> tuple[bytes, ...]:
+        blocks = dm if isinstance(dm, tuple) else (dm,)
+        return tuple(
+            np.ascontiguousarray(np.asarray(block, dtype=float)).tobytes() for block in blocks
+        )
+
+    def _evaluate(self, which: str, dm: DensityArg) -> Evaluation:
+        key = self._density_key(dm)
+        cached = self._eval_cache.get(which)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        ev = {"ll": self._eval_ll, "hl": self._eval_hl}[which](dm)
+        self._eval_cache[which] = (key, ev)
+        return ev
+
     def _veff_channels(self, which: str, dm: DensityArg) -> tuple[np.ndarray, ...]:
-        ev = {"ll": self._eval_ll, "hl": self._eval_hl}[which]
-        h = ev(dm).hamiltonian
+        key = self._density_key(dm)
+        cached = self._veff_cache.get(which)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        h = self._evaluate(which, dm).hamiltonian
         h0 = self._at_zero(which).hamiltonian
-        return tuple(hs - h0s for hs, h0s in zip(h, h0, strict=True))
+        channels = tuple(hs - h0s for hs, h0s in zip(h, h0, strict=True))
+        self._veff_cache[which] = (key, channels)
+        return channels
 
     @staticmethod
     def _mean(channels: tuple[np.ndarray, ...]) -> np.ndarray:

@@ -160,12 +160,12 @@ per-spin leak ~2e-10, ``E_solver = -53.522493`` Ha.
   *count* does not freeze corresponding orbitals) and is validated against the narrower
   channel, with a warning when a frozen pair's ``|<a_i|S|b_i>|`` drops below
   ``_FROZEN_OVERLAP_TOL``.
-* **Only FCI consumes the pair.**  SQD's ``diagonalize_fermionic_hamiltonian`` and the
-  FCIDUMP format each take a single one-body tensor; both fall back to the spin-averaged
-  ``h1`` and warn.  ``h2_spin`` is likewise FCI-only.  This is an upstream
-  ``qiskit-addon-sqd`` limitation (no UHF entry point, and its ``sci_solver`` hook
-  receives the tensor already substituted), not something fixable here -- see
-  ``port.md``.
+* **FCI and the default torch-sci SQD path consume the pair.**  The default
+  ``torch_sci`` solver automatically maps a spin-dependent
+  ``(h1a, h1b, h2_spin)`` set to a ``2*norb`` spin-orbital Hamiltonian and uses
+  torch-sci's spinless engine; other selected SQD solvers raise instead of
+  silently averaging.  The path does not support ``spin_sq`` and needs the
+  dense ``(2*norb)^4`` ERI.  The FCIDUMP format remains spin-averaged.
 * **The energy terms are contracted per channel, and the totals derived from them.**
   Every density-linear term in :meth:`projection_energy` contracts each channel against
   *its own* ``v_emb``/``P_B`` (:meth:`v_emb_spin`, ``_p_b_spin``) and sums, because that
@@ -2197,7 +2197,13 @@ class ProjectionEmbeddingAdapter:
             max_size: fixed ``(nelec, norb)`` active space, filled by projected weight
                 instead of cut at ``threshold``.  ``None`` (default) -> threshold cut.
             n_frozen_occ: lowest doubly occupied orbitals excluded from the projection
-                and always frozen (PySCF's ``ncore``).
+                and always frozen (PySCF's ``ncore``).  With a fixed ``max_size`` the
+                remaining occupied candidates are ranked by target-AO weight and the
+                lowest-weight ones are frozen too, so this is a *floor* on the core --
+                the ``--selector ao-avas`` reading.  (If ``n_frozen_occ`` leaves exactly
+                the requested number of occupied candidates, they are forced and the
+                selection falls back to the canonical energy order -- the behaviour
+                ``ao-avas`` exists to avoid, hence its recommended ``n_frozen_occ=0``.)
             restrict_to_a: forwarded to :meth:`build_orbitals` -- a pure performance
                 knob, ``False`` only needed against a stub adapter without live EmbASI.
             use_relaxed: diagonalize the relaxed embedded-HF Fock from

@@ -29,7 +29,7 @@ extra:
 | `quantum` | `qiskit`, `qiskit-aer`, `qiskit-addon-sqd`, `ffsim` | `SQDSolver`, Aer sampling |
 | `fermions` | `qiskit-fermions>=0.3.1,<0.4` | SqDRIFT circuits (any non-mock SQD run) |
 | `relabel` | `pyomo`, `highspy`, `ortools` | [mode relabeling](#mode-relabeling-optimize); required by `SQDSolver`'s default `optimize=True` |
-| `sci-solvers` | `sci-solvers` + `torch-sci-solver[sqd]` from [IBM/sci-solvers](https://github.com/IBM/sci-solvers); pulls `torch`; Python ≥3.12 | non-`qiskit` `--sci_solver` choices (default `torch_sci`) |
+| `sci-solvers` | `sci-solvers` + `torch-sci-solver[sqd]` from [IBM/sci-solvers](https://github.com/IBM/sci-solvers); pulls `torch`; Python ≥3.12 | `torch_sci` (default) and the other `--sci_solver` backends |
 | `hardware` | `qiskit-ibm-runtime`, `samplomatic` | `RuntimeSampler`, readout characterisation |
 | `embed` | EmbASI (git, `qm-code-adapter`) and its ASI stack (`ase`, `asi4py`, `mpi4py`, `scalapack4py`) | `scripts/embedding_workflow.py`, EmbASI-marked tests |
 | `siesta` | `asi4py` git pin (ASI flavour 3) + `h5py` | `--qm_code siesta` (SIESTA itself is not a Python dependency) |
@@ -91,8 +91,11 @@ print(res.energy)  # within 2e-3 Ha of FCI
 ```
 
 `SQDSolver` defaults to `sci_solver="torch_sci"` (the `sci-solvers` extra) and
-`optimize=True` (the `relabel` extra). Pass `sci_solver="qiskit"` for
-qiskit-addon-sqd's PySCF path. For an offline, deterministic run,
+`optimize=True` (the `relabel` extra). The dependency-free baseline is
+`sci_solver="qiskit_addon_sqd"`: qiskit-addon-sqd's own `solve_sci`/PySCF
+selected-CI path. The baseline comes first because it needs no optional solver
+package; `torch_sci` is the default public path added on top of it. For an
+offline, deterministic run,
 `MockSampler("tests/data/mock_counts.json")` has the same sampler interface.
 
 #### Torch-SCI subspace diagonalizer
@@ -125,6 +128,16 @@ The device auto-detects CUDA, then Apple MPS, then CPU; override it with
 `torch_sci_mode` is `tpb` (default) or `gdb`, and `--torch_sci_apply_ab_projection`
 exposes the engine's αβ projection. Without the extra, the torch path raises an
 install hint and its test skips.
+
+For a spin-dependent Hamiltonian (`h1a`/`h1b`, optionally `h2_spin`), the default
+`torch_sci` path automatically switches to a spin-orbital formulation: it maps the
+spatial batches to `2*norb` spin-orbitals and calls torch-sci's spinless engine, so
+the exact spin-dependent tensors are used instead of the ROHF-like spin average.
+This is automatic for the default `torch_sci`; another selected solver raises a
+clear error for a spin-dependent Hamiltonian instead of silently averaging it.
+`spin_sq` projection is not supported on this path, and the dense `(2*norb)^4`
+ERI makes it most suitable for moderate active spaces. `torch_sci_mode="gdb"` is
+not used for this spin path.
 
 #### Aer simulation methods
 
@@ -218,8 +231,8 @@ A bare `solve` uses the runtime sampler and needs configured credentials; use
 Output is `<jobdir>/result.npz` (or `result.ERROR` on failure). CLI defaults are
 `--shots 1000` per circuit, `--optimization_level 1`, `--seed 42`; `--watch`
 waits for `job.fcidump` (default timeout 300 s). SQD defaults to
-`sci_solver="torch_sci"` (the `sci-solvers` extra); pass `--sci_solver qiskit`
-for qiskit-addon-sqd's PySCF path.
+`sci_solver="torch_sci"` (the `sci-solvers` extra); pass
+`--sci_solver qiskit_addon_sqd` for qiskit-addon-sqd's built-in PySCF path.
 
 **`--sqd_method`** selects how the SqDRIFT ansatz is built (also accepted by
 `scripts/embedding_workflow.py`):
@@ -288,7 +301,16 @@ uv run python scripts/embedding_workflow.py --xc_hl PBE0           # DFT-in-DFT 
 
 By default it takes the WF-in-DFT path (`--xc_ll PBE`, `--xc_hl HF`) with the
 `concentric-cl` selector. A Kohn-Sham `--xc_hl` (PBE0/PBE) routes DFT-in-DFT,
-where the solver and selector are inert.
+where the solver and selector are inert. PySCF runs can write an SCF checkpoint
+with `--scf_chkfile_out path.chk`; EmbASI runs several layers, so the last one
+written wins, but the file is a normal PySCF chkfile and can seed a later
+`--init_guess chkfile`.
+
+[`benchmarks/`](benchmarks/README.md) holds the 12-atom butyronitrile
+C-CN dissociation scan from Rossmannek *et al.*, plus two scripts that run the
+same PBE/HF + FCI protocol through PySCF and SIESTA and compare their relative
+energies and embedding corrections. The bundled geometries are plain XYZ text;
+FCI keeps sampling noise out of the cross-code comparison.
 
 #### Per-cycle diagnostics to CSV (`--diagnostics_csv`)
 
@@ -656,6 +678,15 @@ level-shift embedding scheme originates with:
 > DOI: [10.1021/ct300544e](https://doi.org/10.1021/ct300544e).
 
 EmbASI itself is developed at <https://github.com/tamm-cci/EmbASI>.
+
+The butyronitrile geometries under [`benchmarks/data/butyronitrile/`](benchmarks/data/butyronitrile/)
+are from:
+
+> M. Rossmannek, F. Pavošević, A. Rubio, and I. Tavernelli,
+> *Quantum Embedding Method for the Simulation of Strongly Correlated Systems
+> on Quantum Computers*, J. Phys. Chem. Lett. **14**, 3491-3497 (2023).
+> DOI: [10.1021/acs.jpclett.3c00330](https://doi.org/10.1021/acs.jpclett.3c00330),
+> arXiv: [2302.03052](https://arxiv.org/abs/2302.03052).
 
 ## License
 

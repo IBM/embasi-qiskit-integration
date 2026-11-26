@@ -225,7 +225,7 @@ def test_zero_density_reference_is_cached():
     ints.energy_nuc()
     ints.veff_ll(np.eye(2))
     ints.veff_ll(np.eye(2))
-    assert len(calls) == 3  # one H[0], two H[dm]
+    assert len(calls) == 2  # one H[0], one cached H[dm]
 
 
 def test_layer_evaluator_drops_embasis_cached_eigenvalue_sum():

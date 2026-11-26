@@ -33,9 +33,10 @@ class EmbeddedHamiltonian(BaseModel):
             (SQD, FCIDUMP) keeps working unchanged.
         h1a: Optional alpha one-body integrals, shape ``(norb, norb)``, Hermitian.
             Given with ``h1b`` for a genuine spin-dependent downfold, where the two
-            spin channels see different mean fields. Only a solver that can consume
-            the pair uses it (``FCISolver`` -> ``pyscf.fci.direct_uhf``); the others
-            fall back to ``h1`` and say so. ``None`` means spin-restricted.
+            spin channels see different mean fields. ``FCISolver`` and the default
+            ``torch_sci`` SQD path consume the pair; other SQD solvers reject a
+            spin-dependent Hamiltonian instead of averaging it. ``None`` means
+            spin-restricted.
         h1b: Optional beta one-body integrals. Must accompany ``h1a``.
         h2_spin: Optional ``(h2_aa, h2_ab, h2_bb)`` two-body triple, each
             ``(norb,)*4`` in chemists' notation, for a downfold whose two spin channels

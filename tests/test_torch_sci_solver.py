@@ -23,6 +23,16 @@ from embasi_qiskit_integration.solvers import FCISolver, SQDSolver
 from embasi_qiskit_integration.sqd.driver import resolve_sci_solver
 
 
+def test_solver_listing_puts_torch_sci_after_the_builtin_baseline():
+    from embasi_qiskit_integration.sqd.driver import (
+        QISKIT_ADDON_SOLVER,
+        _available_solvers,
+    )
+
+    names = _available_solvers(("arpack", "sbd", "torch_sci"))
+    assert names == (QISKIT_ADDON_SOLVER, "torch_sci", "arpack", "sbd")
+
+
 def test_resolve_sci_solvers_through_the_factory(monkeypatch):
     pytest.importorskip("torch")
     created = {}

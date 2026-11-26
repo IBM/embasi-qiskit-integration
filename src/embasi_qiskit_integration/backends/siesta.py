@@ -59,10 +59,13 @@ from __future__ import annotations
 
 import copy
 import functools
+import hashlib
 import importlib.metadata
+import json
 import os
 import re
 import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -399,6 +402,7 @@ def siesta_calculator(
         xc=functional,
         basis_set=getattr(cfg, "siesta_basis", "DZP"),
         mesh_cutoff=float(getattr(cfg, "siesta_mesh_cutoff", 200.0)) * 13.605693122994,  # Ry->eV
+        energy_shift=float(getattr(cfg, "siesta_energy_shift", 0.1)),  # eV
         spin="non-polarized",
         pseudo_path=pseudo,
         # Symlinks default to True on POSIX; some shared/container filesystems
@@ -409,12 +413,53 @@ def siesta_calculator(
     return calc
 
 
+def _basis_cache_key(atoms: Any, calc: Any, lib_path: str) -> str:
+    """Content key for the geometry-independent NAO basis metadata.
+
+    The basis size and AO-to-atom map depend on the ordered species, the NAO basis
+    and pseudopotentials, and the SIESTA build -- never on the nuclear positions.
+    """
+    digest = hashlib.sha256()
+    symbols = "".join(atoms.get_chemical_symbols())
+    digest.update(symbols.encode())
+    params = getattr(calc, "parameters", {})
+    digest.update(str(params.get("basis_set", "")).encode())
+    digest.update(str(params.get("mesh_cutoff", "")).encode())
+    digest.update(str(params.get("energy_shift", "")).encode())
+    pseudo_dir = Path(str(params.get("pseudo_path", ""))).expanduser()
+    for element in sorted(set(atoms.get_chemical_symbols())):
+        for suffix in (".psml", ".psf"):
+            path = pseudo_dir / f"{element}{suffix}"
+            if path.is_file():
+                digest.update(path.read_bytes())
+                break
+    library = Path(lib_path).expanduser()
+    try:
+        stat = library.stat()
+        digest.update(f"{library}:{stat.st_size}:{stat.st_mtime_ns}".encode())
+    except OSError:
+        digest.update(str(library).encode())
+    return digest.hexdigest()
+
+
+def _basis_cache_dir() -> Path | None:
+    override = os.environ.get("EQI_SIESTA_BASIS_CACHE")
+    if override is not None:
+        if override.strip().lower() in {"0", "false", "off", "no"}:
+            return None
+        return Path(override).expanduser()
+    root = os.environ.get("XDG_CACHE_HOME")
+    base = Path(root).expanduser() if root else Path.home() / ".cache"
+    return base / "embasi-qiskit-integration" / "siesta-basis"
+
+
 def probe_basis_asi(
     atoms: Any,
     calc: Any,
     *,
     directory: str | Path,
     lib_path: str | None = None,
+    cache: bool = True,
 ) -> tuple[int, np.ndarray]:
     """Size the NAO basis from ASI, without running an SCF or an executable.
 
@@ -423,11 +468,32 @@ def probe_basis_asi(
     replaces the zero-SCF executable probe for ASI-only deployments -- and, unlike
     ``.ORB_INDX``, needs no ``siesta`` binary.
 
+    The result is independent of nuclear positions, so a small on-disk cache keyed
+    by ordered species, basis/pseudopotentials and the SIESTA library skips the probe
+    on later geometries.  Set ``EQI_SIESTA_BASIS_CACHE=0`` to disable it.
+
     Returns:
         ``(n_basis, basis_atoms)`` where ``basis_atoms`` maps each AO to its atom.
     """
     lib_path = lib_path or require_asi_support()
     from asi4py.asecalc import ASI_ASE_calculator
+
+    cache_dir = _basis_cache_dir() if cache else None
+    cache_file = None
+    if cache_dir is not None:
+        try:
+            cache_file = cache_dir / f"{_basis_cache_key(atoms, calc, lib_path)}.json"
+            payload = json.loads(cache_file.read_text())
+            n_cached = int(payload["n_basis"])
+            atoms_cached = np.asarray(payload["basis_atoms"], dtype=int)
+            if (
+                atoms_cached.shape == (n_cached,)
+                and n_cached > 0
+                and np.all((atoms_cached >= 0) & (atoms_cached < len(atoms)))
+            ):
+                return n_cached, atoms_cached
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
 
     work = Path(directory)
     work.mkdir(parents=True, exist_ok=True)
@@ -474,6 +540,15 @@ def probe_basis_asi(
         )
     if np.any((basis_atoms < 0) | (basis_atoms >= len(atoms))):
         raise RuntimeError(f"ASI basis descriptors map beyond the {len(atoms)} atoms")
+    if cache_file is not None:
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix="basis-", suffix=".json", dir=cache_file.parent)
+            with os.fdopen(fd, "w") as fh:
+                json.dump({"n_basis": int(n_basis), "basis_atoms": basis_atoms.tolist()}, fh)
+            os.replace(tmp, cache_file)
+        except OSError:
+            pass
     return n_basis, basis_atoms
 
 
@@ -638,7 +713,11 @@ def nuclear_repulsion(atoms: Any) -> float:
 
 @register_backend(
     "siesta",
-    backend_only_settings={"siesta_basis": "DZP", "siesta_mesh_cutoff": 200.0},
+    backend_only_settings={
+        "siesta_basis": "DZP",
+        "siesta_mesh_cutoff": 200.0,
+        "siesta_energy_shift": 0.1,
+    },
 )
 def build_siesta_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
     """SIESTA **WF-in-DFT** backend: PBE low level, external solver high level.

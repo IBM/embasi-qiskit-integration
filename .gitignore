@@ -29,6 +29,10 @@ coverage.xml
 # Job artifacts produced by the CLI handoff
 *.ERROR
 
+# EmbASI/SIESTA scratch directories created by a workflow run
+EmbASI_calc/
+siesta_calc/
+
 # Editors / OS
 .idea/
 .vscode/
@@ -41,6 +45,7 @@ coverage.xml
 # Outputs
 /output
 /data
+/analysis
 
 # Logging and Experiments
 execute.sh

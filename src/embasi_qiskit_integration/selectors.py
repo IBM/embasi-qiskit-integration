@@ -57,6 +57,7 @@ import numpy as np
 
 from embasi_qiskit_integration.backends.base import (
     CAP_MINAO_PROJECTOR,
+    MissingCapabilityError,
     as_ao_basis,
     atom_ao_indices,
     require_capability,
@@ -72,6 +73,7 @@ __all__ = [
     "concentric_localization_selector",
     "spade_virtual_selector",
     "fragment_ao_indices",
+    "fragment_ao_projector",
     "avas_ao_projector",
     "apc_pair_coefficients",
     "apc_orbital_entropies",
@@ -547,6 +549,12 @@ def fragment_ao_indices(basis, active_atoms) -> np.ndarray:
 # the rotation itself lives on the adapter
 # (:meth:`ProjectionEmbeddingAdapter.build_orbitals_avas`), since it must stay inside
 # span(A) and respect the embedding's occupied/virtual split.
+#
+# ``fragment_ao_projector`` is the same metric built from target AOs in the *working*
+# basis instead of a MINAO reference.  It is what ``--selector ao-avas`` uses: the
+# selection then depends only on fixed fragment AOs and fixed occupied/virtual counts,
+# not on canonical orbital energies, and it is available on NAO/pseudopotential
+# backends that expose neither ``valence_ao_projector`` nor per-AO shell labels.
 
 
 def avas_ao_projector(basis, ao_labels, atoms=None, minao: str = "minao") -> np.ndarray:
@@ -576,6 +584,118 @@ def avas_ao_projector(basis, ao_labels, atoms=None, minao: str = "minao") -> np.
     basis = as_ao_basis(basis)
     require_capability(basis, CAP_MINAO_PROJECTOR, "the AVAS valence-AO projector")
     return basis.valence_ao_projector(list(ao_labels), atoms=atoms, minao=minao)
+
+
+def _overlap_matrix(basis) -> np.ndarray:
+    """AO overlap ``S`` from an AOIntegrals backend (the code-agnostic seam)."""
+    method = getattr(basis, "overlap", None)
+    if callable(method):
+        return np.asarray(method(), dtype=float)
+    raise TypeError(
+        f"{type(basis).__name__} has no overlap(); a fragment-AO projector needs an "
+        "AOIntegrals backend (e.g. adapter.ints), not a bare QM-code molecule object"
+    )
+
+
+def fragment_ao_projector(basis, ao_labels=None, atoms=None) -> np.ndarray:
+    """Same-basis fragment-AO projector ``M = S B (B^T S B)^-1 B^T S``.
+
+    The working-basis counterpart of :func:`avas_ao_projector`.  ``B`` selects target
+    AOs *in the system's own basis* (no MINAO reference), so for an S-normalised
+    orbital ``c`` the weight ``c^T M c`` is the squared S-norm of its S-orthogonal
+    projection onto ``span(target AOs)`` and lies in ``[0, 1]``.  This is the metric
+    :meth:`ProjectionEmbeddingAdapter.build_orbitals_avas` diagonalises inside the
+    occupied and virtual blocks of subsystem A.
+
+    Why a same-basis variant: the MINAO projector behind ``--selector avas`` needs
+    ``valence_ao_projector``, which NAO/pseudopotential backends (SIESTA) do not
+    provide.  Matching labels in the working basis needs only ``search_ao_label``,
+    and when a backend reports no shell labels either (SIESTA's ASI descriptors carry
+    only the atom index) the fragment's AO *indices* from ``atom_ao_indices`` are
+    still enough: pass ``ao_labels=None`` to target every AO of ``atoms``.  On a
+    pseudopotential basis those are the valence functions, so the "all fragment AOs"
+    fallback is a chemically sensible valence target rather than a core-inclusive
+    one.
+
+    The target AOs need not lie exactly inside ``span(A)``.  ``M`` is only the
+    *metric*; the selected orbitals are rotations of subsystem-A columns, so they
+    stay S-orthogonal to ``P_B`` whatever the target AOs' small environment tails.
+
+    Args:
+        basis: an :class:`~embasi_qiskit_integration.backends.base.AOIntegrals`
+            backend (it must expose ``overlap()``, ``atom_ao_indices`` and, for
+            labels, ``search_ao_label``).  The workflow passes ``adapter.ints``; this
+            is deliberately the backend seam rather than a bare QM-code molecule, so
+            no PySCF-specific object leaks outside ``backends/``.
+        ao_labels: AO labels matched in the working basis (``"N 2p"``, ``"C 2p"``).
+            ``None`` targets every AO of the fragment ``atoms`` -- the portable
+            choice for a backend without AO labels.
+        atoms: fragment atom indices (indices into the basis' atom order).  ``None``
+            uses every atom.
+
+    Returns:
+        ``(nao, nao)`` symmetric AO-basis metric ``M``.
+
+    Raises:
+        ValueError: no target AO, labels requested on a backend that reports none, or
+            linearly dependent target AOs (``B^T S B`` singular).
+        TypeError: the object is not an ``AOIntegrals`` backend (no ``overlap()``).
+    """
+    basis = as_ao_basis(basis)
+    s = _overlap_matrix(basis)
+    nao = int(basis.nao)
+    if s.shape != (nao, nao):
+        raise ValueError(f"overlap has shape {s.shape}, expected ({nao}, {nao})")
+
+    frag = (
+        np.arange(nao, dtype=int)
+        if atoms is None
+        else np.asarray(fragment_ao_indices(basis, atoms), dtype=int)
+    )
+    target = frag
+    if ao_labels:
+        search = getattr(basis, "search_ao_label", None)
+        if not callable(search):
+            raise ValueError(
+                "ao_labels were requested but this backend reports no AO shell labels; "
+                "omit ao_labels to target every AO of the fragment (the portable "
+                "choice for SIESTA's pseudopotential/NAO basis)"
+            )
+        try:
+            hits = np.asarray(search(list(ao_labels)), dtype=int)
+        except MissingCapabilityError as exc:
+            raise ValueError(
+                "ao_labels were requested but this backend reports no AO shell labels "
+                "(SIESTA's ASI basis descriptors carry only the atom index); omit "
+                "ao_labels to target every AO of the fragment"
+            ) from exc
+        target = np.intersect1d(hits, frag)
+        if target.size == 0:
+            try:
+                labels = basis.ao_labels()
+                shells = sorted({" ".join(labels[i][1:3]) for i in frag})
+                available = f"; the fragment's shells are: {', '.join(shells)}"
+            except (MissingCapabilityError, AttributeError):
+                available = ""
+            raise ValueError(
+                f"fragment-AO labels {list(ao_labels)} match no AO of the active "
+                f"fragment{available}"
+            )
+    if target.size == 0:
+        raise ValueError("the active fragment has no AOs to project onto")
+
+    b = np.zeros((nao, target.size), dtype=float)
+    b[target, np.arange(target.size)] = 1.0
+    s22 = b.T @ s @ b
+    w = np.linalg.eigvalsh(0.5 * (s22 + s22.T))
+    if w.size == 0 or w.min() <= 1.0e-10 * max(float(w.max()), 1.0):
+        raise ValueError(
+            "the fragment-AO target set is linearly dependent under S "
+            f"(overlap eigenvalues {np.array2string(w, precision=2)}); choose "
+            "independent AOs/labels"
+        )
+    m = s @ b @ np.linalg.solve(s22, b.T @ s)
+    return 0.5 * (m + m.T)
 
 
 # --------------------------------------------------------------------------- #

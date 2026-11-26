@@ -24,6 +24,7 @@ later without touching the adapter.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -35,8 +36,11 @@ import numpy as np
 #: File name written by ``QComp.DataAddress`` in every ASI work directory.
 QCOMP_ERI_NAME = "qcomp_eris.nc"
 
-#: Above this many float64 elements, refuse the dense expansion (512 MB).
-MAX_DENSE_ELEMENTS = 64_000_000
+#: Above this many float64 elements, refuse the dense expansion (1.2 GB).
+#: A 12-atom DZP molecule has ~100 AOs (10^8 elements), so the old 512 MB cap
+#: rejected systems that fit comfortably; the transform below keeps only one
+#: intermediate of the active-space change of basis, not a second full tensor.
+MAX_DENSE_ELEMENTS = 150_000_000
 
 
 def _quartet_permutations() -> tuple[tuple[int, int, int, int], ...]:
@@ -74,6 +78,7 @@ class SiestaEriProvider:
         self._values: np.ndarray | None = None
         self._signature: tuple[int, int] | None = None
         self._dense: np.ndarray | None = None
+        self._weights: np.ndarray | None = None
 
     # ------------------------------------------------------------------ #
     # Loading
@@ -188,10 +193,31 @@ np.savez(dst, eri_indx=indices, eri_vals=values, unit=np.asarray(unit))
                 f"{self.path}: eri_indx references AO {n_ao} but the basis has "
                 f"{self.n_ao} functions"
             )
+        # QCOMP normally stores one orientation per symmetry orbit, but real files
+        # can contain the same orbit under several of the eight permutations (the
+        # SZ butyronitrile file has ~7.5% such rows).  `dense()` assigns each orbit
+        # once (last write wins); the sparse contractions sum every stored row, so
+        # leaving duplicates would over-count them.  Canonicalise by the minimum
+        # permutation code and keep the last occurrence, matching dense semantics.
+        index_dtype = indices.dtype
+        key = np.full(indices.shape[0], np.iinfo(np.int64).max, dtype=np.int64)
+        for permutation in _PERMUTATIONS:
+            p, q, r, s = (indices[:, i] for i in permutation)
+            code = (((p * n_ao + q) * n_ao + r) * n_ao + s).astype(np.int64)
+            np.minimum(key, code, out=key)
+        order = np.argsort(key, kind="stable")
+        sorted_keys = key[order]
+        keep_last = np.empty(key.size, dtype=bool)
+        keep_last[-1] = True
+        keep_last[:-1] = sorted_keys[1:] != sorted_keys[:-1]
+        keep = np.sort(order[keep_last])
+        indices = indices[keep].astype(index_dtype, copy=False)
+        values = values[keep]
         self._indices = indices
         self._values = values
         self._signature = signature
         self._dense = None
+        self._weights = None
 
     @property
     def n_eri(self) -> int:
@@ -216,11 +242,11 @@ np.savez(dst, eri_indx=indices, eri_vals=values, unit=np.asarray(unit))
                 "or a sparse ERI implementation"
             )
         tensor = np.zeros((n, n, n, n), dtype=float)
-        for (p, q, r, s), value in zip(self._indices, self._values, strict=True):
-            quartet = (int(p), int(q), int(r), int(s))
-            for permutation in _PERMUTATIONS:
-                a, b, c, d = (quartet[i] for i in permutation)
-                tensor[a, b, c, d] = value
+        # Assign each permutation as one fancy-index operation; the explicit
+        # quartet loop cost ~10^8 Python iterations on a 100-AO DZP molecule.
+        for permutation in _PERMUTATIONS:
+            p, q, r, s = (self._indices[:, i] for i in permutation)
+            tensor[p, q, r, s] = self._values
         self._dense = tensor
         return tensor
 
@@ -230,56 +256,159 @@ np.savez(dst, eri_indx=indices, eri_vals=values, unit=np.asarray(unit))
     # ------------------------------------------------------------------ #
     # AO contractions
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _permutation_weights(indices: np.ndarray) -> np.ndarray:
+        """Weight each of the eight permutations for repeated AO indices.
+
+        ``_PERMUTATIONS`` swaps the first pair, the second pair, and the two pairs.
+        Equality can make any of those swaps a no-op; the resulting image
+        multiplicity is computed from all four possible pair coincidences (plus
+        both first/second swaps together), with the all-equal quartet special-cased
+        to eight.  Scaling by ``1/multiplicity`` makes the vectorised sum equal the
+        dense expansion, which writes each distinct tensor element once.
+        """
+        a, b, c, d = indices.T
+        all_equal = (a == b) & (b == c) & (c == d)
+        frequency = (
+            1
+            + (a == b).astype(np.int8)
+            + (c == d).astype(np.int8)
+            + ((a == c) & (b == d)).astype(np.int8)
+            + ((a == d) & (b == c)).astype(np.int8)
+            + ((a == b) & (c == d)).astype(np.int8)
+        )
+        frequency = np.where(all_equal, 8, frequency)
+        return 1.0 / frequency
+
+    def _quartet_weights(self) -> np.ndarray:
+        self._load()
+        assert self._indices is not None
+        if getattr(self, "_weights", None) is None:
+            self._weights = self._permutation_weights(self._indices)
+        return self._weights
+
     def jk(self, dm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """``(J[dm], K[dm])`` in the AO basis from the stored quartets.
 
         ``J[p,q] = sum_{rs} (pq|rs) dm[r,s]`` and
-        ``K[p,q] = sum_{rs} (pr|qs) dm[r,s]``.  The loop is over the
-        symmetry-unique quartets, so it does not allocate the dense tensor.
+        ``K[p,q] = sum_{rs} (pr|qs) dm[r,s]``.  This is the same eight-permutation
+        expansion as :meth:`dense`, evaluated with ``bincount`` in chunks so a
+        100-AO DZP file never needs the full ``n_ao^4`` tensor.
         """
         dm = np.asarray(dm, dtype=float)
         self._load()
         assert self._indices is not None and self._values is not None and self.n_ao
         if dm.shape != (self.n_ao, self.n_ao):
             raise ValueError(f"density is {dm.shape}, expected {(self.n_ao, self.n_ao)}")
-        j = np.zeros_like(dm)
-        k = np.zeros_like(dm)
-        for (p, q, r, s), value in zip(self._indices, self._values, strict=True):
-            quartet = (int(p), int(q), int(r), int(s))
-            # Repeated AO indices make several symmetry permutations the same
-            # tensor element; the dense expansion assigns it once, so the
-            # contraction must count each distinct element once as well.
-            seen: set[tuple[int, int, int, int]] = set()
+        n = self.n_ao
+        j = np.zeros((n, n))
+        k = np.zeros((n, n))
+        weights = self._quartet_weights()
+        # Bound the temporary quartet arrays; DZP has ~12M stored quartets.
+        chunk = 2_000_000
+        for start in range(0, self._values.size, chunk):
+            stop = min(start + chunk, self._values.size)
+            idx = self._indices[start:stop]
+            values = self._values[start:stop]
+            weighted = values * weights[start:stop]
             for permutation in _PERMUTATIONS:
-                a, b, c, d = (quartet[i] for i in permutation)
-                if (a, b, c, d) in seen:
-                    continue
-                seen.add((a, b, c, d))
-                j[a, b] += value * dm[c, d]
-                k[a, c] += value * dm[b, d]
+                p, q, r, s = (idx[:, i] for i in permutation)
+                j += np.bincount(
+                    p * n + q,
+                    weights=weighted * dm[r, s],
+                    minlength=n * n,
+                ).reshape(n, n)
+                k += np.bincount(
+                    p * n + r,
+                    weights=weighted * dm[q, s],
+                    minlength=n * n,
+                ).reshape(n, n)
         return j, k
+
+    def _sparse_transform(
+        self, ca: np.ndarray, cb: np.ndarray, cc: np.ndarray, cd: np.ndarray
+    ) -> np.ndarray:
+        """Active-space transform over the stored quartets, never forming ``n_ao^4``.
+
+        The right pair is transformed first into an ``(n_ao, n_ao, n_mo, n_mo)``
+        intermediate (~1M entries at 100 AOs and 10 active orbitals), then the
+        left pair is contracted.  Each stored quartet is expanded through the eight
+        symmetry permutations with the same repeated-index weights as :meth:`jk`.
+        Chunks bound the ``chunk x n_mo^2`` temporary to a few tens of MB.
+        """
+        self._load()
+        assert self._indices is not None and self._values is not None and self.n_ao
+        n = self.n_ao
+        nmo_c, nmo_d = cc.shape[1], cd.shape[1]
+        if ca.shape[1] != cb.shape[1]:
+            raise ValueError("the two left coefficient blocks must have the same width")
+        nmo_a = ca.shape[1]
+        # right intermediate: [p, q, k, l]
+        right = np.zeros((n * n, nmo_c, nmo_d), dtype=float)
+        kl = np.arange(nmo_c)[:, None] * nmo_d + np.arange(nmo_d)[None, :]
+        weights = self._quartet_weights()
+        # ~64 MB of chunk x n_mo^2 doubles, independent of n_ao.
+        chunk = max(1, min(200_000, 8_000_000 // max(1, nmo_c * nmo_d)))
+        for start in range(0, self._values.size, chunk):
+            stop = min(start + chunk, self._values.size)
+            idx = self._indices[start:stop]
+            weighted = self._values[start:stop] * weights[start:stop]
+            for permutation in _PERMUTATIONS:
+                p, q, r, s = (idx[:, i] for i in permutation)
+                pair = p * n + q
+                # (chunk, n_mo_c, n_mo_d), one right-pair transform per quartet.
+                block = (
+                    weighted[:, None, None]
+                    * cc[r][:, :, None]
+                    * cd[s][:, None, :]
+                )
+                code = pair[:, None, None] * (nmo_c * nmo_d) + kl[None, :, :]
+                right += np.bincount(
+                    code.ravel(), weights=block.ravel(), minlength=n * n * nmo_c * nmo_d
+                ).reshape(n * n, nmo_c, nmo_d)
+        # left pair: [p, q, k, l] -> [i, j, k, l]
+        right = right.reshape(n, n, nmo_c, nmo_d)
+        out = np.einsum("pqkl,pi,qj->ijkl", right, ca, cb, optimize=True)
+        if out.shape[:2] != (nmo_a, cb.shape[1]):
+            raise RuntimeError("internal sparse-transform shape mismatch")
+        return np.ascontiguousarray(out)
+
+    def _transform_four(self, ca: np.ndarray, cb: np.ndarray, cc: np.ndarray, cd: np.ndarray):
+        """Active-space change of basis.
+
+        The sparse streaming path is for the large-AO regime that motivated it;
+        within the dense cap the dense tensor plus a vectorised einsum is much
+        faster (10-100x) and its memory is bounded by the provider's 150M-element
+        guard.  ``EQI_SIESTA_SPARSE_ERI=1`` forces sparse, ``=0`` forces dense.
+        """
+        mode = os.environ.get("EQI_SIESTA_SPARSE_ERI", "auto").strip().lower()
+        if mode in {"1", "true", "on", "yes"}:
+            return self._sparse_transform(ca, cb, cc, cd)
+        if mode in {"0", "false", "off", "no"}:
+            tensor = np.einsum("pqrs,pi->iqrs", self.dense(), ca, optimize=True)
+            tensor = np.einsum("iqrs,qj->ijrs", tensor, cb, optimize=True)
+            tensor = np.einsum("ijrs,rk->ijks", tensor, cc, optimize=True)
+            return np.einsum("ijks,sl->ijkl", tensor, cd, optimize=True)
+        if self.n_ao**4 <= 20_000_000:
+            tensor = np.einsum("pqrs,pi->iqrs", self.dense(), ca, optimize=True)
+            tensor = np.einsum("iqrs,qj->ijrs", tensor, cb, optimize=True)
+            tensor = np.einsum("ijrs,rk->ijks", tensor, cc, optimize=True)
+            return np.einsum("ijks,sl->ijkl", tensor, cd, optimize=True)
+        return self._sparse_transform(ca, cb, cc, cd)
 
     def eri_mo(self, mo_coeff: np.ndarray) -> np.ndarray:
         coeff = np.asarray(mo_coeff, dtype=float)
         if coeff.ndim != 2 or coeff.shape[0] != self.n_ao:
             raise ValueError(f"mo_coeff is {coeff.shape}, expected ({self.n_ao}, n_mo)")
-        return np.einsum(
-            "pqrs,pi,qj,rk,sl->ijkl", self.dense(), coeff, coeff, coeff, coeff, optimize=True
-        )
+        return self._transform_four(coeff, coeff, coeff, coeff)
 
     def eri_mo_mixed(self, mo_a: np.ndarray, mo_b: np.ndarray) -> np.ndarray:
         coeff_a = np.asarray(mo_a, dtype=float)
         coeff_b = np.asarray(mo_b, dtype=float)
+        if coeff_a.ndim != 2 or coeff_b.ndim != 2:
+            raise ValueError(f"mo_a/mo_b must be 2-D; got {coeff_a.shape}/{coeff_b.shape}")
         if coeff_a.shape[0] != self.n_ao or coeff_b.shape[0] != self.n_ao:
             raise ValueError(
                 f"mo_a/mo_b must have {self.n_ao} rows; got {coeff_a.shape}/{coeff_b.shape}"
             )
-        return np.einsum(
-            "pqrs,pi,qj,rk,sl->ijkl",
-            self.dense(),
-            coeff_a,
-            coeff_a,
-            coeff_b,
-            coeff_b,
-            optimize=True,
-        )
+        return self._transform_four(coeff_a, coeff_a, coeff_b, coeff_b)

@@ -14,8 +14,6 @@ collected via the addon's ``callback`` hook and stored in ``diagnostics``.
 
 from __future__ import annotations
 
-import warnings
-
 import numpy as np
 
 from embasi_qiskit_integration.circuit_run.spin_layout import (
@@ -84,23 +82,40 @@ _RDM2_KWARG = {
 }
 
 
+#: qiskit-addon-sqd's built-in selected-CI path.  It is not a solver named after
+#: the Qiskit ecosystem: the addon supplies :func:`solve_sci`, which runs PySCF's
+#: selected-CI diagonalization.  The explicit name keeps it distinct from the
+#: optional ``sci-solvers`` backends (and from sci-solvers' own ``pyscf`` entry).
+QISKIT_ADDON_SOLVER = "qiskit_addon_sqd"
+
+
+def _available_solvers(available: tuple[str, ...]) -> tuple[str, ...]:
+    """The built-in baseline first, then torch-sci (the public default), then rest."""
+    ordered = [QISKIT_ADDON_SOLVER]
+    for name in ("torch_sci", *available):
+        if name not in ordered:
+            ordered.append(name)
+    return tuple(ordered)
+
+
 def resolve_sci_solver(name: str, spin_sq: float | None, torch_sci_kwargs: dict | None):
     """Return the ``sci_solver`` callable for qiskit-addon-sqd.
 
-    ``"qiskit"`` wraps the package's PySCF selected-CI batch solver with the
-    aufbau starting vector.  Every other name is dispatched through
-    IBM/sci-solvers' :func:`~sci_solvers.energy_solvers.factory.create_solver`
-    (``torch_sci`` is the default in :class:`SQDSolver`); importing the package
-    is deferred so the optional ``sci-solvers`` extra is only required when
-    selected.  ``torch_sci_kwargs`` is forwarded only to ``torch_sci`` --
-    the other solvers have different constructor options.
+    ``"qiskit_addon_sqd"`` wraps the addon's PySCF selected-CI batch solver with
+    the aufbau starting vector and needs no extra.  Every other name is
+    dispatched through IBM/sci-solvers'
+    :func:`~sci_solvers.energy_solvers.factory.create_solver` (``torch_sci`` is
+    the default in :class:`SQDSolver`); importing the package is deferred so the
+    optional ``sci-solvers`` extra is only required when selected.
+    ``torch_sci_kwargs`` is forwarded only to ``torch_sci`` -- the other solvers
+    have different constructor options.
 
     ``symmetrize_spin=False`` is deliberate: qiskit-addon-sqd already passes
     separate alpha/beta CI-string batches, and the open-shell SQD path must not
     merge them.  A solver that needs closed-shell spin symmetry can still be
     configured through its own options.
     """
-    if name == "qiskit":
+    if name == QISKIT_ADDON_SOLVER:
         import functools
 
         return functools.partial(_solve_sci_batch_from_reference, spin_sq=spin_sq)
@@ -111,10 +126,9 @@ def resolve_sci_solver(name: str, spin_sq: float | None, torch_sci_kwargs: dict 
             f"sci_solver={name!r} needs the optional `sci-solvers` extra: "
             "uv sync --extra sci-solvers"
         ) from exc
+    names = _available_solvers(AVAILABLE_SOLVERS)
     if name not in AVAILABLE_SOLVERS:
-        raise ValueError(
-            f"unknown sci_solver {name!r}; available: 'qiskit', {', '.join(AVAILABLE_SOLVERS)}"
-        )
+        raise ValueError(f"unknown sci_solver {name!r}; available: {', '.join(names)}")
 
     if name == "torch_sci":
         kwargs = dict(torch_sci_kwargs or {})
@@ -167,9 +181,7 @@ def resolve_sci_solver(name: str, spin_sq: float | None, torch_sci_kwargs: dict 
     try:
         solver = create_solver(name, **kwargs)
     except ValueError as exc:
-        raise ValueError(
-            f"unknown sci_solver {name!r}; available: 'qiskit', {', '.join(AVAILABLE_SOLVERS)}"
-        ) from exc
+        raise ValueError(f"unknown sci_solver {name!r}; available: {', '.join(names)}") from exc
     return solver.sci_solver_callable
 
 
@@ -211,7 +223,7 @@ def run_sqd(
     initial_occupancies: tuple[np.ndarray, np.ndarray] | None = None,
     include_configurations=None,
     seed: int | None = None,
-    sci_solver: str = "qiskit",
+    sci_solver: str = QISKIT_ADDON_SOLVER,
     torch_sci_kwargs: dict | None = None,
 ) -> SolverResult:
     """Run SQD on measurement ``counts`` for the active-space ``ham``.
@@ -247,9 +259,15 @@ def run_sqd(
         include_configurations: configurations to force into every subspace (e.g. the
             Hartree-Fock determinant), as the addon's ``include_configurations``.
         seed: RNG seed (int) for the SQD sampling — deterministic when set.
-        sci_solver: ``"qiskit"`` (default here) for the aufbau-starting PySCF
-            selected-CI path, ``"torch_sci"`` for IBM/sci-solvers, or any other
-            name from ``sci_solvers.energy_solvers.factory.AVAILABLE_SOLVERS``.
+        sci_solver: ``"qiskit_addon_sqd"`` (default here) for the
+            aufbau-starting PySCF selected-CI path supplied by qiskit-addon-sqd,
+            ``"torch_sci"`` for IBM/sci-solvers, or any other name from
+            ``sci_solvers.energy_solvers.factory.AVAILABLE_SOLVERS``.  The
+            public :class:`SQDSolver` default is ``"torch_sci"``; this low-level
+            helper keeps the dependency-free addon path as its own default.
+            A spin-dependent ``ham`` is supported only by the ``"torch_sci"``
+            spin-orbital path; other solvers raise a clear error instead of
+            silently using the spin-averaged Hamiltonian.
         torch_sci_kwargs: Constructor options forwarded to ``torch_sci`` only.
 
     Returns:
@@ -290,9 +308,28 @@ def run_sqd(
 
     rng = np.random.default_rng(seed) if seed is not None else None
 
-    # Subspace diagonalizer.  The default keeps our aufbau-starting PySCF
-    # selected-CI wrapper; "torch_sci" uses IBM/sci-solvers' TorchSCISolver.
-    solver_callable = resolve_sci_solver(sci_solver, spin_sq, torch_sci_kwargs)
+    # A spin-dependent Hamiltonian needs the exact (h1a, h1b, h2_spin) tensors.
+    # torch_sci is the only solver with that path; everything else must fail
+    # loudly rather than silently diagonalize the spin-averaged Hamiltonian.
+    spin_resolved_subspace = bool(ham.is_spin_dependent)
+    if spin_resolved_subspace:
+        if sci_solver != "torch_sci":
+            raise NotImplementedError(
+                f"sci_solver={sci_solver!r} does not support a spin-dependent "
+                "Hamiltonian (h1a/h1b/h2_spin). Use the default 'torch_sci' "
+                "solver, or FCISolver for a classical unrestricted solve."
+            )
+        from embasi_qiskit_integration.sqd.spin_orbital import (
+            make_torch_spin_orbital_solver,
+        )
+
+        solver_callable = make_torch_spin_orbital_solver(
+            ham, spin_sq=spin_sq, torch_sci_kwargs=torch_sci_kwargs
+        )
+        spin_solver_backend = "torch_sci_spin"
+    else:
+        solver_callable = resolve_sci_solver(sci_solver, spin_sq, torch_sci_kwargs)
+        spin_solver_backend = None
 
     extra: dict = {}
     if initial_occupancies is not None:
@@ -300,25 +337,6 @@ def run_sqd(
     if include_configurations is not None:
         extra["include_configurations"] = include_configurations
 
-    if ham.is_spin_dependent:
-        # The addon takes a single `one_body_tensor`, so fall back to the spin-averaged
-        # `h1` and say so: the result is ROHF-like, not UHF-quality.  The warning names
-        # the TWO-BODY loss as well, deliberately -- `ham.h2` is alpha-only, so this also
-        # drops `h2_spin`'s (aa, ab, bb) triple, the larger of the two approximations.
-        h2_note = (
-            " The two-body tensor is alpha-only as well (h2_spin's (aa, ab, bb) triple "
-            "cannot be passed either), which is typically the LARGER error of the two."
-            if ham.has_spin_dependent_eri
-            else ""
-        )
-        warnings.warn(
-            "this Hamiltonian carries a spin-dependent (h1a, h1b) pair, but SQD's "
-            "diagonalize_fermionic_hamiltonian accepts only one one-body tensor; "
-            "using the spin-averaged h1. The result is spin-restricted (ROHF-like) "
-            f"even though the downfold was not.{h2_note} Use the FCI solver for a "
-            "genuine unrestricted solve.",
-            stacklevel=2,
-        )
     result = diagonalize_fermionic_hamiltonian(
         ham.h1,
         ham.h2,
@@ -397,12 +415,23 @@ def run_sqd(
     diagnostics = {
         "solver": "qiskit-addon-sqd",
         "sci_solver": (
-            "torch-sci-solver"
+            "torch-sci-spinless"
+            if spin_solver_backend == "torch_sci_spin"
+            else "torch-sci-solver"
             if sci_solver == "torch_sci"
-            else "qiskit-solve-sci"
-            if sci_solver == "qiskit"
+            else "qiskit-addon-sqd:solve-sci"
+            if sci_solver == QISKIT_ADDON_SOLVER
             else f"sci-solvers:{sci_solver}"
         ),
+        "spin_solver_backend": spin_solver_backend,
+        "spin_resolved_subspace": spin_resolved_subspace,
+        "spin_averaged_hamiltonian": bool(ham.is_spin_dependent and not spin_resolved_subspace),
+        "h1_spin_diff": (
+            float(np.abs(np.asarray(ham.h1a) - np.asarray(ham.h1b)).max())
+            if ham.is_spin_dependent
+            else 0.0
+        ),
+        "h2_spin_present": bool(ham.h2_spin is not None),
         "iteration_energies": iteration_totals,
         "n_iterations": len(iteration_totals),
         "n_distinct_bitstrings": len(counts),

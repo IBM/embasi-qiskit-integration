@@ -15,6 +15,7 @@ Two kinds of check:
 from __future__ import annotations
 
 import ast
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -387,6 +388,7 @@ def test_pyscf_only_settings_are_declared_and_refused_for_another_backend():
     registry.available_backends()
     assert set(registry._BACKEND_ONLY_SETTINGS["pyscf"]) == {
         "scf_newton",
+        "scf_chkfile_out",
         "init_guess",
         "init_guess_breaksym",
         "density_fit",
@@ -396,6 +398,8 @@ def test_pyscf_only_settings_are_declared_and_refused_for_another_backend():
     check_backend_settings("siesta", SimpleNamespace(scf_newton=False, init_guess=None))
     with pytest.raises(ValueError, match="--scf_newton is a pyscf option.*--qm_code siesta"):
         check_backend_settings("siesta", SimpleNamespace(scf_newton=True))
+    with pytest.raises(ValueError, match="--scf_chkfile_out is a pyscf option"):
+        check_backend_settings("siesta", SimpleNamespace(scf_chkfile_out=Path("run.chk")))
     with pytest.raises(ValueError, match="--df_auxbasis is a pyscf option"):
         check_backend_settings("siesta", SimpleNamespace(df_auxbasis="cc-pvdz-ri"))
 
@@ -429,7 +433,7 @@ def test_register_backend_rejects_a_duplicate_name():
         register_backend("pyscf")(lambda atoms, charge, cfg: None)
 
 
-def test_pyscf_builder_constructs_matching_calculators_and_integrals():
+def test_pyscf_builder_constructs_matching_calculators_and_integrals(tmp_path):
     """The builder hands EmbASI and the integrals the SAME mean fields (h_emb relies on it)."""
     from ase import Atoms
 
@@ -448,6 +452,7 @@ def test_pyscf_builder_constructs_matching_calculators_and_integrals():
         scf_newton=False,
         density_fit=False,
         df_auxbasis="weigend",
+        scf_chkfile_out=tmp_path / "chk" / "run.chk",
     )
     backend = make_backend("pyscf", atoms, 0, cfg)
     ints = backend.integrals
@@ -458,6 +463,10 @@ def test_pyscf_builder_constructs_matching_calculators_and_integrals():
     assert ints.mf_ll.xc == "PBE" and ints.mf.xc == "HF"
     assert ints.mf_ll.max_cycle == ints.mf.max_cycle == 17
     assert ints.mf_ll.init_guess == "atom"
+    assert ints.mf_ll.chkfile == str(tmp_path / "chk" / "run.chk")
+    assert ints.mf.chkfile == ints.mf_ll.chkfile
+    assert copy.deepcopy(ints.mf_ll).chkfile == ints.mf_ll.chkfile
+    assert (tmp_path / "chk").is_dir()
     assert ints.describe()["density_fit"] == "weigend"  # auxbasis wins over the bool
     assert ints.nao == 7
 

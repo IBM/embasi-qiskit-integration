@@ -66,6 +66,100 @@ def test_provider_expands_permutations_and_contracts(tmp_path):
     assert np.allclose(provider.eri_mo_mixed(coeff, coeff), mo_expected)
 
 
+def test_dense_limit_covers_a_12_atom_dzp_system():
+    from embasi_qiskit_integration.backends._siesta_qcomp import MAX_DENSE_ELEMENTS
+
+    # The butyronitrile DZP active-space scan reaches 100 AOs (10^8 elements).
+    assert MAX_DENSE_ELEMENTS > 100**4
+
+
+def test_vectorised_jk_matches_dense_on_all_index_patterns():
+    from itertools import product
+
+    from embasi_qiskit_integration.backends._siesta_qcomp import SiestaEriProvider
+
+    n = 4
+    rng = np.random.default_rng(11)
+    tensor = rng.normal(size=(n, n, n, n))
+    for perm in ((1, 0, 2, 3), (0, 1, 3, 2), (2, 3, 0, 1)):
+        tensor = 0.5 * (tensor + tensor.transpose(perm))
+    quartets = []
+    values = []
+    for quartet in product(range(n), repeat=4):
+        p, q, r, s = quartet
+        if p < q or r < s or (p, q) < (r, s):
+            continue
+        quartets.append(quartet)
+        values.append(tensor[quartet])
+    provider = SiestaEriProvider.__new__(SiestaEriProvider)
+    provider.n_ao = n
+    provider._indices = np.asarray(quartets, dtype=np.int64)
+    provider._values = np.asarray(values, dtype=float)
+    provider._load = lambda: None  # type: ignore[method-assign]
+    dm = rng.normal(size=(n, n))
+    dm = dm + dm.T
+    j, k = provider.jk(dm)
+    j_ref = np.einsum("pqrs,rs->pq", tensor, dm)
+    k_ref = np.einsum("prqs,rs->pq", tensor, dm)
+    np.testing.assert_allclose(j, j_ref, atol=1e-13)
+    np.testing.assert_allclose(k, k_ref, atol=1e-13)
+
+
+def test_sparse_eri_mo_matches_dense_on_symmetric_quartets():
+    from itertools import product
+
+    from embasi_qiskit_integration.backends._siesta_qcomp import SiestaEriProvider
+
+    n = 4
+    rng = np.random.default_rng(21)
+    tensor = rng.normal(size=(n, n, n, n))
+    for perm in ((1, 0, 2, 3), (0, 1, 3, 2), (2, 3, 0, 1)):
+        tensor = 0.5 * (tensor + tensor.transpose(perm))
+    quartets = []
+    values = []
+    for quartet in product(range(n), repeat=4):
+        p, q, r, s = quartet
+        if p < q or r < s or (p, q) < (r, s):
+            continue
+        quartets.append(quartet)
+        values.append(tensor[quartet])
+    provider = SiestaEriProvider.__new__(SiestaEriProvider)
+    provider.n_ao = n
+    provider._indices = np.asarray(quartets, dtype=np.int64)
+    provider._values = np.asarray(values, dtype=float)
+    provider._dense = None
+    provider._weights = None
+    provider._load = lambda: None  # type: ignore[method-assign]
+    c_a = rng.normal(size=(n, 3))
+    c_b = rng.normal(size=(n, 2))
+    np.testing.assert_allclose(
+        provider.eri_mo(c_a),
+        np.einsum("pqrs,pi,qj,rk,sl->ijkl", tensor, c_a, c_a, c_a, c_a),
+        atol=1e-13,
+    )
+    np.testing.assert_allclose(
+        provider.eri_mo_mixed(c_a, c_b),
+        np.einsum("pqrs,pi,qj,rk,sl->ijkl", tensor, c_a, c_a, c_b, c_b),
+        atol=1e-13,
+    )
+
+
+def test_provider_deduplicates_repeated_symmetry_orbits(tmp_path):
+    """Real QCOMP files can store one orbit under several permutations."""
+    indices = np.vstack([H2_INDICES, H2_INDICES[:, [1, 0, 2, 3]]])
+    values = np.concatenate([H2_VALUES, H2_VALUES])
+    provider = SiestaEriProvider(
+        write_qcomp_file(tmp_path / "dupes.nc", indices=indices, values=values), n_ao=2
+    )
+    clean = SiestaEriProvider(write_qcomp_file(tmp_path / "clean.nc"), n_ao=2)
+    np.testing.assert_allclose(provider.dense(), clean.dense(), atol=1e-7)
+    dm = np.array([[1.2, 0.3], [0.3, 0.7]])
+    for got, want in zip(provider.jk(dm), clean.jk(dm), strict=True):
+        np.testing.assert_allclose(got, want, atol=1e-7)
+    coeff = np.array([[0.9, 0.1], [0.2, 0.8]])
+    np.testing.assert_allclose(provider.eri_mo(coeff), clean.eri_mo(coeff), atol=1e-7)
+
+
 def test_provider_accepts_fortran_dimension_order(tmp_path):
     provider = SiestaEriProvider(write_qcomp_file(tmp_path / "eris.nc", transpose=True), n_ao=2)
     assert provider.dense().shape == (2, 2, 2, 2)
@@ -137,6 +231,35 @@ def test_callback_integrals_high_level_reference_is_opt_in(tmp_path):
         high_level_reference=lambda layer: 2.5,
     )
     assert shifted.high_level_reference_energy(None) == pytest.approx(2.5)
+
+
+def test_basis_cache_key_ignores_positions_but_tracks_species_and_basis(tmp_path):
+    from ase import Atoms
+
+    from embasi_qiskit_integration.backends.siesta import _basis_cache_key
+
+    pseudo = tmp_path / "pseudo"
+    pseudo.mkdir()
+    for element in ("H", "O"):
+        (pseudo / f"{element}.psml").write_text("<pseudo z-pseudo='1'/>")
+    lib = tmp_path / "libsiesta.so"
+    lib.write_bytes(b"fake")
+    calc = SimpleNamespace(
+        parameters={"basis_set": "SZ", "mesh_cutoff": 200.0, "pseudo_path": str(pseudo)}
+    )
+    atoms = Atoms("OH2", positions=[(0, 0, 0), (0, 0.7, 0.6), (0, -0.7, 0.6)])
+    moved = atoms.copy()
+    moved.positions[0] = (0, 0, 0.1)
+    assert _basis_cache_key(atoms, calc, str(lib)) == _basis_cache_key(moved, calc, str(lib))
+
+    other_basis = SimpleNamespace(parameters={**calc.parameters, "basis_set": "DZP"})
+    assert _basis_cache_key(atoms, calc, str(lib)) != _basis_cache_key(
+        atoms, other_basis, str(lib)
+    )
+    other_atoms = Atoms("NH2", positions=atoms.positions)
+    assert _basis_cache_key(atoms, calc, str(lib)) != _basis_cache_key(
+        other_atoms, calc, str(lib)
+    )
 
 
 def test_nuclear_repulsion_from_psml_and_psf(monkeypatch, tmp_path):

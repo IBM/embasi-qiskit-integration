@@ -361,8 +361,10 @@ class SQDSolver(ActiveSpaceSolver):
         # set this when a wrong-multiplicity state could lie below the intended one.
         self.spin_sq = spin_sq
         # Subspace diagonalizer. "torch_sci" (default) is IBM/sci-solvers'
-        # TorchSCISolver, installed through the optional `sci-solvers` extra;
-        # "qiskit" is the PySCF selected-CI solver supplied by qiskit-addon-sqd.
+        # TorchSCISolver, installed through the optional `sci-solvers` extra; a
+        # spin-dependent Hamiltonian automatically uses its spin-orbital path.
+        # "qiskit_addon_sqd" is the addon's own PySCF selected-CI path and needs
+        # no extra; it is the fallback baseline, not a Qiskit-branded solver.
         self.sci_solver = sci_solver
         self.torch_sci_kwargs = dict(torch_sci_kwargs or {})
         self._permutations: list[list[int] | None] = []
@@ -411,13 +413,6 @@ class SQDSolver(ActiveSpaceSolver):
             n_reseeded_circuits=len(self._reseeded),
             reseeded_circuits=list(self._reseeded),
             workers=self.workers,
-            sci_solver=(
-                "torch-sci-solver"
-                if self.sci_solver == "torch_sci"
-                else "qiskit-solve-sci"
-                if self.sci_solver == "qiskit"
-                else f"sci-solvers:{self.sci_solver}"
-            ),
         )
         return res
 
