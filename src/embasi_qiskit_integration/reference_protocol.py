@@ -43,11 +43,26 @@ criterion.
 in-process backends, and switches to safeguarded density mixing + Anderson/DIIS for a
 backend that declares expensive evaluations (``cheap_evaluations=False``, as the
 callback backend does) or as soon as the legacy path is observed to cycle, diverge
-or stagnate.  ``"legacy"`` reproduces the old behaviour exactly, ``"mixing"`` and
+or stagnate.  A *single* residual spike is not a divergence: DIIS's first
+extrapolation normally overshoots (0.35 -> 1.43 on butyronitrile 2.5 A) and recovers
+on the next step, so the fallback needs two consecutive spikes.  ``"legacy"``
+reproduces the old behaviour exactly, ``"mixing"`` and
 ``"anderson"`` start stabilized, and ``"none"`` is the undamped, no-DIIS map.  Every
 evaluation of one density is cached for the duration of the SCF, and the low-level
 potential and energy at a density are requested together, so a stabilized iteration
-costs two ASI runs instead of the legacy path's three or four.
+costs two ASI runs instead of the legacy path's three or four.  For the same reason
+``converge_on="auto"`` (also the default) uses the density criterion alone on a
+file-driven backend, whose one-step energy floor is above the energy threshold.
+
+The variational energy is shifted by ``-ints.high_level_reference_energy(A_LL)`` when
+the backend exposes it (SIESTA).  That same-density offset aligns the bare high-level
+Hamiltonian's zero with the low-level A-layer total at *one* geometry; it is geometry
+dependent (measured 5.76, 8.01 and 8.71 Ha at butyronitrile 0.8, 1.3 and 2.5 A in SZ)
+and it does not put the reference total on the single-shot path's absolute reference
+(a ~27 Ha pseudopotential gap remains at 0.8 A).  Relative energies along a scan must
+therefore use the raw value, which is exposed as
+:attr:`ReferenceProtocolInfo.energy_offset`.  PySCF exposes no such method and is
+unchanged.
 """
 
 from __future__ import annotations
@@ -95,7 +110,8 @@ class SCFIteration:
         mode: ``"legacy"``, ``"none"``, ``"mixing"`` or ``"anderson"``.
         mix_alpha: damping used by the step (``None`` for an undamped legacy/DIIS step).
         converged: whether this step satisfied the configured convergence criteria
-            (energy and density by default; see ``converge_on``).
+            (see ``converge_on``; by default the paper's energy+density criterion for
+            an in-process backend, density alone for a file-driven one).
     """
 
     iteration: int
@@ -111,15 +127,26 @@ class SCFIteration:
 
 @dataclass(frozen=True)
 class ReferenceProtocolInfo:
-    """What the protocol converged to, for the run log."""
+    """What the protocol converged to, for the run log.
 
-    e_variational: float  # E[γ_A] at convergence (Ha)
+    ``e_variational`` is on the backend's total-energy reference (the ``energy_offset``
+    below is already included).  That offset is a *same-density* quantity and therefore
+    geometry dependent on a pseudopotential code, so relative energies along a scan
+    must use ``e_variational - energy_offset`` (the raw variational energy) and not the
+    shifted value.
+    """
+
+    e_variational: float  # E[γ_A] at convergence, on the backend's total-energy reference (Ha)
     e_reference: float  # active-space HF-determinant energy, E_ref + e_core = E[γ_A]
     n_iterations: int
     n_virtual_kept: int  # concentric-localization virtuals before the n_virtual cap
     active_orbital_energies: tuple[float, ...] = ()  # diag of the embedded Fock (Ha)
     converged: bool = True
     scf_history: tuple[SCFIteration, ...] = ()
+    #: Constant added to every reported energy: ``-high_level_reference_energy(A_LL)``.
+    #: Subtract it from ``e_variational`` for the raw (one consistent reference)
+    #: variational energy.  Zero for a backend without a same-density reference.
+    energy_offset: float = 0.0
 
 
 class SCFConvergenceError(RuntimeError):
@@ -183,6 +210,33 @@ def _external_evaluations(ints: Any) -> bool:
     if cheap is None:
         cheap = getattr(ints, "_cheap", None)
     return cheap is False
+
+
+def _resolve_converge_on(
+    ints: Any,
+    converge_on: Literal["auto", "energy_and_density", "density"],
+) -> Literal["energy_and_density", "density"]:
+    """Resolve ``"auto"`` to the criterion the backend can actually satisfy.
+
+    An in-process backend keeps the paper's energy+density criterion.  A file-driven
+    one (``cheap_evaluations=False``) gets the density criterion alone: its one-step
+    A-only energy carries a numerical floor above ``conv_tol``, so the energy-change
+    test never passes and the SCF would run to ``max_iter`` despite a converged
+    density.
+    """
+    if converge_on != "auto":
+        return converge_on
+    return "density" if _external_evaluations(ints) else "energy_and_density"
+
+
+def _external_density_tol(ints: Any) -> float | None:
+    """The practical density threshold for a file-driven backend, or ``None``.
+
+    The ASI one-step density residual reaches a floor above the in-process 1e-6 at
+    stretched geometries; 1e-4 Ha in the fixed-point residual is still far below the
+    energy resolution of the cross-code comparison.
+    """
+    return 1e-4 if _external_evaluations(ints) else None
 
 
 def _commutator(fock: np.ndarray, dm: np.ndarray, overlap: np.ndarray) -> np.ndarray:
@@ -294,9 +348,7 @@ def _validate_stabilization(stabilization: str) -> Stabilization:
     allowed = {"auto", "legacy", "mixing", "anderson", "none"}
     value = str(stabilization).strip().lower()
     if value not in allowed:
-        raise ValueError(
-            f"stabilization must be one of {sorted(allowed)}, got {stabilization!r}"
-        )
+        raise ValueError(f"stabilization must be one of {sorted(allowed)}, got {stabilization!r}")
     return cast(Stabilization, value)
 
 
@@ -310,7 +362,8 @@ def variational_hf_in_dft(
     max_iter=200,
     conv_tol=1e-10,
     density_tol=1e-6,
-    converge_on: Literal["energy_and_density", "density"] = "energy_and_density",
+    converge_on: Literal["auto", "energy_and_density", "density"] = "auto",
+    energy_offset: float = 0.0,
     stabilization: Stabilization = "auto",
     mix_alpha: float | None = None,
     anderson: bool = True,
@@ -339,11 +392,19 @@ def variational_hf_in_dft(
             ``max |γ_new - γ_old|`` (the reference implementation's criterion); the
             stabilized paths apply it to the fixed-point residual
             ``max |G[γ] - γ|``, which damping cannot make small spuriously.
-        converge_on: ``"energy_and_density"`` (default, the paper's criterion) or
-            ``"density"``.  The latter is an explicit opt-in for a backend whose
-            energy at the A-only density is not the functional consistent with its
-            Fock (the SIESTA ASI one-step evaluation); the density criterion is then
-            the reliable one and the energy change is still recorded in the history.
+        converge_on: ``"auto"`` (default), ``"energy_and_density"`` (the paper's
+            criterion) or ``"density"``.  ``"auto"`` resolves to
+            ``"energy_and_density"`` for an in-process backend and to ``"density"``
+            for a file-driven one (``cheap_evaluations=False``): the latter's energy
+            at the A-only density is not the functional consistent with its Fock
+            (the SIESTA ASI one-step evaluation) and carries a numerical floor above
+            ``conv_tol``, so the energy-change criterion is unreachable.  The
+            density criterion is then the reliable one and the energy change is
+            still recorded in the history.
+        energy_offset: constant added to ``E[γ_A]`` and every history energy (Ha).
+            It does not enter the SCF step, the density criterion or ``ΔE`` between
+            steps; it puts the reported variational energy on a backend's
+            total-energy reference (see :func:`reference_wf_in_dft_hamiltonian`).
         stabilization: ``"auto"`` (legacy for in-process backends, safeguarded
             mixing/Anderson for expensive ones and on detected cycling),
             ``"legacy"`` (exactly the old DIIS loop), ``"mixing"`` (damped fixed
@@ -403,11 +464,12 @@ def variational_hf_in_dft(
         raise ValueError(f"max_iter must be positive, got {max_iter}")
     if conv_tol <= 0.0 or density_tol <= 0.0:
         raise ValueError("conv_tol and density_tol must be positive")
-    if converge_on not in {"energy_and_density", "density"}:
+    if converge_on not in {"auto", "energy_and_density", "density"}:
         raise ValueError(
-            "converge_on must be 'energy_and_density' or 'density', "
-            f"got {converge_on!r}"
+            f"converge_on must be 'auto', 'energy_and_density' or 'density', got {converge_on!r}"
         )
+    if not np.isfinite(energy_offset):
+        raise ValueError(f"energy_offset must be finite, got {energy_offset!r}")
     if history_size < 2:
         raise ValueError(f"history_size must be at least 2, got {history_size}")
     if anderson_trust <= 0.0:
@@ -419,10 +481,16 @@ def variational_hf_in_dft(
             raise ValueError(f"mix_alpha must be in (0, 1], got {mix_alpha}")
 
     legacy_fallback = stabilization == "auto"
+    external_evaluations = _external_evaluations(ints)
     if stabilization == "auto":
-        mode = "anderson" if _external_evaluations(ints) else "legacy"
+        mode = "anderson" if external_evaluations else "legacy"
     else:
         mode = stabilization
+    # A file-driven backend's one-step energy has a numerical floor above conv_tol,
+    # so "energy_and_density" can never be satisfied there.  This is the same policy
+    # as stabilization="auto": keep the in-process path exactly as it was, and use
+    # the reliable criterion for an external code.
+    effective_converge_on = _resolve_converge_on(ints, converge_on)
 
     def emit(message: str) -> None:
         if log is not None:
@@ -457,10 +525,8 @@ def variational_hf_in_dft(
         veff_hf = ints.veff_hf(dm)
 
         fock = h + veff_hf + (fock_ll_total - fock_ll_a) + p_b
-        e_hf = float(
-            np.einsum("ij,ji->", h, dm) + 0.5 * np.einsum("ij,ji->", veff_hf, dm)
-        )
-        energy = float(e_hf + e_ll_total - e_ll_a + e_nuc)
+        e_hf = float(np.einsum("ij,ji->", h, dm) + 0.5 * np.einsum("ij,ji->", veff_hf, dm))
+        energy = float(e_hf + e_ll_total - e_ll_a + e_nuc + energy_offset)
         try:
             _eps, coefficients = sla.eigh(fock, s)
         except (np.linalg.LinAlgError, ValueError) as exc:
@@ -538,6 +604,13 @@ def variational_hf_in_dft(
     best_iteration = 0
     last_improvement = 0
     stall = 0
+    # Consecutive legacy-DIIS steps whose residual exceeds the divergence threshold.
+    # One such step is the normal DIIS startup overshoot, not a divergence: on
+    # butyronitrile 2.5 A (PySCF, STO-3G) the very first extrapolation raises the
+    # residual from 0.35 to 1.43 and the next one returns to 0.045, after which DIIS
+    # converges in 35 iterations.  Abandoning the path on that single step (the old
+    # behaviour) left the stabilized loop crawling for hundreds of iterations.
+    divergence_streak = 0
     last_used_anderson = False
     # A short history of accepted densities is enough to recognise the 2-/3-cycle
     # that a badly conditioned fixed-point map falls into.
@@ -590,18 +663,13 @@ def variational_hf_in_dft(
                 previous = anderson_points[-2]
                 latest = anderson_points[-1]
                 denominator = float(np.einsum("ij,ij->", previous.residual, previous.residual))
-                if (
-                    denominator > _PSD_FLOOR
-                    and previous.residual_norm > 10.0 * density_tol
-                ):
+                if denominator > _PSD_FLOOR and previous.residual_norm > 10.0 * density_tol:
                     lambda_eff = (
                         float(np.einsum("ij,ij->", latest.residual, previous.residual))
                         / denominator
                     )
                     if np.isfinite(lambda_eff) and -2.0 < lambda_eff < 0.98:
-                        target = np.clip(
-                            alpha / (1.0 - lambda_eff), 0.15, 0.9
-                        )
+                        target = np.clip(alpha / (1.0 - lambda_eff), 0.15, 0.9)
                         adjusted = float(np.clip(0.5 * alpha + 0.5 * target, 0.15, 0.9))
                         if abs(adjusted - alpha) > 0.03:
                             emit(
@@ -655,7 +723,7 @@ def variational_hf_in_dft(
             # residual is still large; require the residual itself to vanish.
             density_ok = new.residual_norm < density_tol
         energy_ok = abs(delta_energy) < conv_tol
-        converged = density_ok and (energy_ok or converge_on == "density")
+        converged = density_ok and (energy_ok or effective_converge_on == "density")
 
         record = SCFIteration(
             iteration=iteration,
@@ -664,11 +732,7 @@ def variational_hf_in_dft(
             dDmax=dDmax,
             residual=new.residual_norm,
             step_norm=step_norm,
-            mode=(
-                "anderson"
-                if used_anderson
-                else ("mixing" if mode == "anderson" else mode)
-            ),
+            mode=("anderson" if used_anderson else ("mixing" if mode == "anderson" else mode)),
             mix_alpha=step_alpha,
             converged=converged,
         )
@@ -679,8 +743,7 @@ def variational_hf_in_dft(
             f"SCF-in-SCF iter {iteration:3d}: E={new.energy:.10f} Ha "
             f"dE={delta_energy:+.3e} dDmax={dDmax:.3e} "
             f"residual={new.residual_norm:.3e} step={step_norm:.3e} "
-            f"mode={record.mode}"
-            + ("" if step_alpha is None else f" alpha={step_alpha:.3f}")
+            f"mode={record.mode}" + ("" if step_alpha is None else f" alpha={step_alpha:.3f}")
         )
 
         if new.residual_norm < best_point.residual_norm:
@@ -703,9 +766,11 @@ def variational_hf_in_dft(
             # Adaptive damping / rollback.
             # -------------------------------------------------------------- #
             assert alpha is not None
-            if new.residual_norm > rollback_factor * max(
-                best_point.residual_norm, _PSD_FLOOR
-            ) and new.residual_norm > 100.0 * density_tol and best_point is not new:
+            if (
+                new.residual_norm > rollback_factor * max(best_point.residual_norm, _PSD_FLOOR)
+                and new.residual_norm > 100.0 * density_tol
+                and best_point is not new
+            ):
                 alpha = max(alpha * 0.5, 0.05)
                 anderson_points = [best_point]
                 stall = 0
@@ -743,12 +808,14 @@ def variational_hf_in_dft(
                 iteration - last_improvement >= stall_window
                 and current.residual_norm > 100.0 * density_tol
             )
-            diverged = (
-                current.residual_norm > rollback_factor * max(
-                    best_point.residual_norm, _PSD_FLOOR
-                )
+            diverged_now = (
+                current.residual_norm > rollback_factor * max(best_point.residual_norm, _PSD_FLOOR)
                 and current.residual_norm > 100.0 * density_tol
             )
+            divergence_streak = divergence_streak + 1 if diverged_now else 0
+            # Require two consecutive divergent steps: a single one is the DIIS
+            # startup overshoot (see `divergence_streak` above).
+            diverged = divergence_streak >= 2
             if cycle or stagnated or diverged:
                 reason = "cycle" if cycle else ("stagnation" if stagnated else "divergence")
                 mode = "anderson"
@@ -765,10 +832,7 @@ def variational_hf_in_dft(
                     f"(alpha={alpha:.3f}, residual={best_point.residual_norm:.3e})"
                 )
 
-    message = (
-        f"variational HF-in-DFT SCF for subsystem A did not converge in {max_iter} "
-        "iterations"
-    )
+    message = f"variational HF-in-DFT SCF for subsystem A did not converge in {max_iter} iterations"
     if allow_unconverged:
         warnings.warn(
             message + "; returning the last density (allow_unconverged=True)",
@@ -798,6 +862,30 @@ def reference_wf_in_dft_hamiltonian(
     ``{"max_iter": 50, "stabilization": "anderson", "mix_alpha": 0.4, "log": print}``).
     With no options the defaults stabilize a file-driven backend automatically and
     leave the PySCF path unchanged.
+
+    A backend may expose ``high_level_reference_energy(layer)`` -- SIESTA does -- the
+    same-density offset between the bare high-level Hamiltonian and its low-level
+    A-layer total (pseudopotential double-counting and the like).  It is subtracted
+    from ``E[γ_A]`` (and hence from ``e_core``) exactly as
+    :meth:`ProjectionEmbeddingAdapter.projection_energy` subtracts it from
+    ``E_high(A)``.  Without it the protocol's total is off by tens of hartree on a
+    pseudopotential code; PySCF has no such method, so its numbers are unchanged.
+
+    The offset is a *same-density* quantity, evaluated at the initial A density, and on
+    SIESTA it changes by a few hartree across a bond stretch (measured 5.76, 8.01 and
+    8.71 Ha at butyronitrile 0.8, 1.3 and 2.5 A in SZ).  It is a same-density alignment
+    of the bare high-level Hamiltonian with the low-level A-layer total at *one*
+    geometry, not a scan-comparable reference: applying it to ``E[γ_A]`` shifts a
+    relative energy by the offset's geometry dependence (up to ~1850 kcal/mol over the
+    0.8-2.5 A range).  The applied value is reported as
+    :attr:`ReferenceProtocolInfo.energy_offset`;
+    ``info.e_variational - info.energy_offset`` is the raw variational energy on one
+    consistent reference and is what relative energies must use.
+
+    A file-driven backend also gets ``density_tol=1e-4`` unless ``scf_options``
+    overrides it.  Its ASI one-step density residual reaches a practical floor above
+    the 1e-6 default at stretched geometries; the energy at the accepted density is
+    still converged far below the resolution of the cross-code comparison.
     """
     ints = adapter.ints
     require_capability(ints, CAP_ERI, "the reference WF-in-DFT active-space Hamiltonian")
@@ -810,8 +898,37 @@ def reference_wf_in_dft_hamiltonian(
     options = dict(scf_options or {})
     if "history" in options:
         raise ValueError("pass SCF diagnostics through scf_options; 'history' is reserved")
+    if "energy_offset" in options:
+        raise ValueError("energy_offset is derived from the backend, not a scf_option")
+    if "density_tol" not in options:
+        density_floor = _external_density_tol(ints)
+        if density_floor is not None:
+            options["density_tol"] = density_floor
+    reference = getattr(ints, "high_level_reference_energy", None)
+    if callable(reference):
+        layer = getattr(getattr(adapter, "p", None), "A_LL", None)
+        if layer is None:
+            raise ValueError(
+                "the backend exposes high_level_reference_energy but the adapter has "
+                "no p.A_LL layer to evaluate it on"
+            )
+        energy_offset = -float(reference(layer))
+        logger.info(
+            "reference WF-in-DFT: applying same-density reference energy offset "
+            "%.6f Ha to E[gamma_A]",
+            energy_offset,
+        )
+    else:
+        energy_offset = 0.0
     dm_a, f, e_var, n_iter = variational_hf_in_dft(
-        ints, dm_a0, dm_b, p_b, n_occ_a, history=history, **options
+        ints,
+        dm_a0,
+        dm_b,
+        p_b,
+        n_occ_a,
+        history=history,
+        energy_offset=energy_offset,
+        **options,
     )
 
     # Canonical orbitals of the embedded Fock matrix.  B's occupied orbitals sit at
@@ -870,4 +987,5 @@ def reference_wf_in_dft_hamiltonian(
         active_orbital_energies=energies,
         converged=converged,
         scf_history=tuple(history),
+        energy_offset=energy_offset,
     )

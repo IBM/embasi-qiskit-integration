@@ -81,3 +81,46 @@ def test_real_siesta_single_evaluation(tmp_path):
     assert out.hamiltonian[0].shape == (H2O_DZP_NAO, H2O_DZP_NAO)
     assert np.isfinite(out.energy)
     assert np.asarray(evaluator.basis_atoms).shape == (H2O_DZP_NAO,)
+
+
+# TODO(embasi-siesta-shim): remove/port with _embasi_compat.py.
+def test_real_siesta_noscf_logs_energy_at_imported_density(tmp_path):
+    """The one-step log's density-dependent terms must be at the imported density.
+
+    With an imported zero density, ``Ekin = Tr[T D_in]`` is exactly zero only if
+    SIESTA evaluated the in-loop decomposition at the input density.  Under its
+    default Hamiltonian mixing (SIESTA >= 4.1) the logged ``Ekin`` is
+    ``Tr[T DM_out]`` instead and this fails -- and so does the same-density
+    reference, which reads ``Exc`` from that decomposition.
+    """
+    import re
+
+    _require_real()
+
+    from ase.build import molecule
+
+    from embasi_qiskit_integration.backends._embasi_compat import install_siesta_adapter
+    from embasi_qiskit_integration.backends.callback import LayerEvaluator
+
+    install_siesta_adapter()
+    cfg = SimpleNamespace(
+        xc_ll="PBE",
+        xc_hl="PBE",
+        basis="sto-3g",
+        spin=0,
+        unrestricted=False,
+        scf_max_cycle=1,
+        siesta_basis="DZP",
+        siesta_mesh_cutoff=200.0,
+        siesta_workdir=str(tmp_path / "work"),
+    )
+    atoms = molecule("H2O")
+    calc = S.siesta_calculator(cfg, xc="PBE", directory=".", max_scf_cycles=1, require_asi=True)
+    label = tmp_path / "zero"
+    evaluator = LayerEvaluator(atoms, calc, n_spin=1, label=str(label))
+    evaluator(np.zeros((H2O_DZP_NAO, H2O_DZP_NAO)))
+
+    log = (label / "total.log").read_text(errors="replace")
+    match = re.search(r"siesta: Ekin\s*=\s*([-+0-9.Ee]+)", log)
+    assert match is not None, "total.log has no energy decomposition"
+    assert float(match.group(1)) == pytest.approx(0.0, abs=1e-6)

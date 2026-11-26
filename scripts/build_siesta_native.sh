@@ -1039,4 +1039,3 @@ With the build tree env:
     $LIB_PATH_VAR="$RUNTIME_DIRS" \\
     $PYTEST -q tests/test_siesta_qcomp_real.py
 EOF
-

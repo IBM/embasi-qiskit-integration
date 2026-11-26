@@ -158,6 +158,9 @@ class CallbackIntegrals:
         nao: number of AO basis functions (sizes the zero-density evaluation).
         basis_atoms: AO-to-atom map, ``(nao,)``; ``None`` if the code reports none.
         ao_labels: ``(atom, element, shell, m)`` per AO, if the code reports them.
+            May also be a zero-argument callable returning that list, for a code
+            whose labels are only written after the first evaluation (SIESTA's
+            ``.ORB_INDX``); it is resolved once, on the first ``ao_labels()`` call.
         describe: fingerprint fields (``basis``, ``natm``, ``charge``, ``spin``,
             ``atom_coords``, ``atom_symbols``, and optionally ``xc_hl``).
         ll_spin_resolved: whether the low-level calculator has two spin channels.
@@ -194,7 +197,11 @@ class CallbackIntegrals:
         *,
         nao: int,
         basis_atoms: np.ndarray | None = None,
-        ao_labels: list[tuple[int, str, str, str]] | None = None,
+        ao_labels: (
+            Sequence[tuple[int, str, str, str]]
+            | Callable[[], Sequence[tuple[int, str, str, str]]]
+            | None
+        ) = None,
         describe: dict[str, Any] | None = None,
         ll_spin_resolved: bool = False,
         eri_provider: EriProvider | None = None,
@@ -216,6 +223,7 @@ class CallbackIntegrals:
                 f"basis_atoms has shape {self._basis_atoms.shape}, expected ({self._nao},)"
             )
         self._ao_labels = ao_labels
+        self._ao_labels_resolved: list[tuple[int, str, str, str]] | None = None
         self._describe = dict(describe or {})
         self._ll_spin_resolved = bool(ll_spin_resolved)
         self._eri = eri_provider
@@ -288,7 +296,19 @@ class CallbackIntegrals:
     def ao_labels(self) -> list[tuple[int, str, str, str]]:
         if self._ao_labels is None:
             raise MissingCapabilityError("this backend's QM code reports no AO labels")
-        return list(self._ao_labels)
+        if self._ao_labels_resolved is None:
+            # A callable is resolved once: the labels may only become readable after
+            # the first evaluation (SIESTA writes .ORB_INDX then), and the basis does
+            # not change between evaluations.
+            source = self._ao_labels() if callable(self._ao_labels) else self._ao_labels
+            labels = [tuple(label) for label in source]
+            if len(labels) != self._nao:
+                raise ValueError(
+                    f"AO label provider returned {len(labels)} labels for a "
+                    f"{self._nao}-function basis; its ordering cannot be trusted"
+                )
+            self._ao_labels_resolved = labels
+        return list(self._ao_labels_resolved)
 
     def search_ao_label(self, labels: Sequence[str]) -> np.ndarray:
         """AO indices whose ``"<element> <shell>"`` matches any of ``labels``."""

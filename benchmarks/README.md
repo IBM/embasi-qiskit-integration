@@ -170,9 +170,16 @@ uv run python scripts/benchmarks/run_structural_scan.py \
     --solver fci --max-cycles 1 --jobs 4 --continue-on-error
 ```
 
+The SIESTA A-layer is a one-step non-SCF evaluation.  The shim sets
+`SCF.Mix density-matrix` and `DM.MixSCF1 False` so `total.log` reports the energy
+terms at the imported density; without them SIESTA >= 4.1 logs `Exc` at `DM_out`,
+which corrupts the same-density reference.
+
 All 18 points complete; SIESTA selected active indices `[5, 6, 7, 8]` at every
-geometry.  The low-level PBE curves agree closely, while the embedded FCI
-correction remains the open comparison.
+geometry.  Low-level PBE and the full embedding relative-energy curve now track
+closely; a residual 1.7-2.3 A hump remains.  The report's dashed basis probe is the
+same PySCF calculation with `--basis sto-3g`; it keeps the AO-avas CAS(4,4)
+target and isolates the Gaussian basis change.
 
 What this fixes and what it does not:
 
@@ -194,6 +201,12 @@ What this fixes and what it does not:
   `--selector`.  The runner refuses `ao-avas` together with the reference protocol
   rather than silently ignoring the selector.
 
+
+`scripts/benchmarks/diagnose_embedding_components.py` splits the embedding total
+into `E_low_total`, `E_high(A)-E_low(A)` and the correction term, reports
+mean-centred cross-code differences and well depths, and can compare several CAS
+sizes (`--pyscf-cas 4=... --siesta-cas 10=...`).  Use it before interpreting a
+raw correction offset as physics.
 
 The comparison writes `comparison.csv`, `comparison.json`,
 `comparison_summary.md`, and PNG/PDF figures (`totals`, `relative_energy`,

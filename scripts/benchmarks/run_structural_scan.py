@@ -195,6 +195,8 @@ def _build_command(
             cmd += ["--avas_max_size", _compact_list(args.avas_max_size)]
         if args.avas_threshold is not None:
             cmd += ["--avas_threshold", str(args.avas_threshold)]
+        if args.avas_energy_window is not None:
+            cmd += ["--avas_energy_window", str(args.avas_energy_window)]
     if args.scf_newton and args.backend == "pyscf":
         cmd += ["--scf_newton", "True"]
     if args.backend == "siesta":
@@ -210,6 +212,10 @@ def _build_command(
         ]
     else:
         cmd += ["--qm_code", "pyscf", "--basis", args.basis]
+    if args.dump_active_mos:
+        cmd += ["--dump_active_mos", str(energy_path.parent / "active_mos.npz")]
+        if args.dump_downfolded_onebody:
+            cmd += ["--dump_downfolded_onebody", "True"]
     return cmd
 
 
@@ -400,6 +406,28 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="AVAS weight threshold for avas/ao-avas (default: the workflow's 0.2).",
     )
     parser.add_argument(
+        "--avas-energy-window",
+        type=float,
+        default=None,
+        metavar="DELTA",
+        help="Opt-in correlation-window virtual ranking for avas/ao-avas: keep the "
+        "highest-weight virtuals whose F_emb energy is at most HOMO + DELTA (Ha). "
+        "Omitted (default): the standard highest-weight selection, unchanged.",
+    )
+    parser.add_argument(
+        "--dump-active-mos",
+        action="store_true",
+        help="Write each geometry's --dump_active_mos .npz (active-space character "
+        "diagnostic) next to its diagnostics.csv.",
+    )
+    parser.add_argument(
+        "--dump-downfolded-onebody",
+        action="store_true",
+        help="Extend --dump-active-mos with the downfolded one-body ingredients "
+        "(h_emb, veff_hf(dm_in), canonical virtual block/energies) for offline "
+        "arbitrary-candidate scoring.  Requires --dump-active-mos.",
+    )
+    parser.add_argument(
         "--cas-size",
         type=int,
         nargs=2,
@@ -549,6 +577,7 @@ def main(argv: list[str] | None = None) -> int:
         "selector": args.selector,
         "avas_ao_labels": args.avas_ao_labels,
         "avas_max_size": (None if args.avas_max_size is None else list(args.avas_max_size)),
+        "avas_energy_window": args.avas_energy_window,
         "n_frozen_occ": args.n_frozen_occ,
         "cas_size": cas_size,
     }

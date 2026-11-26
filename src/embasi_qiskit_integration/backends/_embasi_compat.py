@@ -64,11 +64,67 @@ from embasi.qmcode_adapters import QMCodeASIAdapter
 #: ASI flavour ID for SIESTA (ASI upstream ``include/asi.h``).
 ASI_SIESTA = 3
 
+#: Opt-in: run the non-SCF one-step layers (A_LL/B_LL, the imported-density
+#: evaluations) in a *neutral* cell even when the layer carries a fragment charge.
+#:
+#: EmbASI derives a layer's SIESTA ``NetCharge`` from
+#: ``fragment_total_charge = input_total_charge + free_atom_nelectrons -
+#: input_fragment_nelectrons``.  For A_LL that is ``0 + 28 - 14 = +14``: a 12-atom
+#: supersystem cell with 28 valence ions holding only SPADE's 14 A-fragment
+#: electrons.  SIESTA neutralises the missing 14 e with a uniform background and
+#: refuses the Makov-Payne correction for the orthorhombic cells this backend
+#: builds (``madelung: WARNING: Charged system, but not SC, FCC or BCC cell``),
+#: which leaves a cell-size-dependent electrostatic gauge in the A_LL
+#: Hamiltonian (measured -0.63 Ha between the 10 A and 20 A cells, overlap
+#: identical); EmbASI's exported ``v_emb = H_AB - H_A_LL`` carries it.
+#:
+#: With this flag set, a layer whose ``density_matrix_in`` is live -- exactly the
+#: ``run_noscf`` one-step path that imports a fragment density -- omits
+#: ``NetCharge`` (SIESTA's neutral default), matching what ``eval_ll`` already
+#: does.  The full supersystem ``run_scf`` (``density_matrix_in is None``) keeps
+#: its charge, and ``input_fragment_nelectrons`` is untouched, so EmbASI's
+#: non-SCF eigenvalue-sum correction still fills the fragment electron count.
+#: Off by default.  Validated at 0.8 and 2.5 A, plus a charged/neutral one-step
+#: probe at the shipped 10 A cell: the A_LL H and S at the imported density are
+#: bit-identical between the charged and neutral cells (max|dH| = 0), the
+#: audit's -0.63 Ha 10->20 A shift being a cell-size effect, not a charge
+#: effect.  The only thing the flag moves is SIESTA's post-step ``E_KS`` scalar
+#: (a neutral cell nominally occupies 28 electrons); that scalar cancels
+#: between ``E_low_A`` and the same-density reference, and the WF assembly
+#: cancels ``H_A_LL`` in ``F_emb = H_A_LL + (H_AB - H_A_LL) + P_B``, so
+#: ``v_emb``/``h1``/``E_emb`` are unchanged.  The flag is a control for that
+#: check, not a validated default.
+NEUTRAL_LAYER_ENV = "EQI_SIESTA_NEUTRAL_A_LAYER"
+
+
+def _neutral_layer_enabled() -> bool:
+    """Whether :data:`NEUTRAL_LAYER_ENV` opts the one-step layers into a neutral cell."""
+    raw = os.environ.get(NEUTRAL_LAYER_ENV, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 #: fdf keys the adapter always keeps at these values.
+#:
+#: ``SCF.Mix density-matrix`` + ``DM.MixSCF1 False`` are load-bearing, not
+#: stylistic.  SIESTA >= 4.1 defaults to *Hamiltonian* mixing, which evaluates
+#: the one-step run's energy decomposition (``total.log``) at the post-step
+#: output density ``DM_out``.  The shim's same-density reference reads ``Exc``
+#: from that decomposition and pairs it with the imported input density
+#: ``D_in``, so under H mixing it silently evaluates the XC term at the wrong
+#: density (measured on H2O: 97 eV = 3.58 Ha, geometry dependent).  DM mixing
+#: evaluates the in-loop decomposition at ``D_in``; disabling first-step mixing
+#: keeps the final post-SCF energy at ``DM_out``, which is the density
+#: EmbASI's ``needs_nonscf_ene_corr`` correction is written for.
+#:
+#: TODO(embasi-siesta-shim): delete these two keys with this module once EmbASI
+#: either registers its own Siesta adapter (and gets the protocol right) or
+#: consumes the input-density energy terms directly instead of parsing Exc.
 _NOSCF_FDF = {
     "MaxSCFIterations": 1,
     "SCFMustConverge": False,
     "DM.UseSaveDM": False,
+    "SCF.Mix": "density-matrix",
+    "DM.MixSCF1": False,
 }
 
 
@@ -141,6 +197,19 @@ class SiestaAdapter(QMCodeASIAdapter):
         # EmbASI calls this with each *layer's* fragment charge, which is not
         # the supersystem charge (a neutral system still has charged fragments).
         charge = float(charge)
+        # Opt-in (see NEUTRAL_LAYER_ENV): a one-step layer that imports a
+        # fragment density runs in a neutral supersystem cell, so the charged
+        # fragment's uniform-background gauge cannot enter H_A_LL/v_emb.  The
+        # discriminator is EmbASI's own run_noscf path, which sets
+        # ``density_matrix_in`` before this initializer; the full supersystem
+        # ``run_scf`` leaves it None.  The non-SCF energy correction keeps the
+        # layer's ``input_fragment_nelectrons`` (the adapter never touches it),
+        # so its eigenvalue sum still fills the fragment count.
+        if _neutral_layer_enabled() and getattr(atomsembed, "density_matrix_in", None) is not None:
+            fdf = _fdf(calc)
+            fdf.pop("NetCharge", None)
+            calc.parameters["fdf_arguments"] = fdf
+            return calc
         values = {"NetCharge": charge} if abs(charge) > 1e-12 else {}
         return _set_fdf(calc, values)
 

@@ -270,6 +270,58 @@ _IMAG_TOL = 1.0e-9
 _FROZEN_OVERLAP_TOL = 0.9
 
 
+def _windowed_virtual_positions(
+    weights: np.ndarray,
+    energies: np.ndarray,
+    *,
+    n_keep: int,
+    ceiling: float,
+) -> tuple[np.ndarray, int]:
+    """Highest-weight virtual positions whose F_emb energy is inside a ceiling.
+
+    The AVAS virtual ranking can saturate -- on SIESTA's DZP basis several
+    high-energy pi* orbitals all carry target-AO weight 1.000, so "keep the
+    highest-weight virtuals" selects the *highest-energy* pair while a slightly
+    lower-weight pair only ~0.04 Ha above the occupied pi is discarded.  This
+    correlation-window policy restricts the weight ranking to candidates with
+    ``energy <= ceiling`` (the caller's highest occupied energy plus a window).
+
+    Args:
+        weights: target-AO weight of every virtual candidate, one entry each.
+        energies: F_emb energy of the same candidates (Ha).  Both arrays must
+            describe the *same* basis -- in :meth:`_avas_select` that is the
+            incoming canonical virtual block, for which energies are true
+            F_emb eigenvalues rather than expectation values of rotated columns.
+        n_keep: number of virtuals the active-space budget asks for.
+        ceiling: energy ceiling in Ha; candidates at or below it are eligible.
+
+    Returns:
+        ``(positions, shortfall)``.  ``positions`` selects candidates in
+        weight-descending order: the highest-weight in-window candidates first,
+        then -- when the window holds fewer than ``n_keep`` -- the highest-weight
+        excluded candidates.  ``shortfall`` is how many of the kept virtuals had
+        to come from outside the window, so a fixed-width active space is never
+        silently narrowed but the fallback is still reported.
+    """
+    weights = np.asarray(weights, dtype=float)
+    energies = np.asarray(energies, dtype=float)
+    if weights.shape != energies.shape:
+        raise ValueError(
+            f"weights {weights.shape} and energies {energies.shape} must describe the "
+            "same virtual candidates"
+        )
+    n_keep = int(n_keep)
+    if weights.size == 0 or n_keep <= 0:
+        return np.empty(0, dtype=int), 0
+    order = np.argsort(-weights, kind="stable")
+    inside = energies[order] <= ceiling
+    selected = order[inside][:n_keep]
+    shortfall = int(n_keep - selected.size)
+    if shortfall:
+        selected = np.concatenate([selected, order[~inside][:shortfall]])
+    return selected.astype(int), shortfall
+
+
 # --------------------------------------------------------------------------- #
 # AO integrals: the quantities EmbASI/ASI does not (yet) hand you
 # --------------------------------------------------------------------------- #
@@ -2154,6 +2206,7 @@ class ProjectionEmbeddingAdapter:
         n_frozen_occ: int = 0,
         restrict_to_a: bool = True,
         use_relaxed: bool = False,
+        energy_window: float | None = None,
     ) -> EmbeddedOrbitals:
         """AVAS active space: the subsystem-A orbitals that project onto target valence AOs.
 
@@ -2208,18 +2261,34 @@ class ProjectionEmbeddingAdapter:
                 knob, ``False`` only needed against a stub adapter without live EmbASI.
             use_relaxed: diagonalize the relaxed embedded-HF Fock from
                 :meth:`relax_active_hf` instead of the one-shot low-level F_emb.
+            energy_window: opt-in correlation-window ranking (Ha).  ``None``
+                (default) keeps the standard AVAS highest-weight virtual selection.
+                When set, a virtual is eligible only if its F_emb energy is at most
+                the highest occupied F_emb energy plus this window, and the
+                highest-weight eligible virtuals fill the fixed budget.  See
+                :meth:`_avas_select` for the exact rule; this is what
+                ``--avas_energy_window`` exposes.
 
         Returns:
             The AVAS-selected :class:`EmbeddedOrbitals`.
 
         Raises:
-            ValueError: if ``n_frozen_occ`` is out of range, no orbital passes the
-                threshold, or ``max_size`` cannot be filled from subsystem A.
+            ValueError: if ``n_frozen_occ`` is out of range, ``energy_window`` is not
+                positive, no orbital passes the threshold, or ``max_size`` cannot be
+                filled from subsystem A.
         """
         orbitals = self.build_orbitals(
             n_frozen_occ=0, restrict_to_a=restrict_to_a, use_relaxed=use_relaxed
         )
         fock = self._fock_relaxed_arr if use_relaxed else self._fock_arr
+        # The incoming canonical (pre-AVAS) block.  Kept for the opt-in downfolded-
+        # onebody diagnostic: arbitrary virtual candidates are defined in this basis,
+        # and after `_avas_select` rotates each group the canonical virtuals cannot be
+        # recovered from the returned coefficients.  Two small arrays, no effect on
+        # the selection itself.
+        canonical_coeff = np.asarray(orbitals.coeff, dtype=float).copy()
+        canonical_energy = np.asarray(orbitals.energy, dtype=float).copy()
+        ao_projector_matrix = np.asarray(ao_projector, dtype=float)
         n_occ = orbitals.n_occ
         # Restricted open shell: the first n_occ_b columns are doubly occupied and the
         # next n_occ - n_occ_b singly occupied (canonical energy order from build_orbitals).
@@ -2242,6 +2311,7 @@ class ProjectionEmbeddingAdapter:
             n_docc=n_docc,
             n_frozen_occ=n_frozen_occ,
             choose=choose,
+            energy_window=energy_window,
         )
         if sel["active"].size == 0:
             raise ValueError(
@@ -2255,10 +2325,28 @@ class ProjectionEmbeddingAdapter:
             "max_size": max_size,
             "occ_weights": sel["occ_weights"],
             "virt_weights": sel["virt_weights"],
+            "virt_selection_weights": sel["virt_selection_weights"],
             "n_active_occ": sel["n_active_occ"],
             "n_active_virt": sel["n_active_virt"],
             "n_somo": n_somo,
+            # Pre-AVAS canonical block and the target-AO metric: only the opt-in
+            # downfolded-onebody dump reads these, but capturing them here is the only
+            # place the canonical virtuals still exist.
+            "canonical_coeff": canonical_coeff,
+            "canonical_energy": canonical_energy,
+            "ao_projector": ao_projector_matrix,
         }
+        for key in (
+            "energy_window",
+            "window_ceiling",
+            "window_n_candidates",
+            "window_shortfall",
+            "virt_candidate_column",
+            "virt_candidate_energy",
+            "virt_selection_column",
+        ):
+            if key in sel:
+                self._avas_info[key] = sel[key]
         return EmbeddedOrbitals(
             coeff=sel["coeff"],
             energy=sel["energy"],
@@ -2279,6 +2367,7 @@ class ProjectionEmbeddingAdapter:
         n_docc: int,
         n_frozen_occ: int,
         choose,
+        energy_window: float | None = None,
     ) -> dict[str, Any]:
         """The AVAS rotation and selection on one orbital set, shared by both builders.
 
@@ -2290,8 +2379,21 @@ class ProjectionEmbeddingAdapter:
         ascending / descending) returns how many of each to keep; every group is then
         semi-canonicalized against ``fock``.
 
+        ``energy_window`` (Ha) is the opt-in **correlation-window policy**.  When
+        given, the virtual ranking is evaluated on the *incoming* canonical virtuals
+        (``build_orbitals`` hands in F_emb eigenvectors, so ``energy`` is a true
+        orbital energy) rather than on the AVAS-rotated columns.  A candidate is
+        eligible only if ``energy <= max(occupied F_emb) + energy_window``; the
+        highest-weight eligible virtuals are kept, and a shortfall is filled from the
+        highest-weight excluded ones (reported as ``window_shortfall``).  The
+        occupied block and the default (``None``) virtual selection are unchanged.
+
         Returns a dict with the rotated ``coeff`` and ``energy``, ``active`` / ``inactive``
-        column indices, the ``occ_weights`` / ``virt_weights`` and the kept counts.
+        column indices, the ``occ_weights`` / ``virt_weights``, the weights actually
+        used for the kept virtuals (``virt_selection_weights``) and the kept counts.
+        In window mode it also carries the candidate columns/energies (weight-sorted)
+        and the window diagnostics: ``window_ceiling``, ``window_n_candidates`` and
+        ``window_shortfall``.
         """
         c = coeff.copy()
         energy = energy.copy()
@@ -2299,6 +2401,11 @@ class ProjectionEmbeddingAdapter:
         if not 0 <= n_frozen_occ <= n_docc:
             raise ValueError(
                 f"n_frozen_occ={n_frozen_occ} outside [0, {n_docc}] doubly occupied orbitals"
+            )
+        if energy_window is not None and not energy_window > 0.0:
+            raise ValueError(
+                f"energy_window={energy_window} must be positive (a correlation window "
+                "in Ha above the highest occupied F_emb energy)"
             )
 
         def project(idx: np.ndarray, ascending: bool) -> np.ndarray:
@@ -2318,16 +2425,67 @@ class ProjectionEmbeddingAdapter:
         occ_idx = np.arange(n_frozen_occ, n_docc)
         virt_idx = np.arange(n_occ, n_orb)
         w_occ = project(occ_idx, ascending=True)
-        w_virt = project(virt_idx, ascending=False)
-        n_act_occ, n_act_virt = choose(w_occ, w_virt)
+
+        # The only virtuals with a well-defined F_emb energy are the incoming canonical
+        # virtuals; capture them before any AVAS rotation.  Their ranking weight is the
+        # target-AO expectation c^T M c of that same orbital, so weight and energy
+        # describe the same candidate (the AVAS eigenvalues belong to rotated columns,
+        # whose Fock expectation would be a mixture of canonical energies).
+        c_virt_canonical = c[:, virt_idx].copy()
+        w_virt_canonical = np.einsum(
+            "pi,pq,qi->i", c_virt_canonical, ao_projector, c_virt_canonical
+        )
+        w_virt_canonical = np.clip(w_virt_canonical, 0.0, None)
+        e_virt_canonical = energy[virt_idx].copy()
+
+        if energy_window is None:
+            # Default AVAS: rotate the virtual block and keep the largest eigenvalues.
+            w_virt = project(virt_idx, ascending=False)
+            n_act_occ, n_act_virt = choose(w_occ, w_virt)
+            active_virt = virt_idx[:n_act_virt]
+            virt_selection_weights = w_virt[:n_act_virt]
+            window_info: dict[str, Any] = {}
+        else:
+            n_act_occ, n_act_virt = choose(w_occ, w_virt_canonical)
+            # Highest occupied F_emb expectation over this orbital set -- doubly occupied,
+            # singly occupied (an open-shell SOMO can be the highest) and the frozen core
+            # all count; the frozen core is lower in energy, so it cannot raise the max.
+            occupied_fock = np.einsum("pi,pq,qi->i", c[:, :n_occ], fock, c[:, :n_occ])
+            e_homo = float(occupied_fock.max()) if occupied_fock.size else float("-inf")
+            ceiling = e_homo + energy_window
+            positions, shortfall = _windowed_virtual_positions(
+                w_virt_canonical,
+                e_virt_canonical,
+                n_keep=n_act_virt,
+                ceiling=ceiling,
+            )
+            selected_columns = virt_idx[positions]
+            by_column = np.argsort(selected_columns, kind="stable")
+            active_virt = selected_columns[by_column]
+            # Keep the reported weights aligned with the active column order (the full
+            # weight-sorted ranking is in virt_candidate_*).
+            virt_selection_weights = w_virt_canonical[positions][by_column]
+            candidate_order = np.argsort(-w_virt_canonical, kind="stable")
+            w_virt = w_virt_canonical[candidate_order]
+            window_info = {
+                "energy_window": float(energy_window),
+                "window_ceiling": ceiling,
+                "window_n_candidates": int(np.count_nonzero(e_virt_canonical <= ceiling)),
+                "window_shortfall": shortfall,
+                "virt_candidate_column": virt_idx[candidate_order],
+                "virt_candidate_energy": e_virt_canonical[candidate_order],
+                "virt_selection_column": active_virt,
+            }
 
         inactive_occ = occ_idx[: occ_idx.size - n_act_occ]
         active_occ = occ_idx[occ_idx.size - n_act_occ :]
-        active_virt = virt_idx[:n_act_virt]
-        for group in (inactive_occ, active_occ, active_virt, virt_idx[n_act_virt:]):
+        # In window mode the kept virtuals are canonical columns, not a prefix of an
+        # AVAS-rotated block, so the discarded set is the complement rather than a tail.
+        discarded_virt = np.setdiff1d(virt_idx, active_virt)
+        for group in (inactive_occ, active_occ, active_virt, discarded_virt):
             semicanonicalize(group)
 
-        return {
+        result = {
             "coeff": c,
             "energy": energy,
             "active": np.concatenate([active_occ, np.arange(n_docc, n_occ), active_virt]).astype(
@@ -2336,9 +2494,12 @@ class ProjectionEmbeddingAdapter:
             "inactive": np.concatenate([np.arange(n_frozen_occ), inactive_occ]).astype(int),
             "occ_weights": w_occ,
             "virt_weights": w_virt,
+            "virt_selection_weights": virt_selection_weights,
             "n_active_occ": n_act_occ,
             "n_active_virt": n_act_virt,
         }
+        result.update(window_info)
+        return result
 
     def build_orbitals_avas_spin(
         self,
@@ -2347,6 +2508,7 @@ class ProjectionEmbeddingAdapter:
         max_size: tuple[int, ...],
         n_frozen_occ: int = 0,
         use_relaxed: bool = False,
+        energy_window: float | None = None,
     ) -> tuple[EmbeddedOrbitals, EmbeddedOrbitals]:
         """Per-spin AVAS with the alpha and beta channels selected independently.
 
@@ -2391,6 +2553,9 @@ class ProjectionEmbeddingAdapter:
             n_frozen_occ: lowest occupied orbitals of each channel excluded from the
                 projection and always frozen.
             use_relaxed: diagonalize the relaxed per-spin Fock.
+            energy_window: opt-in correlation-window ranking (Ha), applied per channel
+                against that channel's highest occupied F_emb energy.  ``None`` keeps
+                the standard AVAS selection.
 
         Returns:
             ``(alpha, beta)`` :class:`EmbeddedOrbitals`, each describing one spin
@@ -2435,6 +2600,7 @@ class ProjectionEmbeddingAdapter:
                 n_docc=n_occ,
                 n_frozen_occ=n_frozen_occ,
                 choose=lambda w_occ, w_virt, n=nelec: (n, norb - n),
+                energy_window=energy_window,
             )
             out.append(
                 EmbeddedOrbitals(
@@ -2445,15 +2611,26 @@ class ProjectionEmbeddingAdapter:
                     active=sel["active"],
                 )
             )
-            info["channels"].append(
-                {
-                    "occ_weights": sel["occ_weights"],
-                    "virt_weights": sel["virt_weights"],
-                    "n_active_occ": sel["n_active_occ"],
-                    "n_active_virt": sel["n_active_virt"],
-                    "n_frozen": int(sel["inactive"].size),
-                }
-            )
+            channel_info = {
+                "occ_weights": sel["occ_weights"],
+                "virt_weights": sel["virt_weights"],
+                "virt_selection_weights": sel["virt_selection_weights"],
+                "n_active_occ": sel["n_active_occ"],
+                "n_active_virt": sel["n_active_virt"],
+                "n_frozen": int(sel["inactive"].size),
+            }
+            for key in (
+                "energy_window",
+                "window_ceiling",
+                "window_n_candidates",
+                "window_shortfall",
+                "virt_candidate_column",
+                "virt_candidate_energy",
+                "virt_selection_column",
+            ):
+                if key in sel:
+                    channel_info[key] = sel[key]
+            info["channels"].append(channel_info)
 
         alpha, beta = out
         cosines = np.linalg.svd(alpha.c_active.T @ self._s_arr @ beta.c_active, compute_uv=False)

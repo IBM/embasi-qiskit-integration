@@ -609,13 +609,15 @@ def fragment_ao_projector(basis, ao_labels=None, atoms=None) -> np.ndarray:
 
     Why a same-basis variant: the MINAO projector behind ``--selector avas`` needs
     ``valence_ao_projector``, which NAO/pseudopotential backends (SIESTA) do not
-    provide.  Matching labels in the working basis needs only ``search_ao_label``,
-    and when a backend reports no shell labels either (SIESTA's ASI descriptors carry
-    only the atom index) the fragment's AO *indices* from ``atom_ao_indices`` are
-    still enough: pass ``ao_labels=None`` to target every AO of ``atoms``.  On a
-    pseudopotential basis those are the valence functions, so the "all fragment AOs"
-    fallback is a chemically sensible valence target rather than a core-inclusive
-    one.
+    provide.  Matching labels in the working basis needs only ``search_ao_label``.
+    SIESTA supplies it lazily from the ``.ORB_INDX`` its low-level run writes; when
+    a backend reports no shell labels at all, the fragment's AO *indices* from
+    ``atom_ao_indices`` are still enough: pass ``ao_labels=None`` to target every AO
+    of ``atoms``.  On a pseudopotential basis those are the valence functions, so
+    the "all fragment AOs" fallback is a chemically sensible valence target rather
+    than a core-inclusive one -- but it also includes every valence shell and
+    polarisation function, so it is a different target space from a specific
+    ``"N 2p"`` request.
 
     The target AOs need not lie exactly inside ``span(A)``.  ``M`` is only the
     *metric*; the selected orbitals are rotations of subsystem-A columns, so they

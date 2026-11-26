@@ -272,6 +272,108 @@ def _weights_per_index(mol, layout) -> list[np.ndarray]:
     return [weights[:, i] for i in range(weights.shape[1])]
 
 
+def sphi_projection(atoms, shells: dict[str, list[Shell]]):
+    """PySCF primitive-Cartesian ``Mole`` for the whole system and the ``sphi`` map.
+
+    QCOMP's stored ERIs are in ``sphi``, a spherical Gaussian fit basis built from
+    the ``ORB.GAUSS.*`` shells.  This builds the same basis for *all* atoms at once,
+    as coefficient-1 primitive Cartesian Gaussians (one PySCF shell per primitive,
+    with ``NORMALIZE_GTO`` off -- exactly the construction :func:`self_eri` uses
+    for one AO), and returns
+
+    * ``mol`` -- the PySCF ``Mole`` whose AOs are those unnormalized primitives;
+    * ``W`` -- ``(mol.nao, n_sphi)``.  Column ``i`` expands ``sphi`` AO ``i`` (in
+      :func:`ao_table` order) in ``mol``'s *normalized* primitive AOs, so for a
+      density ``dm`` in the ``sphi`` basis, ``W @ dm @ W.T`` is its primitive
+      representation and ``W.T @ J_prim @ W`` maps a primitive-basis ``J`` back.
+
+    ``NORMALIZE_GTO`` is a module-global in PySCF, so it is restored in a
+    ``finally`` block: leaving it off would silently change every later PySCF
+    integral in the process.
+    """
+    from pyscf import gto
+
+    basis: dict[str, list] = {}
+    for element, element_shells in shells.items():
+        entries = []
+        for shell in element_shells:
+            # One PySCF shell per primitive: each primitive becomes its own AO,
+            # so the sphi contraction weights apply per primitive.
+            for z in shell.z:
+                entries.append((shell.l, [float(z), 1.0]))
+        basis[element] = entries
+
+    symbols = atoms.get_chemical_symbols()
+    # Only integral parity matters here; keep the Mole's electron-count parity
+    # self-consistent so PySCF does not refuse it.
+    spin = int(round(float(sum(atoms.get_atomic_numbers())))) % 2
+    previous = gto.mole.NORMALIZE_GTO
+    gto.mole.NORMALIZE_GTO = False
+    try:
+        mol = gto.M(
+            atom=[[atoms[i].symbol, tuple(atoms[i].position)] for i in range(len(atoms))],
+            basis=basis,
+            unit="Angstrom",
+            cart=True,
+            spin=spin,
+            verbose=0,
+        )
+        sdiag = np.diag(mol.intor("int1e_ovlp"))
+        n_sphi = sum(2 * shell.l + 1 for symbol in symbols for shell in shells[symbol])
+        weights = np.zeros((mol.nao, n_sphi))
+        pos = idx = 0
+        for symbol in symbols:
+            for shell in shells[symbol]:
+                ncart = len(shell.carts)
+                block = len(shell.z) * ncart
+                for m in range(-shell.l, shell.l + 1):
+                    values, _ = shell.weights(m)
+                    # values = sphi * sqrt(primitive self-overlap), so dividing
+                    # by sqrt(sdiag) expresses it in normalized primitives.
+                    weights[pos : pos + block, idx] = values / np.sqrt(sdiag[pos : pos + block])
+                    idx += 1
+                pos += block
+    finally:
+        gto.mole.NORMALIZE_GTO = previous
+    if pos != mol.nao:
+        raise RuntimeError(f"sphi weights cover {pos} of {mol.nao} primitive AOs")
+    if idx != weights.shape[1]:
+        raise RuntimeError(f"sphi weights cover {idx} of {weights.shape[1]} AOs")
+    return mol, weights
+
+
+def hartree_matrix(atoms, shells: dict[str, list[Shell]], dm: np.ndarray, *, omega=None):
+    """``J[dm]`` in the QCOMP ``sphi`` basis, reconstructed with PySCF.
+
+    ``J[p,q] = sum_rs (pq|rs) dm[r,s]``.  ``dm`` is a ``(n_sphi, n_sphi)`` matrix
+    in :func:`ao_table` order (e.g. the adapter's frozen ``D_B``).  ``omega=None``
+    is full Coulomb; ``omega`` selects QCOMP's short-range ``erfc(omega r)/r``
+    operator, which QCOMP uses when ``HFX.Omega`` is not the production
+    ``1e-8``.
+
+    The contraction is done in the primitive basis so no ``n_sphi^4`` tensor is
+    ever formed: ``dm_prim = W dm W^T``, one PySCF ``get_j`` call on the
+    primitive Mole, and ``W^T J_prim W``.
+    """
+    from pyscf import scf
+
+    dm = np.asarray(dm, dtype=float)
+    mol, weights = sphi_projection(atoms, shells)
+    n = weights.shape[1]
+    if dm.shape != (n, n):
+        raise ValueError(f"density is {dm.shape}, expected {(n, n)} in the sphi basis")
+    dm_prim = weights @ dm @ weights.T
+    engine = scf.hf.RHF(mol)
+    if omega is None:
+        j_prim = engine.get_j(mol, dm_prim)
+    else:
+        # The context manager is the form PySCF actually honours for get_j; its
+        # ``omega=`` keyword is not propagated by this version.
+        with mol.with_short_range_coulomb(float(omega)):
+            j_prim = engine.get_j(mol, dm_prim)
+    return weights.T @ np.asarray(j_prim) @ weights
+
+
 def eri_value(atoms, table, quartet, *, omega: float | None = None) -> tuple[float, str]:
     """Reference ERI for four AO indices, in the QCOMP ``sphi`` fit basis.
 

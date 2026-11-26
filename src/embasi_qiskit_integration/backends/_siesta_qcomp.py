@@ -357,11 +357,7 @@ np.savez(dst, eri_indx=indices, eri_vals=values, unit=np.asarray(unit))
                 p, q, r, s = (idx[:, i] for i in permutation)
                 pair = p * n + q
                 # (chunk, n_mo_c, n_mo_d), one right-pair transform per quartet.
-                block = (
-                    weighted[:, None, None]
-                    * cc[r][:, :, None]
-                    * cd[s][:, None, :]
-                )
+                block = weighted[:, None, None] * cc[r][:, :, None] * cd[s][:, None, :]
                 code = pair[:, None, None] * (nmo_c * nmo_d) + kl[None, :, :]
                 right += np.bincount(
                     code.ravel(), weights=block.ravel(), minlength=n * n * nmo_c * nmo_d

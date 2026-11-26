@@ -253,13 +253,9 @@ def test_basis_cache_key_ignores_positions_but_tracks_species_and_basis(tmp_path
     assert _basis_cache_key(atoms, calc, str(lib)) == _basis_cache_key(moved, calc, str(lib))
 
     other_basis = SimpleNamespace(parameters={**calc.parameters, "basis_set": "DZP"})
-    assert _basis_cache_key(atoms, calc, str(lib)) != _basis_cache_key(
-        atoms, other_basis, str(lib)
-    )
+    assert _basis_cache_key(atoms, calc, str(lib)) != _basis_cache_key(atoms, other_basis, str(lib))
     other_atoms = Atoms("NH2", positions=atoms.positions)
-    assert _basis_cache_key(atoms, calc, str(lib)) != _basis_cache_key(
-        other_atoms, calc, str(lib)
-    )
+    assert _basis_cache_key(atoms, calc, str(lib)) != _basis_cache_key(other_atoms, calc, str(lib))
 
 
 def test_nuclear_repulsion_from_psml_and_psf(monkeypatch, tmp_path):

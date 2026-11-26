@@ -440,6 +440,33 @@ def test_ao_avas_without_labels_is_the_siesta_portable_path():
     assert ad._avas_info["projector"] == "working-basis fragment AOs"
 
 
+def test_build_selector_passes_the_opt_in_energy_window():
+    # H2/STO-3G has one virtual, far above the HOMO, so a 0.3 Ha window finds no
+    # eligible candidate: the fixed budget is still filled (shortfall=1) and the
+    # untouched default reports no window at all.
+    mol = pyscf.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", verbose=0)
+    mf = mol.RHF().run(conv_tol=1e-12)
+
+    ad_default = _h2_stub(mf)
+    _sel, _loc, builder = build_selector(_cfg(), ad_default)
+    builder(ad_default)
+    assert "energy_window" not in ad_default._avas_info
+
+    ad_window = _h2_stub(mf)
+    _sel, _loc, builder = build_selector(_cfg(avas_energy_window=0.3), ad_window)
+    orb = builder(ad_window)
+    assert orb.n_active_orbitals == 2
+    assert ad_window._avas_info["energy_window"] == 0.3
+    assert ad_window._avas_info["window_shortfall"] == 1
+    assert ad_window._avas_info["window_n_candidates"] == 0
+
+
+def test_build_selector_refuses_the_window_for_other_selectors():
+    cfg = _cfg(selector="mulliken", avas_energy_window=0.3)
+    with pytest.raises(ValueError, match="applies only to the AVAS selectors"):
+        build_selector(cfg, object())
+
+
 # --------------------------------------------------------------------------- #
 # benchmark runner CLI
 # --------------------------------------------------------------------------- #

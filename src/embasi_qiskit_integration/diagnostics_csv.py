@@ -102,6 +102,260 @@ def json_cell(value: Any) -> str:
     return json.dumps(value)
 
 
+def _downfolded_onebody_payload(emb, orbitals, coefficients: np.ndarray) -> dict[str, Any]:
+    """The operator ingredients needed to score arbitrary virtual candidates offline.
+
+    The standard dump stores only the *selected* active columns, so a candidate pair
+    that was not selected cannot be scored.  This extended block adds the full
+    embedded one-body ingredients -- ``h_emb``, the high-level HF mean field at the
+    inactive density (``veff_hf(dm_in)``), the low-level mean field, the canonical
+    virtual block and the AVAS target metric -- so an analysis script can form
+    ``C^T (h_emb + veff_hf(dm_in)) C`` for any occupied/virtual choice and compare
+    its downfolded gap with the F_emb spectrum.  Also carries ``v_emb`` and the
+    initial subsystem-A density, which fix the paper-Eq.-8 correction for a candidate
+    without rerunning the embedding.
+
+    Every array is optional: a backend/selector that cannot supply a piece drops it
+    rather than failing the diagnostic.
+    """
+
+    def _array(value) -> np.ndarray | None:
+        if value is None:
+            return None
+        return np.asarray(value, dtype=float)
+
+    def _put(key: str, value) -> None:
+        array = _array(value)
+        if array is not None:
+            out[key] = array
+
+    out: dict[str, Any] = {}
+    ints = getattr(emb, "ints", None)
+    h_emb = _array(getattr(emb, "h_emb", None))
+    f_emb = _array(getattr(emb, "_fock_arr", None))
+    if h_emb is not None:
+        out["h_emb"] = h_emb
+    if f_emb is not None:
+        out["f_emb"] = f_emb
+        if h_emb is not None:
+            out["veff_ll_a"] = f_emb - h_emb
+    _put("v_emb", getattr(emb, "v_emb", None))
+    _put("p_b", getattr(emb, "p_b", None))
+    _put("dm_a_init", getattr(emb, "_dm_a_init", None))
+    if ints is not None:
+        hcore = getattr(ints, "hcore", None)
+        if callable(hcore):
+            try:
+                _put("hcore", hcore())
+            except Exception:  # noqa: BLE001 - extended diagnostic is optional
+                pass
+
+    c_in = np.asarray(coefficients[:, orbitals.inactive], dtype=float)
+    dm_in = 2.0 * (c_in @ c_in.T)
+    out["dm_in"] = dm_in
+    n_occ = int(orbitals.n_occ)
+    active = np.asarray(orbitals.active, dtype=int)
+    active_occ = active[active < n_occ]
+    if active_occ.size:
+        c_act_occ = np.asarray(coefficients[:, active_occ], dtype=float)
+        dm_act_occ = 2.0 * (c_act_occ @ c_act_occ.T)
+        out["dm_act_occ"] = dm_act_occ
+    else:
+        dm_act_occ = None
+
+    if ints is not None:
+        veff_hf = getattr(ints, "veff_hf", None)
+        if callable(veff_hf):
+            try:
+                out["veff_hf_in"] = np.asarray(veff_hf(dm_in), dtype=float)
+            except Exception:  # noqa: BLE001 - extended diagnostic is optional
+                pass
+            if dm_act_occ is not None:
+                try:
+                    out["veff_hf_act_occ"] = np.asarray(veff_hf(dm_act_occ), dtype=float)
+                except Exception:  # noqa: BLE001
+                    pass
+        veff_ll = getattr(ints, "veff_ll", None)
+        if callable(veff_ll):
+            try:
+                out["veff_ll_in"] = np.asarray(veff_ll(dm_in), dtype=float)
+            except Exception:  # noqa: BLE001
+                pass
+            if dm_act_occ is not None:
+                try:
+                    out["veff_ll_act_occ"] = np.asarray(veff_ll(dm_act_occ), dtype=float)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    info = getattr(emb, "_avas_info", None)
+    if isinstance(info, dict):
+        for key in ("canonical_coeff", "canonical_energy", "ao_projector"):
+            _put(key, info.get(key))
+    return out
+
+
+def dump_active_space(
+    path: Path,
+    *,
+    emb,
+    orbitals,
+    result,
+    cfg,
+    ham=None,
+    cycle: int = 0,
+    geometry_file: str = "",
+    geometry_parameter: float | None = None,
+    downfolded_onebody: bool = False,
+) -> Path:
+    """Write one cycle's active-space orbitals and AO labels to an ``.npz`` dump.
+
+    Opt-in diagnostic for active-space *character* comparisons across backends
+    (``EQI_EMB_DUMP_ACTIVE_MOS`` / ``--dump_active_mos``).  It writes the embedded
+    orbital coefficients and overlap in the working AO basis, the active/inactive
+    column indices, the solver 1-RDM, and -- when the backend can report them --
+    the per-AO ``(atom, element, shell, m)`` labels and the AO-to-atom map.  When the
+    downfolded Hamiltonian is supplied it also stores the orbital energies and (for
+    small active spaces) ``h1``/``h2``, so the one- and two-body drivers of the
+    correlation can be compared offline.  Nothing here re-derives physics; a
+    companion analysis script computes populations and bonding/antibonding character.
+
+    ``downfolded_onebody`` (off by default) additionally stores the full operator
+    ingredients -- ``h_emb``, ``veff_hf(dm_in)``, the low-level and high-level mean
+    fields, the canonical (pre-AVAS) virtual block/energies, the AVAS target metric,
+    ``v_emb`` and the initial A density -- so arbitrary virtual candidate pairs can be
+    scored offline (see :func:`_downfolded_onebody_payload`).  The default dump is
+    unchanged when this flag is off.
+
+    Args:
+        path: Destination ``.npz`` path.  Parent directories are created.
+        emb: The :class:`ProjectionEmbeddingAdapter` the orbitals came from (used
+            for the AO basis and overlap).
+        orbitals: The cycle's :class:`EmbeddedOrbitals` (restricted path only).
+        result: The :class:`SolverResult`; its ``rdm1`` is in the active-MO basis.
+        cfg: The workflow settings (selector and AVAS target labels go into ``meta``).
+        ham: The :class:`EmbeddedHamiltonian` solved this cycle, or ``None``.  Its
+            ``h2`` is stored only when ``norb <= 16`` (a 64k-element tensor), so the
+            dump never becomes the large object it was meant to avoid.
+        cycle: Outer-loop cycle index.
+        geometry_file: Source geometry, recorded in ``meta``.
+        geometry_parameter: Bond-distance label, recorded in ``meta``.
+
+    Returns:
+        The path written.
+    """
+    ints = emb.ints
+    coefficients = np.asarray(orbitals.coeff, dtype=float)
+    overlap = np.asarray(ints.overlap(), dtype=float)
+    active = np.asarray(orbitals.active, dtype=int)
+    inactive = np.asarray(orbitals.inactive, dtype=int)
+    atom_map = np.asarray(ints.ao_atom_map(), dtype=int)
+    payload: dict[str, Any] = {
+        "coeff": coefficients,
+        "coeff_active": coefficients[:, active],
+        "overlap": overlap,
+        "active": active,
+        "inactive": inactive,
+        "n_occ": np.asarray(int(orbitals.n_occ)),
+        "n_occ_b": np.asarray(-1 if orbitals.n_occ_b is None else int(orbitals.n_occ_b)),
+        "ao_atom_map": atom_map,
+        "rdm1_active": (
+            np.empty((0, 0))
+            if result is None or result.rdm1 is None
+            else np.asarray(result.rdm1, dtype=float)
+        ),
+        "cycle": np.asarray(int(cycle)),
+    }
+    # Orbital energies and the downfolded Hamiltonian: the one-electron spectrum sets
+    # the excitation denominators, while h2 carries the couplings.  Without these an
+    # orbital-character comparison cannot say why the same character correlates in one
+    # backend and not the other.
+    energy = getattr(orbitals, "energy", None)
+    if energy is not None:
+        energy = np.asarray(energy, dtype=float)
+        payload["orbital_energy"] = energy
+        payload["active_energy"] = energy[active]
+    if ham is not None:
+        payload["ham_nelec"] = np.asarray([int(x) for x in ham.nelec], dtype=int)
+        payload["ham_e_core"] = np.asarray(float(ham.e_core))
+        payload["h1"] = np.asarray(ham.h1, dtype=float)
+        if int(ham.norb) <= 16:
+            payload["h2"] = np.asarray(ham.h2, dtype=float)
+
+    # Labels are optional and backend-specific.  A length mismatch means the backend
+    # cannot be trusted to order them like the AO matrices, so drop them rather than
+    # silently mislabel the analysis.
+    try:
+        labels = ints.ao_labels()
+    except Exception:  # noqa: BLE001 - labels are diagnostic, never required
+        labels = None
+    if labels is not None and len(labels) == overlap.shape[0]:
+        payload["label_atom"] = np.asarray([int(lab[0]) for lab in labels], dtype=int)
+        payload["label_element"] = np.asarray([str(lab[1]) for lab in labels])
+        payload["label_shell"] = np.asarray([str(lab[2]) for lab in labels])
+        payload["label_m"] = np.asarray([str(lab[3]) for lab in labels])
+
+    try:
+        describe = ints.describe()
+    except Exception:  # noqa: BLE001 - optional metadata
+        describe = {}
+    symbols = describe.get("atom_symbols")
+    coords = describe.get("atom_coords")
+    if symbols is not None:
+        payload["atom_symbols"] = np.asarray([str(s) for s in symbols])
+    if coords is not None:
+        payload["atom_coords"] = np.asarray(coords, dtype=float)
+
+    info = getattr(emb, "_avas_info", None)
+    if isinstance(info, dict) and "channels" not in info:
+        for key in (
+            "occ_weights",
+            "virt_weights",
+            "virt_selection_weights",
+            "virt_candidate_energy",
+        ):
+            value = info.get(key)
+            if value is not None:
+                payload[key] = np.asarray(value, dtype=float)
+        for key in ("virt_candidate_column", "virt_selection_column"):
+            value = info.get(key)
+            if value is not None:
+                payload[key] = np.asarray(value, dtype=int)
+    if downfolded_onebody:
+        payload.update(_downfolded_onebody_payload(emb, orbitals, coefficients))
+        payload["downfolded_onebody"] = np.asarray(True)
+    meta = {
+        "selector": str(getattr(cfg, "selector", "")),
+        "avas_ao_labels": getattr(cfg, "avas_ao_labels", None),
+        "avas_max_size": getattr(cfg, "avas_max_size", None),
+        # Opt-in correlation-window virtual ranking (Ha); None means standard AVAS.
+        "avas_energy_window": getattr(cfg, "avas_energy_window", None),
+        "energy_window_ceiling": (
+            None if not isinstance(info, dict) else info.get("window_ceiling")
+        ),
+        "energy_window_n_candidates": (
+            None if not isinstance(info, dict) else info.get("window_n_candidates")
+        ),
+        "energy_window_shortfall": (
+            None if not isinstance(info, dict) else info.get("window_shortfall")
+        ),
+        "n_frozen_occ": getattr(cfg, "n_frozen_occ", None),
+        "projector": None if not isinstance(info, dict) else info.get("projector"),
+        "geometry_file": geometry_file,
+        "geometry_parameter": geometry_parameter,
+        "qm_code": getattr(cfg, "qm_code", None),
+        "basis": describe.get("basis"),
+        # The workflow reorders the active atoms to the front, so the fragment AO
+        # indices are 0..len(active_atoms)-1 in this dump's atom map.
+        "active_atoms": getattr(cfg, "active_atoms", None),
+    }
+    payload["meta"] = np.asarray(json.dumps(meta))
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **payload)
+    return path
+
+
 def natural_occupations(rdm1: np.ndarray) -> list[float] | None:
     """Compute natural-orbital occupations from the 1-RDM.
 

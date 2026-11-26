@@ -136,6 +136,87 @@ def test_adapter_maps_directives_to_siesta_fdf(siesta_env):
         adapter.set_ghost_atoms(None, calc, [True])
 
 
+# TODO(embasi-siesta-shim): remove/port once EmbASI ships its own Siesta adapter.
+def test_neutral_one_step_layer_charge_is_opt_in(monkeypatch: pytest.MonkeyPatch):
+    """The A_LL/B_LL one-step layers can run a neutral cell without moving the default.
+
+    ``run_noscf`` imports a fragment density and sets ``density_matrix_in`` before
+    EmbASI's calculator initializer; the full supersystem ``run_scf`` leaves it
+    ``None``.  That is the discriminator: with ``EQI_SIESTA_NEUTRAL_A_LAYER=1``
+    the non-SCF layer must omit ``NetCharge`` (SIESTA's neutral default) while the
+    full SCF keeps its layer charge.  Without the flag everything is unchanged.
+    """
+    from embasi_qiskit_integration.backends._embasi_compat import (
+        NEUTRAL_LAYER_ENV,
+        SiestaAdapter,
+    )
+
+    adapter = SiestaAdapter()
+
+    def fresh_calc() -> SimpleNamespace:
+        return SimpleNamespace(parameters={"fdf_arguments": {"SCFMustConverge": False}})
+
+    # EmbASI's two layer paths: run_noscf(dm) sets the density, run_scf() does not.
+    one_step = SimpleNamespace(density_matrix_in=object())
+    full_scf = SimpleNamespace(density_matrix_in=None)
+
+    # Default: unchanged -- the charged fragment is written for the one-step layer.
+    monkeypatch.delenv(NEUTRAL_LAYER_ENV, raising=False)
+    calc = fresh_calc()
+    adapter.set_qm_total_charge(one_step, calc, 14.0)
+    assert calc.parameters["fdf_arguments"]["NetCharge"] == 14.0
+
+    # An explicit 0 is the same as unset (the probe scripts use it for the control).
+    monkeypatch.setenv(NEUTRAL_LAYER_ENV, "0")
+    calc = fresh_calc()
+    adapter.set_qm_total_charge(one_step, calc, 14.0)
+    assert calc.parameters["fdf_arguments"]["NetCharge"] == 14.0
+
+    # Opt-in: the imported-density layer is neutral ...
+    monkeypatch.setenv(NEUTRAL_LAYER_ENV, "1")
+    calc = fresh_calc()
+    adapter.set_qm_total_charge(one_step, calc, 14.0)
+    assert "NetCharge" not in calc.parameters["fdf_arguments"]
+    assert calc.parameters["fdf_arguments"]["SCFMustConverge"] is False  # merged, not replaced
+
+    # ... while the full supersystem SCF (density_matrix_in None) keeps its charge.
+    calc = fresh_calc()
+    adapter.set_qm_total_charge(full_scf, calc, 2.0)
+    assert calc.parameters["fdf_arguments"]["NetCharge"] == 2.0
+    # A neutral full SCF stays neutral, with no redundant key written.
+    calc = fresh_calc()
+    adapter.set_qm_total_charge(full_scf, calc, 0.0)
+    assert "NetCharge" not in calc.parameters["fdf_arguments"]
+
+    # The adapter must not touch the layer's fragment electron count: EmbASI's
+    # non-SCF eigenvalue-sum correction fills exactly that many states.
+    layer = SimpleNamespace(density_matrix_in=object(), input_fragment_nelectrons=14.0)
+    adapter.set_qm_total_charge(layer, fresh_calc(), 14.0)
+    assert layer.input_fragment_nelectrons == 14.0
+
+
+# TODO(embasi-siesta-shim): remove/port with this module.
+def test_noscf_fdf_logs_energy_at_imported_density(siesta_env):
+    """The non-SCF fdf must make ``total.log``'s energy terms use the input density.
+
+    ``same_density_reference_energy`` pairs the logged ``Exc`` with the imported
+    density ``D_in``.  SIESTA >= 4.1 defaults to Hamiltonian mixing, which logs
+    the one-step decomposition at the post-step ``DM_out`` instead; DM mixing
+    evaluates it at ``D_in``, and ``DM.MixSCF1 False`` keeps the final post-SCF
+    energy at ``DM_out`` (the density EmbASI's non-SCF correction targets).
+    """
+    from embasi_qiskit_integration.backends._embasi_compat import SiestaAdapter
+
+    calc = make_calculator(siesta_env, siesta_env.tmp)
+    SiestaAdapter().set_noscf_calc_params(calc)
+    fdf = calc.parameters["fdf_arguments"]
+    assert fdf["SCF.Mix"] == "density-matrix"
+    assert fdf["DM.MixSCF1"] is False
+    # The one-step non-SCF contract itself is unchanged.
+    assert fdf["MaxSCFIterations"] == 1
+    assert fdf["SCFMustConverge"] is False
+
+
 # TODO(embasi-siesta-shim): keep the fdf/DM/pseudo assertions; drop the
 # write_inputfiles call with the shim once EmbASI writes input itself.
 def test_calculator_writes_single_dm_use_save_false_and_pseudos(siesta_env, tmp_path):

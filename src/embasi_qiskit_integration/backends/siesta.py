@@ -25,8 +25,11 @@ and a real build):
 * overlap, the full Kohn-Sham ``H`` and the density matrix, in its numerical
   atomic-orbital (NAO) basis -- so ``hcore = H[0]`` and ``veff = H[dm] - H[0]`` follow
   from Hamiltonian evaluations, as for any :mod:`~.callback` backend;
-* the AO-to-atom map from ASI's type-101 basis descriptors (atom index only; no
-  per-AO shell labels, so ``ao_labels`` is unavailable);
+* the AO-to-atom map from ASI's type-101 basis descriptors (atom index only).  ASI
+  exposes no per-AO shell labels, but the low-level evaluator writes ``.ORB_INDX``;
+  the backend reads it lazily to answer ``ao_labels``/``search_ao_label``, so
+  label-aware selection (``--selector ao-avas --avas_ao_labels ...``) works here
+  too.  Without AO labels that file is never read;
 * no pure-HF mean field: the branch supports hybrid XC (PBE0/HSE06, <=50% exchange)
   but not the 100% exchange a ``veff_hf`` probe would need;
 * **AO ERIs**, when built with ``SIESTA_WITH_QCOMP=ON`` (hybrid-XC/libint), via the
@@ -67,7 +70,7 @@ import re
 import shutil
 import tempfile
 import xml.etree.ElementTree as ET
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -223,6 +226,55 @@ def ao_labels_from_orbitals(
 
 def basis_atoms_from_orbitals(orbitals: Sequence[SiestaOrbital]) -> np.ndarray:
     return np.array([o.atom for o in orbitals], dtype=int)
+
+
+def orb_indx_ao_labels(
+    path: str | Path,
+    *,
+    nao: int | None = None,
+    basis_atoms: np.ndarray | None = None,
+) -> Callable[[], list[tuple[int, str, str, str]]]:
+    """Lazy ``(atom, element, shell, m)`` provider backed by a SIESTA ``.ORB_INDX``.
+
+    SIESTA writes ``.ORB_INDX`` during a run, *after* the backend (and its
+    :class:`~._callback.CallbackIntegrals`) has been built, so the labels cannot be
+    read at construction.  :class:`CallbackIntegrals` accepts this callable and
+    resolves it on the first ``ao_labels()`` request -- which for ``ao-avas`` happens
+    after ``run_low_level()``, when the file exists.  Reading it later is safe because
+    the NAO basis is fixed by species/pseudopotential/basis size, not by geometry.
+
+    Two checks make a stale or foreign file fail loudly rather than silently
+    mislabel the basis: the orbital count must match ``nao`` and, when supplied, the
+    per-AO atom map must match ASI's ``basis_atoms``.
+    """
+    expected_atoms = None if basis_atoms is None else np.asarray(basis_atoms, dtype=int)
+
+    def load() -> list[tuple[int, str, str, str]]:
+        exact = Path(path)
+        if exact.is_file():
+            source = exact
+        else:
+            hits = sorted(exact.parent.glob("*.ORB_INDX"))
+            if not hits:
+                raise RuntimeError(
+                    f"no .ORB_INDX under {exact.parent}; cannot label SIESTA's AO basis"
+                )
+            source = hits[0]
+        orbitals = read_orb_indx(source)
+        if nao is not None and len(orbitals) != nao:
+            raise RuntimeError(
+                f"{source} lists {len(orbitals)} orbitals but the ASI basis has {nao}; "
+                "the file does not describe this calculation"
+            )
+        atoms = basis_atoms_from_orbitals(orbitals)
+        if expected_atoms is not None and not np.array_equal(atoms, expected_atoms):
+            raise RuntimeError(
+                f"{source} atom map differs from ASI's basis_atoms; refusing to label "
+                "the basis from a mismatched file"
+            )
+        return ao_labels_from_orbitals(orbitals)
+
+    return load
 
 
 def probe_basis(atoms: Any, cfg: Any, *, directory: str | Path) -> list[SiestaOrbital]:
@@ -650,9 +702,12 @@ def same_density_reference_energy(layer: Any, integrals: Any) -> float:
     reference cancels.
 
     SIESTA's ``Exc`` in ``total.log`` is evaluated at the input density of the
-    non-SCF run, matching the other terms.  Falls back to the ``Ena``-only
-    reference when the shim could not record the density (e.g. a non-SIESTA
-    test layer).
+    non-SCF run, matching the other terms.  This relies on ``_NOSCF_FDF``
+    selecting DM mixing with no first-step mixing: SIESTA >= 4.1 defaults to
+    Hamiltonian mixing, which logs the one-step decomposition at the output
+    density instead (see the TODO(embasi-siesta-shim) note there).  Falls back
+    to the ``Ena``-only reference when the shim could not record the density
+    (e.g. a non-SIESTA test layer).
     """
     density = _layer_input_density(layer)
     if density is None:
@@ -814,7 +869,13 @@ def build_siesta_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
         None,  # no pure-HF mean field in SIESTA; ERIs supply exact exchange
         nao=n_basis,
         basis_atoms=basis_atoms,
-        ao_labels=None,  # ASI type-101 descriptors carry only the atom index
+        # ASI's type-101 descriptors carry only the atom index.  The low-level
+        # evaluator writes .ORB_INDX into this directory, so label-aware selection
+        # (--avas_ao_labels on SIESTA) resolves the full (atom, element, shell, m)
+        # table lazily; without labels the file is never read.
+        ao_labels=orb_indx_ao_labels(
+            workdir / "eval_ll" / "siesta.ORB_INDX", nao=n_basis, basis_atoms=basis_atoms
+        ),
         describe={
             "basis": f"siesta:{getattr(cfg, 'siesta_basis', 'DZP')}",
             "natm": len(atoms),

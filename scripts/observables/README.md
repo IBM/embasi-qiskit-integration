@@ -36,4 +36,3 @@ Notes:
 - `--n-elec` / `--n-orbs` are optional too — both come from the FCIDUMP header.
 
 See each script's `--help` for the full flag list.
-

@@ -282,6 +282,8 @@ class EmbeddingSetup(Protocol):
     @property
     def avas_max_size(self) -> tuple[int, ...] | None: ...
     @property
+    def avas_energy_window(self) -> float | None: ...
+    @property
     def n_frozen_occ(self) -> int: ...
     @property
     def uno_n_env(self) -> int | None: ...
@@ -455,6 +457,12 @@ def build_selector(
     occupy the first ``len(active_atoms)`` positions of the basis, so the
     fragment AO indices come straight from the leading atom slices.
     """
+    energy_window = getattr(cfg, "avas_energy_window", None)
+    if energy_window is not None and cfg.selector not in ("avas", "ao-avas"):
+        raise ValueError(
+            "--avas_energy_window applies only to the AVAS selectors "
+            f"(--selector avas/ao-avas); got --selector {cfg.selector}"
+        )
     if cfg.selector == "none":
         return None, None, None
     if cfg.selector == "uno":
@@ -545,6 +553,7 @@ def build_selector(
             max_size=cfg.avas_max_size,
             n_frozen_occ=cfg.n_frozen_occ,
             use_relaxed=use_relaxed,
+            energy_window=energy_window,
             spin=False,
             selector_name=selector_name,
             projector_label=projector_label,
@@ -564,6 +573,7 @@ def build_selector(
                     max_size=max_size,
                     n_frozen_occ=n_frozen_occ,
                     use_relaxed=use_relaxed,
+                    energy_window=energy_window,
                 )
             else:
                 orbitals = emb.build_orbitals_avas(
@@ -572,6 +582,7 @@ def build_selector(
                     max_size=max_size,
                     n_frozen_occ=n_frozen_occ,
                     use_relaxed=use_relaxed,
+                    energy_window=energy_window,
                 )
             # Record how the target AO space was defined, for the run log / diagnostics.
             # The builder is the single place that knows; build_orbitals_avas only sees
@@ -749,9 +760,11 @@ class EmbeddingWorkflow(BaseSettings):
     # projected onto, as AO labels (e.g. ["Fe 3d", "C 2p", "O 2p"]); restricted to the
     # fragment's atoms.  Required by ``--selector avas`` (MINAO labels).  For
     # ``--selector ao-avas`` the labels are matched in the working basis; None targets
-    # every AO of the active fragment, the portable fallback for SIESTA (whose ASI
-    # descriptors report no shell labels).  For the UNO fill, None -> the fragment's p
-    # shells (right for C/N/O pi and sigma bonds, not for a transition metal).
+    # every AO of the active fragment.  That fallback is portable (SIESTA can now also
+    # match labels, lazily from its .ORB_INDX, but the default stays unchanged), and on
+    # a pseudopotential basis "every AO" means all valence + polarisation functions --
+    # a wider target than e.g. ["N 2p", "C 2p"].  For the UNO fill, None -> the
+    # fragment's p shells (right for C/N/O pi and sigma bonds, not for a transition metal).
     avas_ao_labels: list[str] | None = None
     # ``--selector avas``/``ao-avas``: keep orbitals whose weight on the target AOs
     # exceeds this (PySCF's default).  ``avas`` matches the labels in this minimal
@@ -767,6 +780,12 @@ class EmbeddingWorkflow(BaseSettings):
     # For ``ao-avas`` this is the recommended mode: the occupied candidates left after
     # ``n_frozen_occ`` are ranked by fragment-AO weight, not by canonical energy.
     avas_max_size: tuple[int, ...] | None = None
+    # ``avas``/``ao-avas`` only, opt-in: correlation-window virtual ranking (Ha).  A
+    # virtual is eligible only if its canonical F_emb energy is at most the highest
+    # occupied F_emb energy plus this window; the highest target-AO-weight eligible
+    # virtuals fill the fixed budget.  None (default) keeps the standard
+    # highest-weight AVAS selection, so this is never applied implicitly.
+    avas_energy_window: float | None = None
     # UNO-SPADE only: fix the number of doubly occupied natural orbitals in the environment,
     # so B is the same size at every geometry of a scan (A takes the rest).  The doubly
     # occupied count changes with geometry as orbitals become fractional, so a fixed a_nmos
@@ -919,6 +938,18 @@ class EmbeddingWorkflow(BaseSettings):
     job_dir: Path | None = None
     output_path: Path | None = None
     diagnostics_csv: Path | None = None  # append per-cycle diagnostics here; None disables logging
+    # Opt-in active-space character diagnostic: write this cycle's embedded orbital
+    # coefficients, AO overlap/labels and solver 1-RDM to this .npz for offline
+    # analysis (scripts/benchmarks/active_space_character.py).  Off by default; the
+    # dump never feeds back into the calculation.
+    dump_active_mos: Path | None = None
+    # Opt-in extension of `dump_active_mos`: also store the full downfolded one-body
+    # ingredients -- h_emb, veff_hf(dm_in), the low/high mean fields, the canonical
+    # (pre-AVAS) virtual block/energies, the AVAS target metric, v_emb and the initial
+    # A density -- so arbitrary virtual candidate pairs can be scored offline without
+    # rerunning.  Off by default: with it off, the dump contains the previous
+    # keys/values unchanged.
+    dump_downfolded_onebody: bool = False
     # SQD solver parameters
     sqd_method: Literal["exact", "qdrift"] = "qdrift"
     # Evolution time of the SqDRIFT sampling circuits.  It sets how far the samples
@@ -1074,16 +1105,21 @@ class EmbeddingWorkflow(BaseSettings):
             n_virtual=self.n_virtual,
             n_shells=self.n_shells,
         )
+        # The backend's same-density offset is geometry dependent, so it must not
+        # enter a scan's relative energies.  ``info.e_variational`` is shifted by
+        # it; the raw value below is the one comparable across geometries.
+        e_variational = info.e_variational - info.energy_offset
         log("== Steps 2-4: reference WF-in-DFT protocol (variational SCF-in-SCF) ==")
         log(
-            f"   E[γ_A] = {info.e_variational:.6f} Ha after {info.n_iterations} SCF-in-SCF "
+            f"   E[γ_A] = {e_variational:.6f} Ha after {info.n_iterations} SCF-in-SCF "
             f"iterations; CAS({sum(ham.nelec)}e, {ham.norb}o), "
             f"{info.n_virtual_kept} canonical concentric virtual(s)"
         )
         log(f"   active orbital energies: {np.round(info.active_orbital_energies, 5)}")
         result = self._solve(ham, self._build_solver(), rank=rank, log=log)
         correlation = result.energy - info.e_variational
-        log(f"   E_solver + e_core = {result.energy:.6f} Ha (correlation {correlation:.6f} Ha)")
+        e_solver = result.energy - info.energy_offset
+        log(f"   E_solver + e_core = {e_solver:.6f} Ha (correlation {correlation:.6f} Ha)")
         if self.diagnostics_csv is not None and rank == 0:
             from embasi_qiskit_integration.diagnostics_csv import append_diagnostics_row
 
@@ -1104,18 +1140,18 @@ class EmbeddingWorkflow(BaseSettings):
                     "norb": int(ham.norb),
                     "nelec_alpha": int(ham.nelec[0]),
                     "nelec_beta": int(ham.nelec[1]),
-                    "E_solver": float(result.energy),
-                    "E_low_total": float(info.e_variational),
+                    "E_solver": float(e_solver),
+                    "E_low_total": float(e_variational),
                     "E_low_A": 0.0,
                     "E_high_A": float(correlation),
-                    "e_core": float(ham.e_core),
+                    "e_core": float(ham.e_core - info.energy_offset),
                     "correction": 0.0,
-                    "embedding_energy": float(info.e_variational + correlation),
+                    "embedding_energy": float(e_variational + correlation),
                     "rdm1_trace": float(np.trace(result.rdm1)),
                 },
             )
         return ProjectionEnergy(
-            e_low_total=info.e_variational,
+            e_low_total=e_variational,
             e_low_A=0.0,
             e_high_A=correlation,
             correction=0.0,
@@ -1326,12 +1362,19 @@ class EmbeddingWorkflow(BaseSettings):
                 w_occ = " ".join(
                     f"{w:.3f}" for w in info["occ_weights"][::-1][: info["n_active_occ"]]
                 )
-                w_virt = " ".join(f"{w:.3f}" for w in info["virt_weights"][: info["n_active_virt"]])
+                w_virt = " ".join(
+                    f"{w:.3f}"
+                    for w in info.get(
+                        "virt_selection_weights", info["virt_weights"][: info["n_active_virt"]]
+                    )
+                )
                 cut = (
                     f"threshold={self.avas_threshold}"
                     if self.avas_max_size is None
                     else f"max_size={self.avas_max_size}"
                 )
+                if info.get("energy_window") is not None:
+                    cut += f", window={info['energy_window']:g} Ha"
                 labels = self.avas_ao_labels or "<all fragment AOs>"
                 log(
                     f"   selector={self.selector} ({labels}, {cut}; "
@@ -1340,6 +1383,13 @@ class EmbeddingWorkflow(BaseSettings):
                     f"{info['n_somo']} singly occupied and {info['n_active_virt']} virtual "
                     f"(weights {w_virt or '-'}); froze {orbitals.inactive.size} occupied"
                 )
+                if info.get("energy_window") is not None:
+                    log(
+                        "   [selector] correlation window: E <= "
+                        f"{info['window_ceiling']:.4f} Ha; "
+                        f"{info['window_n_candidates']} eligible virtual(s), "
+                        f"{info['window_shortfall']} kept from outside the window"
+                    )
             elif orbital_builder is not None:
                 n_kept_virt = orbitals.n_active_orbitals - (orbitals.n_occ - orbitals.inactive.size)
                 log(
@@ -1446,6 +1496,29 @@ class EmbeddingWorkflow(BaseSettings):
                 rank=rank,
                 log=log,
             )
+
+            # Opt-in active-space character dump (see EmbeddingWorkflow.dump_active_mos).
+            # Kept separate from diagnostics_csv so it works on any run, and non-fatal
+            # like that path: a failed diagnostic must not abort the embedding.
+            if self.dump_active_mos is not None and rank == 0 and not self.spin_downfold:
+                try:
+                    from embasi_qiskit_integration.diagnostics_csv import dump_active_space
+
+                    written = dump_active_space(
+                        self.dump_active_mos,
+                        emb=emb,
+                        orbitals=orbitals,
+                        result=result,
+                        cfg=self,
+                        ham=ham,
+                        cycle=cycle,
+                        geometry_file=geometry_file,
+                        geometry_parameter=geometry_parameter,
+                        downfolded_onebody=self.dump_downfolded_onebody,
+                    )
+                    log(f"   [diagnostics] active-space dump written to {written}")
+                except Exception as exc:  # noqa: BLE001 - diagnostics are optional
+                    log(f"   [diagnostics] active-space dump skipped: {type(exc).__name__}: {exc}")
 
             if converged:
                 crit = "|ΔE|" if self.converge_on == "energy" else "|ΔE| and max|Δγ^A|"
