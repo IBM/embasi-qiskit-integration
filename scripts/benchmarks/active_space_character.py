@@ -116,9 +116,7 @@ def load_dump(path: Path, orb_indx: Path | None = None) -> dict:
         "atom_coords": record.get("atom_coords"),
         "occ_weights": record.get("occ_weights"),
         "virt_weights": record.get("virt_weights"),
-        # Opt-in AVAS correlation-window diagnostics (only present when the run used
-        # --avas_energy_window): weights/columns of the kept virtuals and the full
-        # weight-sorted candidate spectrum.
+        # Selected virtual weights/columns and the candidate spectrum, when recorded.
         "virt_selection_weights": record.get("virt_selection_weights"),
         "virt_selection_column": record.get("virt_selection_column"),
         "virt_candidate_column": record.get("virt_candidate_column"),

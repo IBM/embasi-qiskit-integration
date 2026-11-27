@@ -319,6 +319,28 @@ class PySCFIntegrals(PySCFBasis):
             self._df.build()
         return ao2mo.restore(1, self._df.ao2mo(mo_coeff), nmo)
 
+    def eri_mo_block(self, mo_a, mo_b, mo_c, mo_d) -> np.ndarray:
+        """``(p_a q_b | r_c s_d)`` for four independent blocks; see the protocol.
+
+        Uses PySCF's four-orbital-set ``ao2mo.general`` (the same call behind
+        :meth:`eri_mo_mixed`), so the four blocks may have different widths.  The
+        exact transform is required: a density-fitted backend could assemble this
+        from its three-index tensor, but the correlation ranking's denominators and
+        couplings are only meaningful if they are consistent with the exact ERIs the
+        downfold will use, so DF is refused here rather than silently mixed in.
+        """
+        from pyscf import ao2mo
+
+        if self._density_fit:
+            raise NotImplementedError(
+                "eri_mo_block needs the exact ERIs; the correlation-avas ranking "
+                "does not support a density-fitted PySCF backend"
+            )
+        blocks = tuple(np.asarray(m, dtype=float, order="F") for m in (mo_a, mo_b, mo_c, mo_d))
+        shape = tuple(b.shape[1] for b in blocks)
+        out = ao2mo.general(self.mol, blocks, compact=False)
+        return np.asarray(out, dtype=float).reshape(shape)
+
     def eri_mo_mixed(self, mo_a: np.ndarray, mo_b: np.ndarray) -> np.ndarray:
         """Mixed-spin ``(p_a q_a | r_b s_b)``, shape ``(nmo,)*4``.
 
@@ -538,6 +560,9 @@ class _PySCFEri:
 
     def eri_mo_mixed(self, mo_a: np.ndarray, mo_b: np.ndarray) -> np.ndarray:
         return self._ints.eri_mo_mixed(mo_a, mo_b)
+
+    def eri_mo_block(self, mo_a, mo_b, mo_c, mo_d) -> np.ndarray:
+        return self._ints.eri_mo_block(mo_a, mo_b, mo_c, mo_d)
 
 
 class PySCFCallbackIntegrals(CallbackIntegrals):

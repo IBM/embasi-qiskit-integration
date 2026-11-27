@@ -282,7 +282,7 @@ class EmbeddingSetup(Protocol):
     @property
     def avas_max_size(self) -> tuple[int, ...] | None: ...
     @property
-    def avas_energy_window(self) -> float | None: ...
+    def correlation_min_marginal(self) -> float: ...
     @property
     def n_frozen_occ(self) -> int: ...
     @property
@@ -457,12 +457,6 @@ def build_selector(
     occupy the first ``len(active_atoms)`` positions of the basis, so the
     fragment AO indices come straight from the leading atom slices.
     """
-    energy_window = getattr(cfg, "avas_energy_window", None)
-    if energy_window is not None and cfg.selector not in ("avas", "ao-avas"):
-        raise ValueError(
-            "--avas_energy_window applies only to the AVAS selectors "
-            f"(--selector avas/ao-avas); got --selector {cfg.selector}"
-        )
     if cfg.selector == "none":
         return None, None, None
     if cfg.selector == "uno":
@@ -503,12 +497,14 @@ def build_selector(
             )
 
         return None, None, _uno_builder
-    if cfg.selector in ("avas", "ao-avas"):
+    if cfg.selector in ("avas", "ao-avas", "correlation-avas"):
         from embasi_qiskit_integration.selectors import (
             avas_ao_projector,
             fragment_ao_projector,
         )
 
+        is_correlation = cfg.selector == "correlation-avas"
+        selector_name = cfg.selector
         # After the atom reorder the active atoms come first, so the targets are
         # restricted to the fragment's own copies of the labelled AOs.
         fragment_atoms = range(len(cfg.active_atoms))
@@ -535,16 +531,19 @@ def build_selector(
             if log is not None:
                 if cfg.avas_ao_labels:
                     log(
-                        "   [selector] ao-avas: target AOs "
+                        f"   [selector] {selector_name}: target AOs "
                         f"{list(cfg.avas_ao_labels)} on the active fragment"
                     )
                 else:
                     log(
-                        "   [selector] ao-avas: no --avas_ao_labels; targeting every AO "
-                        "of the active fragment (portable SIESTA/NAO choice)"
+                        f"   [selector] {selector_name}: no --avas_ao_labels; targeting "
+                        "every AO of the active fragment (portable SIESTA/NAO choice)"
                     )
-
-        selector_name = cfg.selector
+            if is_correlation and log is not None:
+                log(
+                    "   [selector] correlation-avas: occupied block by target-AO weight, "
+                    "virtual block by semicanonical embedded MP2 marginal correlation"
+                )
 
         def _avas_builder(
             emb,
@@ -553,12 +552,33 @@ def build_selector(
             max_size=cfg.avas_max_size,
             n_frozen_occ=cfg.n_frozen_occ,
             use_relaxed=use_relaxed,
-            energy_window=energy_window,
             spin=False,
             selector_name=selector_name,
             projector_label=projector_label,
+            is_correlation=is_correlation,
+            # Read with a default so drivers/settings predating the guard still work.
+            min_marginal=getattr(cfg, "correlation_min_marginal", 0.01),
         ):
-            if spin:
+            if is_correlation:
+                if spin:
+                    raise ValueError(
+                        "correlation-avas is closed-shell only: the MP2 metric has no "
+                        "per-spin form.  Use --selector ao-avas or avas with "
+                        "--spin_downfold."
+                    )
+                if max_size is None:
+                    raise ValueError(
+                        "--selector correlation-avas needs a fixed active-space budget: "
+                        "pass --cas-size or --avas_max_size (nelec, norb)"
+                    )
+                orbitals = emb.build_orbitals_correlation_avas(
+                    ao_projector=ao_projector,
+                    max_size=max_size,
+                    n_frozen_occ=n_frozen_occ,
+                    use_relaxed=use_relaxed,
+                    min_marginal=min_marginal,
+                )
+            elif spin:
                 # Per-spin: each channel selected on its own; only norb is shared, so the
                 # threshold cut (which cannot promise a common count) is not available.
                 if max_size is None:
@@ -573,7 +593,6 @@ def build_selector(
                     max_size=max_size,
                     n_frozen_occ=n_frozen_occ,
                     use_relaxed=use_relaxed,
-                    energy_window=energy_window,
                 )
             else:
                 orbitals = emb.build_orbitals_avas(
@@ -582,7 +601,6 @@ def build_selector(
                     max_size=max_size,
                     n_frozen_occ=n_frozen_occ,
                     use_relaxed=use_relaxed,
-                    energy_window=energy_window,
                 )
             # Record how the target AO space was defined, for the run log / diagnostics.
             # The builder is the single place that knows; build_orbitals_avas only sees
@@ -780,12 +798,14 @@ class EmbeddingWorkflow(BaseSettings):
     # For ``ao-avas`` this is the recommended mode: the occupied candidates left after
     # ``n_frozen_occ`` are ranked by fragment-AO weight, not by canonical energy.
     avas_max_size: tuple[int, ...] | None = None
-    # ``avas``/``ao-avas`` only, opt-in: correlation-window virtual ranking (Ha).  A
-    # virtual is eligible only if its canonical F_emb energy is at most the highest
-    # occupied F_emb energy plus this window; the highest target-AO-weight eligible
-    # virtuals fill the fixed budget.  None (default) keeps the standard
-    # highest-weight AVAS selection, so this is never applied implicitly.
-    avas_energy_window: float | None = None
+    # ``correlation-avas`` only: weak-signal guard (Ha).  The MP2 virtual ranking is
+    # used only if every selected virtual's |marginal correlation| reaches this value;
+    # otherwise the whole virtual block falls back to the standard AVAS target-AO
+    # weight selection (the default ao-avas space).  0 disables the guard.  The 0.01
+    # default keeps the strong H2 (top -0.016 Ha) and butyronitrile 2.5
+    # (-0.138/-0.135 Ha) selections and rejects the weak, diffuse 0.8 A ranking
+    # (top -0.0077/-0.0043 Ha) that otherwise chases C/N 3d/N2p virtuals.
+    correlation_min_marginal: float = 0.01
     # UNO-SPADE only: fix the number of doubly occupied natural orbitals in the environment,
     # so B is the same size at every geometry of a scan (A takes the rest).  The doubly
     # occupied count changes with geometry as orbitals become fractional, so a fixed a_nmos
@@ -853,6 +873,9 @@ class EmbeddingWorkflow(BaseSettings):
     # AO-defined option: without labels it targets every AO of the active fragment, which
     # works on SIESTA's NAO basis, and with ``avas_max_size`` it keeps fixed occupied and
     # virtual counts ranked by fragment-AO weight rather than by canonical energy.
+    # ``correlation-avas`` keeps the ao-avas occupied selection but
+    # replaces the saturated virtual weight cut with a semicanonical embedded-MP2
+    # marginal-correlation ranking (needs a fixed ``avas_max_size`` and a closed shell).
     # ``none`` disables.  See ``selectors`` for the papers.
     selector: Literal[
         "none",
@@ -863,6 +886,7 @@ class EmbeddingWorkflow(BaseSettings):
         "uno",
         "avas",
         "ao-avas",
+        "correlation-avas",
     ] = "concentric-cl"
     # ``concentric-cl``/``apc-concentric`` only: Fock shell expansions after shell 0.
     # 0 keeps just the fragment-spanned shell; higher values grow the candidate space
@@ -943,13 +967,6 @@ class EmbeddingWorkflow(BaseSettings):
     # analysis (scripts/benchmarks/active_space_character.py).  Off by default; the
     # dump never feeds back into the calculation.
     dump_active_mos: Path | None = None
-    # Opt-in extension of `dump_active_mos`: also store the full downfolded one-body
-    # ingredients -- h_emb, veff_hf(dm_in), the low/high mean fields, the canonical
-    # (pre-AVAS) virtual block/energies, the AVAS target metric, v_emb and the initial
-    # A density -- so arbitrary virtual candidate pairs can be scored offline without
-    # rerunning.  Off by default: with it off, the dump contains the previous
-    # keys/values unchanged.
-    dump_downfolded_onebody: bool = False
     # SQD solver parameters
     sqd_method: Literal["exact", "qdrift"] = "qdrift"
     # Evolution time of the SqDRIFT sampling circuits.  It sets how far the samples
@@ -1357,38 +1374,59 @@ class EmbeddingWorkflow(BaseSettings):
                 log(f"   {orbitals}")
             if self.spin_downfold:
                 pass  # already logged per channel above
-            elif orbital_builder is not None and self.selector in ("avas", "ao-avas"):
+            elif orbital_builder is not None and self.selector in (
+                "avas",
+                "ao-avas",
+                "correlation-avas",
+            ):
                 info = emb._avas_info
+                is_correlation = self.selector == "correlation-avas"
+                correlation_fallback = bool(info.get("correlation_fallback"))
                 w_occ = " ".join(
                     f"{w:.3f}" for w in info["occ_weights"][::-1][: info["n_active_occ"]]
                 )
-                w_virt = " ".join(
-                    f"{w:.3f}"
-                    for w in info.get(
-                        "virt_selection_weights", info["virt_weights"][: info["n_active_virt"]]
+                if is_correlation and not correlation_fallback:
+                    # The kept virtuals are ranked by MP2 marginal correlation (Ha),
+                    # not by the target-AO weight.
+                    w_virt = " ".join(f"{w:.4f}" for w in info.get("virt_selection_weights", []))
+                    cut = f"max_size={self.avas_max_size}, mp2-marginal"
+                elif is_correlation:
+                    # Weak-signal guard fired: the virtuals are the standard AVAS
+                    # weight selection, not the MP2 ranking.
+                    w_virt = " ".join(f"{w:.3f}" for w in info.get("virt_selection_weights", []))
+                    cut = f"max_size={self.avas_max_size}, avas-weights (MP2 fallback)"
+                else:
+                    w_virt = " ".join(
+                        f"{w:.3f}"
+                        for w in info.get(
+                            "virt_selection_weights", info["virt_weights"][: info["n_active_virt"]]
+                        )
                     )
-                )
-                cut = (
-                    f"threshold={self.avas_threshold}"
-                    if self.avas_max_size is None
-                    else f"max_size={self.avas_max_size}"
-                )
-                if info.get("energy_window") is not None:
-                    cut += f", window={info['energy_window']:g} Ha"
+                    cut = (
+                        f"threshold={self.avas_threshold}"
+                        if self.avas_max_size is None
+                        else f"max_size={self.avas_max_size}"
+                    )
                 labels = self.avas_ao_labels or "<all fragment AOs>"
+                virt_label = (
+                    "MP2 marg" if is_correlation and not correlation_fallback else "weights"
+                )
                 log(
                     f"   selector={self.selector} ({labels}, {cut}; "
                     f"{info.get('projector', '?')}) "
                     f"kept {info['n_active_occ']} occupied (weights {w_occ or '-'}), "
                     f"{info['n_somo']} singly occupied and {info['n_active_virt']} virtual "
-                    f"(weights {w_virt or '-'}); froze {orbitals.inactive.size} occupied"
+                    f"({virt_label} {w_virt or '-'}); froze {orbitals.inactive.size} occupied"
                 )
-                if info.get("energy_window") is not None:
+                if correlation_fallback:
+                    attempted = " ".join(
+                        f"{abs(float(w)):.4f}"
+                        for w in info.get("correlation_attempted_marginals", [])
+                    )
                     log(
-                        "   [selector] correlation window: E <= "
-                        f"{info['window_ceiling']:.4f} Ha; "
-                        f"{info['window_n_candidates']} eligible virtual(s), "
-                        f"{info['window_shortfall']} kept from outside the window"
+                        "   [selector] correlation-avas weak-signal guard: |MP2 marginal| "
+                        f"{attempted or '-'} < {info.get('correlation_min_marginal')} Ha; "
+                        "fell back to the standard AVAS weight ranking"
                     )
             elif orbital_builder is not None:
                 n_kept_virt = orbitals.n_active_orbitals - (orbitals.n_occ - orbitals.inactive.size)
@@ -1514,7 +1552,6 @@ class EmbeddingWorkflow(BaseSettings):
                         cycle=cycle,
                         geometry_file=geometry_file,
                         geometry_parameter=geometry_parameter,
-                        downfolded_onebody=self.dump_downfolded_onebody,
                     )
                     log(f"   [diagnostics] active-space dump written to {written}")
                 except Exception as exc:  # noqa: BLE001 - diagnostics are optional

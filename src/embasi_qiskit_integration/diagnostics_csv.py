@@ -102,98 +102,6 @@ def json_cell(value: Any) -> str:
     return json.dumps(value)
 
 
-def _downfolded_onebody_payload(emb, orbitals, coefficients: np.ndarray) -> dict[str, Any]:
-    """The operator ingredients needed to score arbitrary virtual candidates offline.
-
-    The standard dump stores only the *selected* active columns, so a candidate pair
-    that was not selected cannot be scored.  This extended block adds the full
-    embedded one-body ingredients -- ``h_emb``, the high-level HF mean field at the
-    inactive density (``veff_hf(dm_in)``), the low-level mean field, the canonical
-    virtual block and the AVAS target metric -- so an analysis script can form
-    ``C^T (h_emb + veff_hf(dm_in)) C`` for any occupied/virtual choice and compare
-    its downfolded gap with the F_emb spectrum.  Also carries ``v_emb`` and the
-    initial subsystem-A density, which fix the paper-Eq.-8 correction for a candidate
-    without rerunning the embedding.
-
-    Every array is optional: a backend/selector that cannot supply a piece drops it
-    rather than failing the diagnostic.
-    """
-
-    def _array(value) -> np.ndarray | None:
-        if value is None:
-            return None
-        return np.asarray(value, dtype=float)
-
-    def _put(key: str, value) -> None:
-        array = _array(value)
-        if array is not None:
-            out[key] = array
-
-    out: dict[str, Any] = {}
-    ints = getattr(emb, "ints", None)
-    h_emb = _array(getattr(emb, "h_emb", None))
-    f_emb = _array(getattr(emb, "_fock_arr", None))
-    if h_emb is not None:
-        out["h_emb"] = h_emb
-    if f_emb is not None:
-        out["f_emb"] = f_emb
-        if h_emb is not None:
-            out["veff_ll_a"] = f_emb - h_emb
-    _put("v_emb", getattr(emb, "v_emb", None))
-    _put("p_b", getattr(emb, "p_b", None))
-    _put("dm_a_init", getattr(emb, "_dm_a_init", None))
-    if ints is not None:
-        hcore = getattr(ints, "hcore", None)
-        if callable(hcore):
-            try:
-                _put("hcore", hcore())
-            except Exception:  # noqa: BLE001 - extended diagnostic is optional
-                pass
-
-    c_in = np.asarray(coefficients[:, orbitals.inactive], dtype=float)
-    dm_in = 2.0 * (c_in @ c_in.T)
-    out["dm_in"] = dm_in
-    n_occ = int(orbitals.n_occ)
-    active = np.asarray(orbitals.active, dtype=int)
-    active_occ = active[active < n_occ]
-    if active_occ.size:
-        c_act_occ = np.asarray(coefficients[:, active_occ], dtype=float)
-        dm_act_occ = 2.0 * (c_act_occ @ c_act_occ.T)
-        out["dm_act_occ"] = dm_act_occ
-    else:
-        dm_act_occ = None
-
-    if ints is not None:
-        veff_hf = getattr(ints, "veff_hf", None)
-        if callable(veff_hf):
-            try:
-                out["veff_hf_in"] = np.asarray(veff_hf(dm_in), dtype=float)
-            except Exception:  # noqa: BLE001 - extended diagnostic is optional
-                pass
-            if dm_act_occ is not None:
-                try:
-                    out["veff_hf_act_occ"] = np.asarray(veff_hf(dm_act_occ), dtype=float)
-                except Exception:  # noqa: BLE001
-                    pass
-        veff_ll = getattr(ints, "veff_ll", None)
-        if callable(veff_ll):
-            try:
-                out["veff_ll_in"] = np.asarray(veff_ll(dm_in), dtype=float)
-            except Exception:  # noqa: BLE001
-                pass
-            if dm_act_occ is not None:
-                try:
-                    out["veff_ll_act_occ"] = np.asarray(veff_ll(dm_act_occ), dtype=float)
-                except Exception:  # noqa: BLE001
-                    pass
-
-    info = getattr(emb, "_avas_info", None)
-    if isinstance(info, dict):
-        for key in ("canonical_coeff", "canonical_energy", "ao_projector"):
-            _put(key, info.get(key))
-    return out
-
-
 def dump_active_space(
     path: Path,
     *,
@@ -205,7 +113,6 @@ def dump_active_space(
     cycle: int = 0,
     geometry_file: str = "",
     geometry_parameter: float | None = None,
-    downfolded_onebody: bool = False,
 ) -> Path:
     """Write one cycle's active-space orbitals and AO labels to an ``.npz`` dump.
 
@@ -218,13 +125,6 @@ def dump_active_space(
     small active spaces) ``h1``/``h2``, so the one- and two-body drivers of the
     correlation can be compared offline.  Nothing here re-derives physics; a
     companion analysis script computes populations and bonding/antibonding character.
-
-    ``downfolded_onebody`` (off by default) additionally stores the full operator
-    ingredients -- ``h_emb``, ``veff_hf(dm_in)``, the low-level and high-level mean
-    fields, the canonical (pre-AVAS) virtual block/energies, the AVAS target metric,
-    ``v_emb`` and the initial A density -- so arbitrary virtual candidate pairs can be
-    scored offline (see :func:`_downfolded_onebody_payload`).  The default dump is
-    unchanged when this flag is off.
 
     Args:
         path: Destination ``.npz`` path.  Parent directories are created.
@@ -320,23 +220,17 @@ def dump_active_space(
             value = info.get(key)
             if value is not None:
                 payload[key] = np.asarray(value, dtype=int)
-    if downfolded_onebody:
-        payload.update(_downfolded_onebody_payload(emb, orbitals, coefficients))
-        payload["downfolded_onebody"] = np.asarray(True)
     meta = {
         "selector": str(getattr(cfg, "selector", "")),
         "avas_ao_labels": getattr(cfg, "avas_ao_labels", None),
         "avas_max_size": getattr(cfg, "avas_max_size", None),
-        # Opt-in correlation-window virtual ranking (Ha); None means standard AVAS.
-        "avas_energy_window": getattr(cfg, "avas_energy_window", None),
-        "energy_window_ceiling": (
-            None if not isinstance(info, dict) else info.get("window_ceiling")
+        # ``correlation-avas`` weak-signal guard: True means the standard AVAS
+        # virtual weight space was returned instead of the MP2-selected one.
+        "correlation_fallback": (
+            None if not isinstance(info, dict) else info.get("correlation_fallback")
         ),
-        "energy_window_n_candidates": (
-            None if not isinstance(info, dict) else info.get("window_n_candidates")
-        ),
-        "energy_window_shortfall": (
-            None if not isinstance(info, dict) else info.get("window_shortfall")
+        "correlation_min_marginal": (
+            None if not isinstance(info, dict) else info.get("correlation_min_marginal")
         ),
         "n_frozen_occ": getattr(cfg, "n_frozen_occ", None),
         "projector": None if not isinstance(info, dict) else info.get("projector"),

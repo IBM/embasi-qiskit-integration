@@ -442,6 +442,34 @@ class CallbackIntegrals:
             raise MissingCapabilityError("this backend's QM code provides no ERIs")
         return self._eri.eri_mo_mixed(mo_a, mo_b)
 
+    def eri_mo_block(self, mo_a, mo_b, mo_c, mo_d) -> np.ndarray:
+        """Four independent orbital blocks; see :meth:`AOIntegrals.eri_mo_block`.
+
+        The native path delegates to the code-specific ERI provider (SIESTA-QCOMP's
+        block transform streams the stored quartets).  A provider that only exposes
+        ``eri_mo`` falls back to transforming the union of the four blocks, which is
+        only allowed for small unions: on an NAO basis the union of the occupied and
+        candidate-virtual blocks is essentially the whole subsystem, and its fourth
+        power is exactly what this method exists to avoid.
+        """
+        if self._eri is None:
+            raise MissingCapabilityError("this backend's QM code provides no ERIs")
+        native = getattr(self._eri, "eri_mo_block", None)
+        if callable(native):
+            return np.asarray(native(mo_a, mo_b, mo_c, mo_d), dtype=float)
+        blocks = [np.asarray(m, dtype=float) for m in (mo_a, mo_b, mo_c, mo_d)]
+        union = np.hstack(blocks)
+        if union.shape[1] > 24:
+            raise MissingCapabilityError(
+                "this backend's ERI provider implements only eri_mo(); the "
+                "correlation-avas block transform needs eri_mo_block() (or a union "
+                f"of at most 24 orbitals, got {union.shape[1]})"
+            )
+        transformed = self.eri_mo(union)
+        offsets = np.cumsum([0] + [b.shape[1] for b in blocks])
+        idx = [np.arange(offsets[i], offsets[i + 1]) for i in range(4)]
+        return np.asarray(transformed[np.ix_(idx[0], idx[1], idx[2], idx[3])], dtype=float)
+
     # ---------------- SCF status / footing ---------------- #
     def layer_scf_status(self, layer: Any) -> dict[str, Any] | None:
         return None if self._scf_status is None else self._scf_status(layer)

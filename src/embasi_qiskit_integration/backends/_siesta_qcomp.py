@@ -408,3 +408,36 @@ np.savez(dst, eri_indx=indices, eri_vals=values, unit=np.asarray(unit))
                 f"mo_a/mo_b must have {self.n_ao} rows; got {coeff_a.shape}/{coeff_b.shape}"
             )
         return self._transform_four(coeff_a, coeff_a, coeff_b, coeff_b)
+
+    def eri_mo_block(
+        self,
+        mo_a: np.ndarray,
+        mo_b: np.ndarray,
+        mo_c: np.ndarray,
+        mo_d: np.ndarray,
+    ) -> np.ndarray:
+        """Chemist-notation ``(p_a q_b | r_c s_d)`` for four independent blocks.
+
+        The sparse quartet transform requires the *two left* blocks to have equal
+        width, which is not true of the mixed ``(ia|jb)`` block the MP2 ranking
+        needs (one occupied and one virtual on each side).  When the direct
+        transform is not rectangularly compatible, transform the right pair with an
+        identity left pair -- always allowed -- and contract the left pair into the
+        resulting ``(n_ao, n_ao, n_c, n_d)`` intermediate.  For the sizes the
+        ranking uses (2 occupied x 86 virtual on a 100-AO basis) that intermediate
+        is ~1.7M doubles, not the fourth power of the subsystem.
+        """
+        ca = np.asarray(mo_a, dtype=float)
+        cb = np.asarray(mo_b, dtype=float)
+        cc = np.asarray(mo_c, dtype=float)
+        cd = np.asarray(mo_d, dtype=float)
+        for name, block in (("mo_a", ca), ("mo_b", cb), ("mo_c", cc), ("mo_d", cd)):
+            if block.ndim != 2 or block.shape[0] != self.n_ao:
+                raise ValueError(f"{name} must be 2-D with {self.n_ao} rows; got {block.shape}")
+        self._load()
+        assert self.n_ao is not None
+        if ca.shape[1] == cb.shape[1] and cc.shape[1] == cd.shape[1]:
+            return self._transform_four(ca, cb, cc, cd)
+        identity = np.eye(self.n_ao)
+        right = self._transform_four(identity, identity, cc, cd)
+        return np.ascontiguousarray(np.einsum("pqkl,pi,qj->ijkl", right, ca, cb, optimize=True))
