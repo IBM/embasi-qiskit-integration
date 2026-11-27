@@ -290,6 +290,138 @@ def test_layer_footing_hcore_includes_the_ecp():
     assert enuc == pytest.approx(mol.energy_nuc())
 
 
+def test_footing_and_nuclear_energy_honour_mean_field_overrides():
+    """An external potential lives on the SCF object; the Mole-only calls drop it.
+
+    ``pyscf.qmmm.add_mm_charges`` overrides ``get_hcore`` and ``energy_nuc``.  The
+    layer's footing and the integral backend's nuclear reference must read those
+    overrides, not the bare ``Mole``, or the point-charge terms disappear from the
+    Hamiltonian and its energy zero.
+    """
+    from pyscf import gto, qmmm, scf
+
+    from embasi_qiskit_integration.backends.pyscf import pyscf_layer_footing
+
+    mol = gto.M(atom="O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587", basis="sto-3g", verbose=0)
+    mf = qmmm.add_mm_charges(scf.RHF(mol), [(0.0, 0.0, 4.0)], [-1.0])
+    layer = SimpleNamespace(atoms=SimpleNamespace(calc=SimpleNamespace(method=mf, mol=mol)))
+
+    hcore, enuc = pyscf_layer_footing(layer)
+    np.testing.assert_allclose(hcore, mf.get_hcore(), atol=1e-12)
+    assert not np.allclose(hcore, scf.hf.get_hcore(mol))
+    assert enuc == pytest.approx(mf.energy_nuc(), abs=1e-12)
+    assert enuc != pytest.approx(mol.energy_nuc())
+
+    ints = PySCFIntegrals(mf)
+    np.testing.assert_allclose(ints.hcore(), mf.get_hcore(), atol=1e-12)
+    assert ints.energy_nuc() == pytest.approx(mf.energy_nuc(), abs=1e-12)
+
+
+def test_deepcopy_preserves_direct_scf_state_for_plain_and_newton_mean_fields():
+    """PySCF's pickle hooks null ``_opt``; EmbASI's copies must still run direct SCF.
+
+    ``SCF.get_jk`` reads ``self._opt.get(omega)`` on the direct route (AO ERIs over
+    ``max_memory``).  A second-order (Newton) wrapper builds its Fock through the inner
+    ``_scf``, which is copied through the wrapper, so preserving only the outer object
+    leaves the direct route broken there.  The copy must also drop the original's
+    populated optimizer cache: it holds ctypes pointers and would make ``deepcopy``
+    itself fail.
+    """
+    from pyscf import gto, scf
+
+    from embasi_qiskit_integration.backends.pyscf import _preserve_scf_state_on_deepcopy
+
+    mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", verbose=0)
+    mol.max_memory = 1  # below the process size: SCF.get_jk takes the direct route
+    reference = scf.RHF(mol).kernel()
+
+    plain = scf.RHF(mol)
+    assert plain.kernel() == pytest.approx(reference, abs=1e-8)
+    assert plain._opt[None] is not None  # a live optimizer cache, not {None: None}
+    _preserve_scf_state_on_deepcopy(plain)
+    plain_copy = copy.deepcopy(plain)
+    assert plain_copy._opt == {None: None}
+    assert plain_copy.kernel() == pytest.approx(reference, abs=1e-8)
+
+    wrapped = scf.RHF(mol).newton()
+    assert wrapped.kernel() == pytest.approx(reference, abs=1e-8)
+    assert wrapped._scf._opt[None] is not None
+    _preserve_scf_state_on_deepcopy(wrapped)
+    wrapped_copy = copy.deepcopy(wrapped)
+    assert wrapped_copy._opt == {None: None}
+    assert wrapped_copy._scf._opt == {None: None}
+    assert wrapped_copy.kernel() == pytest.approx(reference, abs=1e-8)
+
+    # EmbASI copies the ASE calculator, not the bare SCF, so exercise that path too.
+    from pyscf.pbc.tools.pyscf_ase import PySCF
+
+    calc_copy = copy.deepcopy(PySCF(method=wrapped))
+    assert calc_copy.method._opt == {None: None}
+    assert calc_copy.method._scf._opt == {None: None}
+    assert calc_copy.method.kernel() == pytest.approx(reference, abs=1e-8)
+
+
+def test_pyscf_builder_protects_the_newton_inner_mean_field(tmp_path):
+    """The builder's second-order low level keeps its inner ``_opt`` across the copy."""
+    from ase import Atoms
+
+    from embasi_qiskit_integration.backends.registry import make_backend
+
+    atoms = Atoms("H2", positions=[(0, 0, 0), (0, 0, 0.74)])
+    chkfile = tmp_path / "chk" / "run.chk"
+    cfg = SimpleNamespace(
+        basis="sto-3g",
+        spin=0,
+        unrestricted=False,
+        xc_ll="PBE",
+        xc_hl="HF",
+        scf_max_cycle=None,
+        init_guess=None,
+        init_guess_breaksym=None,
+        scf_newton=True,
+        density_fit=False,
+        df_auxbasis=None,
+        scf_chkfile_out=chkfile,
+    )
+    backend = make_backend("pyscf", atoms, 0, cfg)
+    copied = copy.deepcopy(backend.calc_ll)
+    assert copied.method._scf._opt == {None: None}
+    assert copied.method._opt == {None: None}
+    # The wrapper owns the requested checkpoint; the inner SCF does not share it.
+    assert copied.method.chkfile == str(chkfile)
+    assert copied.method._scf.chkfile != str(chkfile)
+
+
+def test_callback_backend_protects_its_exchange_calculator_from_deepcopy(monkeypatch):
+    """``LayerEvaluator`` deep-copies the HF evaluator before every evaluation."""
+    from ase import Atoms
+    from pyscf import gto
+
+    from embasi_qiskit_integration.backends.registry import make_backend
+
+    monkeypatch.setattr(gto.Mole, "max_memory", 1, raising=False)  # force direct SCF
+    atoms = Atoms("H2", positions=[(0, 0, 0), (0, 0, 0.74)])
+    cfg = SimpleNamespace(
+        basis="sto-3g",
+        spin=0,
+        unrestricted=False,
+        xc_ll="PBE",
+        xc_hl="HF",
+        scf_max_cycle=None,
+        init_guess=None,
+        init_guess_breaksym=None,
+        scf_newton=False,
+        density_fit=False,
+        df_auxbasis=None,
+        scf_chkfile_out=None,
+    )
+    backend = make_backend("pyscf-callback", atoms, 0, cfg)
+    calc_hf = backend.integrals._eval_hf._layer.initial_calc
+    copied = copy.deepcopy(calc_hf)
+    assert copied.method._opt == {None: None}
+    assert copied.method.kernel() == pytest.approx(calc_hf.method.kernel(), abs=1e-8)
+
+
 # --------------------------------------------------------------------------- #
 # Capabilities
 # --------------------------------------------------------------------------- #
@@ -466,6 +598,9 @@ def test_pyscf_builder_constructs_matching_calculators_and_integrals(tmp_path):
     assert ints.mf_ll.chkfile == str(tmp_path / "chk" / "run.chk")
     assert ints.mf.chkfile == ints.mf_ll.chkfile
     assert copy.deepcopy(ints.mf_ll).chkfile == ints.mf_ll.chkfile
+    # The direct-SCF state survives the same copy (both mean fields are protected).
+    assert copy.deepcopy(ints.mf_ll)._opt == {None: None}
+    assert copy.deepcopy(ints.mf)._opt == {None: None}
     assert (tmp_path / "chk").is_dir()
     assert ints.describe()["density_fit"] == "weigend"  # auxbasis wins over the bool
     assert ints.nao == 7
@@ -607,3 +742,66 @@ def test_scf_hint_names_pyscf_flags_only_for_pyscf():
 def test_fingerprint_does_not_read_private_backend_state():
     src = (PKG / "projection_embedding_adapter.py").read_text()
     assert "_density_fit" not in src
+
+
+# --------------------------------------------------------------------------- #
+# Mean-field hcore overrides in EmbASI's estat_xc matrix
+# --------------------------------------------------------------------------- #
+class _Mat:
+    """The small slice of ``SpinKpointArray`` the hcore shim touches."""
+
+    def __init__(self, matrix: np.ndarray):
+        self.matrix = np.asarray(matrix, dtype=float)
+        self.n_spins = 1
+        self.n_kpoints = 1
+
+    def __getitem__(self, key):
+        return self.matrix
+
+    def __setitem__(self, key, value):
+        self.matrix = np.asarray(value, dtype=float)
+
+
+class _Mol:
+    def __init__(self, kin: np.ndarray, nuc: np.ndarray):
+        self._kin = kin
+        self._nuc = nuc
+
+    def intor(self, name: str) -> np.ndarray:
+        return {"int1e_kin": self._kin, "int1e_nuc": self._nuc}[name]
+
+
+class _Mf:
+    def __init__(self, kin: np.ndarray, nuc: np.ndarray, external: np.ndarray | None = None):
+        self.mol = _Mol(kin, nuc)
+        self._external = np.zeros_like(kin) if external is None else external
+
+    def get_hcore(self) -> np.ndarray:
+        return self.mol._kin + self.mol._nuc + self._external
+
+
+def test_method_hcore_shift_adds_external_potential_to_estat_xc():
+    from embasi_qiskit_integration.backends.pyscf import _apply_method_hcore_shift
+
+    kin = np.eye(3)
+    nuc = np.diag([-2.0, -1.0, -0.5])
+    veff = np.full((3, 3), 0.1)
+    external = np.diag([0.4, 0.3, 0.2])
+    rundata = SimpleNamespace(ham_estat_xc=_Mat(nuc + veff))
+    mf = _Mf(kin, nuc, external)
+
+    assert _apply_method_hcore_shift(rundata, mf) is True
+    np.testing.assert_allclose(rundata.ham_estat_xc.matrix, nuc + veff + external)
+
+
+def test_method_hcore_shift_is_a_no_op_without_overrides():
+    from embasi_qiskit_integration.backends.pyscf import _apply_method_hcore_shift
+
+    kin = np.eye(2)
+    nuc = np.diag([-1.0, -0.5])
+    veff = np.full((2, 2), 0.2)
+    est = _Mat(nuc + veff)
+    rundata = SimpleNamespace(ham_estat_xc=est)
+
+    assert _apply_method_hcore_shift(rundata, _Mf(kin, nuc)) is False
+    np.testing.assert_allclose(est.matrix, nuc + veff)

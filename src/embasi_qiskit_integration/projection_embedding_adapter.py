@@ -79,7 +79,8 @@ Upstream gaps that remain (each marked ``TODO(embasi-api)`` inline):
   ``(pq|rs) = sum_P M^P_pq M^P_rs`` -- so FHI-aims cannot drive the WF-in-DFT half
   and the workflow stays PySCF-only.  See :class:`FHIaimsIntegrals`.
 * **No A-fragment footing (h_core^A / E_nuc^A).**  The WF-path nuclear-frame rebase
-  asks the backend for ``layer_footing(A_LL)`` (PySCF: ``A_LL.atoms.calc.mol``) because EmbASI exposes
+  asks the backend for ``layer_footing(A_LL)`` (PySCF: the layer's mean field,
+  ``A_LL.atoms.calc.method``) because EmbASI exposes
   no backend-agnostic A-fragment one-electron operator / nuclear repulsion; the
   rebase is therefore PySCF-only.  See :meth:`_a_fragment_footing`.
   **Largely moot since EmbASI's ``9c21cac``**, which sets ``ghosts=0`` on every
@@ -4015,13 +4016,16 @@ class ProjectionEmbeddingAdapter:
         only**: the DFT-in-DFT path reads EmbASI's native ``DFT_AinB_total_energy``,
         which telescopes on EmbASI's own frame and needs no rebase (:meth:`dft_in_dft_energy`).
 
-        We read the operators *directly* off EmbASI's ``A_LL`` ``mol`` (the same
-        object it integrated), not by reconstructing them from a subtraction of
-        exposed matrices -- ``A_LL.hamiltonian_estat_plus_xc`` bundles the nuclear
-        attraction together with Coulomb+xc, so h_core^A is not separable from
-        what EmbASI exports.  ``int1e_kin + int1e_nuc`` on that ``mol`` reproduces
-        ``subsys_A_lowlvl_totalen`` to ~1e-14 Ha (asserted in the tests), and its
-        overlap matches ``self._s`` bit-for-bit (same basis, same AO ordering).
+        We read the operators off EmbASI's ``A_LL`` mean field (the same SCF object
+        it integrated), not by reconstructing them from a subtraction of exposed
+        matrices -- ``A_LL.hamiltonian_estat_plus_xc`` bundles the nuclear
+        attraction together with Coulomb+xc, so h_core^A is not separable from what
+        EmbASI exports.  ``method.get_hcore()`` and ``method.energy_nuc()`` on that
+        layer reproduce ``subsys_A_lowlvl_totalen`` to ~1e-14 Ha (asserted in the
+        tests), include any mean-field overrides (an external point-charge
+        potential), and its overlap matches ``self._s`` bit-for-bit (same basis,
+        same AO ordering); a calculator without a ``method`` falls back to
+        ``int1e_kin + int1e_nuc`` on its ``mol``.
 
         TODO(embasi-api): this reach-through is physically unavoidable for the WF
         path against today's EmbASI.  The rebase needs ``h_core^A`` (a matrix) and the
@@ -4033,9 +4037,9 @@ class ProjectionEmbeddingAdapter:
         high level is HF + an external correlated solver, so EmbASI's value is only
         the *mean-field* HF-in-DFT reference (and is the *embedded* energy, carrying
         ``v_emb``/``P_B``), not the bare correlated ``E_high(A)`` the assembly needs.
-        Absent an EmbASI-native A-fragment footing, we reach through
-        ``A_LL.atoms.calc.mol`` to a PySCF ``Mole`` (now behind the backend's
-        ``layer_footing``) -- fine for PySCF, but there is no
+        Absent an EmbASI-native A-fragment footing, we reach through the layer's
+        PySCF mean field (behind the backend's ``layer_footing``) -- fine for PySCF,
+        but there is no
         equivalent for the FHI-aims/ASI backend, so the WF-path rebase is PySCF-only.
         A backend-agnostic A-fragment ``h_core`` / ``energy_nuc`` on EmbASI would
         remove the reach-through entirely.
