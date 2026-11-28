@@ -295,8 +295,8 @@ class SQDSolver(ActiveSpaceSolver):
     ``len(evolution_time) * len(num_groups) * num_randomizations * shots``.
     ``method="exact"`` builds one circuit per evolution time.
 
-    ``optimize`` (default True) lets the generator
-    relabel the fermionic modes to shorten each circuit. That makes every circuit
+    ``optimize`` (default: probe whether the relabel extra is available) lets the
+    generator relabel the fermionic modes to shorten each circuit. That makes every circuit
     sample in its *own* permuted mode order, which this class handles end to end:
     the reference determinant is prepared in the permuted order, and each
     circuit's counts are mapped back to the original order *before* the ensemble
@@ -318,7 +318,7 @@ class SQDSolver(ActiveSpaceSolver):
         num_batches: int = 5,
         max_iterations: int = 5,
         seed: int | None = None,
-        optimize: bool | None = True,
+        optimize: bool | None = None,
         time_limit: float = 10.0,
         relabel_solver: str = "cpsat",
         cpsat_workers: int = 1,

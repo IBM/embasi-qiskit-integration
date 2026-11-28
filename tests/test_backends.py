@@ -395,9 +395,12 @@ def test_pyscf_builder_protects_the_newton_inner_mean_field(tmp_path):
 def test_callback_backend_protects_its_exchange_calculator_from_deepcopy(monkeypatch):
     """``LayerEvaluator`` deep-copies the HF evaluator before every evaluation."""
     from ase import Atoms
+    from conftest import require_module
     from pyscf import gto
 
     from embasi_qiskit_integration.backends.registry import make_backend
+
+    require_module("embasi.atoms_embedding_asi", "needs a usable EmbASI")
 
     monkeypatch.setattr(gto.Mole, "max_memory", 1, raising=False)  # force direct SCF
     atoms = Atoms("H2", positions=[(0, 0, 0), (0, 0, 0.74)])

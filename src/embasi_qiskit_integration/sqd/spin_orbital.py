@@ -202,7 +202,7 @@ def make_torch_spin_orbital_solver(
     if mode not in (None, "tpb"):
         raise NotImplementedError(
             "the spin-orbital torch-sci path uses its flat spinless engine; "
-            f"torch_sci_mode={mode!r} is not supported"
+            f"mode={mode!r} is not supported"
         )
     kwargs.setdefault("apply_ab_projection", False)
     kwargs.setdefault("compute_full_rdm", False)

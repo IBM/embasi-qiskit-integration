@@ -45,7 +45,6 @@ class SolveCommand(BaseSettings):
     sci_solver: str = "torch_sci"
     # None auto-detects CUDA, then Apple MPS, then CPU.
     torch_sci_device: str | None = None
-    torch_sci_mode: Literal["tpb", "gdb"] = "tpb"
     torch_sci_apply_ab_projection: bool = False
     sampler: Literal["aer", "mock", "runtime"] = "runtime"
     # Which Aer simulator, when --sampler aer; None takes the package default (MPS).
@@ -148,7 +147,6 @@ class SolveCommand(BaseSettings):
             num_randomizations=self.num_randomizations,
             sci_solver=self.sci_solver,
             torch_sci_kwargs={
-                "mode": self.torch_sci_mode,
                 "apply_ab_projection": self.torch_sci_apply_ab_projection,
                 **({"device": self.torch_sci_device} if self.torch_sci_device else {}),
             },

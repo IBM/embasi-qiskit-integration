@@ -28,7 +28,7 @@ extra:
 |---|---|---|
 | `quantum` | `qiskit`, `qiskit-aer`, `qiskit-addon-sqd`, `ffsim` | `SQDSolver`, Aer sampling |
 | `fermions` | `qiskit-fermions>=0.3.1,<0.4` | SqDRIFT circuits (any non-mock SQD run) |
-| `relabel` | `pyomo`, `highspy`, `ortools` | [mode relabeling](#mode-relabeling-optimize); required by `SQDSolver`'s default `optimize=True` |
+| `relabel` | `pyomo`, `highspy`, `ortools` | [mode relabeling](#mode-relabeling-optimize); makes `SQDSolver`'s default `optimize` probe resolve to `True` |
 | `sci-solvers` | `sci-solvers` + `torch-sci-solver[sqd]` from [IBM/sci-solvers](https://github.com/IBM/sci-solvers); pulls `torch`; Python ≥3.12 | `torch_sci` (default) and the other `--sci_solver` backends |
 | `hardware` | `qiskit-ibm-runtime`, `samplomatic` | `RuntimeSampler`, readout characterisation |
 | `embed` | EmbASI (git, `qm-code-adapter`) and its ASI stack (`ase`, `asi4py`, `mpi4py`, `scalapack4py`) | `scripts/embedding_workflow.py`, EmbASI-marked tests |
@@ -91,7 +91,8 @@ print(res.energy)  # within 2e-3 Ha of FCI
 ```
 
 `SQDSolver` defaults to `sci_solver="torch_sci"` (the `sci-solvers` extra) and
-`optimize=True` (the `relabel` extra). The dependency-free baseline is
+`optimize=None`, which resolves to `True` when the `relabel` extra is available
+and `False` otherwise. The dependency-free baseline is
 `sci_solver="qiskit_addon_sqd"`: qiskit-addon-sqd's own `solve_sci`/PySCF
 selected-CI path. The baseline comes first because it needs no optional solver
 package; `torch_sci` is the default public path added on top of it. For an
@@ -114,7 +115,6 @@ res = SQDSolver(
     shots=100_000,
     seed=24,
     sci_solver="torch_sci",              # the default
-    torch_sci_kwargs={"mode": "tpb"},
 ).solve(ham)
 print(res.diagnostics["sci_solver"])     # "torch-sci-solver"
 ```
@@ -125,7 +125,9 @@ uv run embasi-qiskit-integration solve <jobdir> --sci_solver torch_sci
 
 The device auto-detects CUDA, then Apple MPS, then CPU; override it with
 `--torch_sci_device cuda|mps|cpu`. MPS runs in float32 because it has no float64.
-`torch_sci_mode` is `tpb` (default) or `gdb`, and `--torch_sci_apply_ab_projection`
+torch-sci runs in `tpb` mode in the SQD loop; its GDB pair mode returns a flat
+pair basis that qiskit-addon-sqd's diagonalization loop cannot consume, so the
+integration rejects `gdb` with a clear error. `--torch_sci_apply_ab_projection`
 exposes the engine's αβ projection. Without the extra, the torch path raises an
 install hint and its test skips.
 
@@ -136,8 +138,9 @@ the exact spin-dependent tensors are used instead of the ROHF-like spin average.
 This is automatic for the default `torch_sci`; another selected solver raises a
 clear error for a spin-dependent Hamiltonian instead of silently averaging it.
 `spin_sq` projection is not supported on this path, and the dense `(2*norb)^4`
-ERI makes it most suitable for moderate active spaces. `torch_sci_mode="gdb"` is
-not used for this spin path.
+ERI makes it most suitable for moderate active spaces. The spin path uses
+torch-sci's flat spinless engine; GDB pair mode is not compatible with the
+addon's SQD loop.
 
 #### Aer simulation methods
 
@@ -288,7 +291,7 @@ embedding flow against real EmbASI: low-level embedding → active-space
 Hamiltonian → SQD/FCI → projection-based-embedding energy → 1-RDM feedback. It
 drives a live `embasi.embedding.ProjectionEmbedding` (methanol monomer, OH active
 fragment, HF-in-PBE, sto-3g), so it needs EmbASI (the `embed` extra) and the
-quantum-path extras, including `relabel` for the default `optimize=True` and
+quantum-path extras, including `relabel` for the default `optimize` probe and
 `sci-solvers` for the default `torch_sci` diagonalizer.
 
 ```bash
@@ -384,8 +387,9 @@ order so a seed always maps to the same physical group.
 
 ### Mode relabeling (optimize)
 
-`optimize=True` (the default of `SQDSolver` and `scripts/embedding_workflow.py`;
-the `solve` CLI enables it when the `relabel` extra is installed) runs
+`optimize=True` (the resolved default of `SQDSolver` when the `relabel` extra
+is installed, and the default of `scripts/embedding_workflow.py`; the `solve`
+CLI enables it when the `relabel` extra is installed) runs
 `qiskit-fermions`' `RelabelModes` pass, reordering fermionic modes to shorten
 each circuit. A relabeled circuit samples in the permuted mode order, so the
 reference determinant must be prepared in that order and the counts mapped back

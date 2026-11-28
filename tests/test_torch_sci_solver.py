@@ -36,8 +36,10 @@ def test_solver_listing_puts_torch_sci_after_the_builtin_baseline():
 def test_resolve_sci_solvers_through_the_factory(monkeypatch):
     pytest.importorskip("torch")
     created = {}
+    received = []
 
     def fake_callable(*args, **kwargs):
+        received.append(kwargs)
         return []
 
     def fake_create_solver(name, **kwargs):
@@ -53,7 +55,9 @@ def test_resolve_sci_solvers_through_the_factory(monkeypatch):
         ),
     )
 
-    assert resolve_sci_solver("torch_sci", 0.0, {"device": "cpu"}) is fake_callable
+    spin_pinned = resolve_sci_solver("torch_sci", 0.0, {"device": "cpu"})
+    assert spin_pinned([], None, None, 1, (1, 1)) == []
+    assert received[-1] == {"spin_sq": 0.0}
     assert created["torch_sci"] == {
         "device": "cpu",
         "apply_ab_projection": False,
@@ -80,6 +84,13 @@ def test_resolve_sci_solvers_through_the_factory(monkeypatch):
 
     with pytest.raises(ValueError, match="unknown sci_solver"):
         resolve_sci_solver("nope", None, None)
+
+
+def test_torch_sci_gdb_pair_mode_is_rejected_with_guidance():
+    """The gdb engine's flat pair output is not usable by the addon's SQD loop."""
+    pytest.importorskip("sci_solvers")
+    with pytest.raises(NotImplementedError, match="gdb"):
+        resolve_sci_solver("torch_sci", None, {"mode": "gdb", "device": "cpu"})
 
 
 def test_sqdsolver_torch_sci_matches_fci(data_dir, monkeypatch):

@@ -108,7 +108,9 @@ def resolve_sci_solver(name: str, spin_sq: float | None, torch_sci_kwargs: dict 
     the default in :class:`SQDSolver`); importing the package is deferred so the
     optional ``sci-solvers`` extra is only required when selected.
     ``torch_sci_kwargs`` is forwarded only to ``torch_sci`` -- the other solvers
-    have different constructor options.
+    have different constructor options.  Torch-SCI's ``mode="gdb"`` pair engine
+    is rejected: its flat pair basis is not consumable by
+    ``diagonalize_fermionic_hamiltonian``; the SQD loop uses ``tpb``.
 
     ``symmetrize_spin=False`` is deliberate: qiskit-addon-sqd already passes
     separate alpha/beta CI-string batches, and the open-shell SQD path must not
@@ -132,6 +134,12 @@ def resolve_sci_solver(name: str, spin_sq: float | None, torch_sci_kwargs: dict 
 
     if name == "torch_sci":
         kwargs = dict(torch_sci_kwargs or {})
+        if kwargs.get("mode", "tpb") != "tpb":
+            raise NotImplementedError(
+                "torch-sci's gdb (pair) mode returns a flat pair basis that "
+                "qiskit-addon-sqd's diagonalize_fermionic_hamiltonian cannot "
+                "consume; use mode='tpb' for the SQD loop."
+            )
         import torch
 
         # The engine defaults to CUDA.  Auto-detect instead: CUDA, then Apple
@@ -182,7 +190,14 @@ def resolve_sci_solver(name: str, spin_sq: float | None, torch_sci_kwargs: dict 
         solver = create_solver(name, **kwargs)
     except ValueError as exc:
         raise ValueError(f"unknown sci_solver {name!r}; available: {', '.join(names)}") from exc
-    return solver.sci_solver_callable
+    callable = solver.sci_solver_callable
+    if name == "torch_sci" and spin_sq is not None:
+        import functools
+
+        # qiskit-addon-sqd's loop calls the solver without a spin_sq argument;
+        # torch-sci accepts it per call, so pin the requested sector here.
+        return functools.partial(callable, spin_sq=spin_sq)
+    return callable
 
 
 def _normalise_rdm1(rdm1: np.ndarray, nelec: float) -> np.ndarray:

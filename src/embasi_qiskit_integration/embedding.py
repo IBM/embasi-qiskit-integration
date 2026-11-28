@@ -944,7 +944,6 @@ class EmbeddingWorkflow(BaseSettings):
     sci_solver: str = "torch_sci"
     # None auto-detects CUDA, then Apple MPS, then CPU.
     torch_sci_device: str | None = None
-    torch_sci_mode: Literal["tpb", "gdb"] = "tpb"
     torch_sci_apply_ab_projection: bool = False
     handoff: Literal["in-process", "two-process"] = "in-process"
     sampler: SamplerKind = "aer"
@@ -1832,7 +1831,6 @@ class EmbeddingWorkflow(BaseSettings):
             spin_sq=self.target_s2,
             sci_solver=self.sci_solver,
             torch_sci_kwargs={
-                "mode": self.torch_sci_mode,
                 "apply_ab_projection": self.torch_sci_apply_ab_projection,
                 **({"device": self.torch_sci_device} if self.torch_sci_device else {}),
             },
