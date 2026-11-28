@@ -102,6 +102,154 @@ def json_cell(value: Any) -> str:
     return json.dumps(value)
 
 
+def dump_active_space(
+    path: Path,
+    *,
+    emb,
+    orbitals,
+    result,
+    cfg,
+    ham=None,
+    cycle: int = 0,
+    geometry_file: str = "",
+    geometry_parameter: float | None = None,
+) -> Path:
+    """Write one cycle's active-space orbitals and AO labels to an ``.npz`` dump.
+
+    Opt-in diagnostic for active-space *character* comparisons across backends
+    (``EQI_EMB_DUMP_ACTIVE_MOS`` / ``--dump_active_mos``).  It writes the embedded
+    orbital coefficients and overlap in the working AO basis, the active/inactive
+    column indices, the solver 1-RDM, and -- when the backend can report them --
+    the per-AO ``(atom, element, shell, m)`` labels and the AO-to-atom map.  When the
+    downfolded Hamiltonian is supplied it also stores the orbital energies and (for
+    small active spaces) ``h1``/``h2``, so the one- and two-body drivers of the
+    correlation can be compared offline.  Nothing here re-derives physics; a
+    companion analysis script computes populations and bonding/antibonding character.
+
+    Args:
+        path: Destination ``.npz`` path.  Parent directories are created.
+        emb: The :class:`ProjectionEmbeddingAdapter` the orbitals came from (used
+            for the AO basis and overlap).
+        orbitals: The cycle's :class:`EmbeddedOrbitals` (restricted path only).
+        result: The :class:`SolverResult`; its ``rdm1`` is in the active-MO basis.
+        cfg: The workflow settings (selector and AVAS target labels go into ``meta``).
+        ham: The :class:`EmbeddedHamiltonian` solved this cycle, or ``None``.  Its
+            ``h2`` is stored only when ``norb <= 16`` (a 64k-element tensor), so the
+            dump never becomes the large object it was meant to avoid.
+        cycle: Outer-loop cycle index.
+        geometry_file: Source geometry, recorded in ``meta``.
+        geometry_parameter: Bond-distance label, recorded in ``meta``.
+
+    Returns:
+        The path written.
+    """
+    ints = emb.ints
+    coefficients = np.asarray(orbitals.coeff, dtype=float)
+    overlap = np.asarray(ints.overlap(), dtype=float)
+    active = np.asarray(orbitals.active, dtype=int)
+    inactive = np.asarray(orbitals.inactive, dtype=int)
+    atom_map = np.asarray(ints.ao_atom_map(), dtype=int)
+    payload: dict[str, Any] = {
+        "coeff": coefficients,
+        "coeff_active": coefficients[:, active],
+        "overlap": overlap,
+        "active": active,
+        "inactive": inactive,
+        "n_occ": np.asarray(int(orbitals.n_occ)),
+        "n_occ_b": np.asarray(-1 if orbitals.n_occ_b is None else int(orbitals.n_occ_b)),
+        "ao_atom_map": atom_map,
+        "rdm1_active": (
+            np.empty((0, 0))
+            if result is None or result.rdm1 is None
+            else np.asarray(result.rdm1, dtype=float)
+        ),
+        "cycle": np.asarray(int(cycle)),
+    }
+    # Orbital energies and the downfolded Hamiltonian: the one-electron spectrum sets
+    # the excitation denominators, while h2 carries the couplings.  Without these an
+    # orbital-character comparison cannot say why the same character correlates in one
+    # backend and not the other.
+    energy = getattr(orbitals, "energy", None)
+    if energy is not None:
+        energy = np.asarray(energy, dtype=float)
+        payload["orbital_energy"] = energy
+        payload["active_energy"] = energy[active]
+    if ham is not None:
+        payload["ham_nelec"] = np.asarray([int(x) for x in ham.nelec], dtype=int)
+        payload["ham_e_core"] = np.asarray(float(ham.e_core))
+        payload["h1"] = np.asarray(ham.h1, dtype=float)
+        if int(ham.norb) <= 16:
+            payload["h2"] = np.asarray(ham.h2, dtype=float)
+
+    # Labels are optional and backend-specific.  A length mismatch means the backend
+    # cannot be trusted to order them like the AO matrices, so drop them rather than
+    # silently mislabel the analysis.
+    try:
+        labels = ints.ao_labels()
+    except Exception:  # noqa: BLE001 - labels are diagnostic, never required
+        labels = None
+    if labels is not None and len(labels) == overlap.shape[0]:
+        payload["label_atom"] = np.asarray([int(lab[0]) for lab in labels], dtype=int)
+        payload["label_element"] = np.asarray([str(lab[1]) for lab in labels])
+        payload["label_shell"] = np.asarray([str(lab[2]) for lab in labels])
+        payload["label_m"] = np.asarray([str(lab[3]) for lab in labels])
+
+    try:
+        describe = ints.describe()
+    except Exception:  # noqa: BLE001 - optional metadata
+        describe = {}
+    symbols = describe.get("atom_symbols")
+    coords = describe.get("atom_coords")
+    if symbols is not None:
+        payload["atom_symbols"] = np.asarray([str(s) for s in symbols])
+    if coords is not None:
+        payload["atom_coords"] = np.asarray(coords, dtype=float)
+
+    info = getattr(emb, "_avas_info", None)
+    if isinstance(info, dict) and "channels" not in info:
+        for key in (
+            "occ_weights",
+            "virt_weights",
+            "virt_selection_weights",
+            "virt_candidate_energy",
+        ):
+            value = info.get(key)
+            if value is not None:
+                payload[key] = np.asarray(value, dtype=float)
+        for key in ("virt_candidate_column", "virt_selection_column"):
+            value = info.get(key)
+            if value is not None:
+                payload[key] = np.asarray(value, dtype=int)
+    meta = {
+        "selector": str(getattr(cfg, "selector", "")),
+        "avas_ao_labels": getattr(cfg, "avas_ao_labels", None),
+        "avas_max_size": getattr(cfg, "avas_max_size", None),
+        # ``correlation-avas`` weak-signal guard: True means the standard AVAS
+        # virtual weight space was returned instead of the MP2-selected one.
+        "correlation_fallback": (
+            None if not isinstance(info, dict) else info.get("correlation_fallback")
+        ),
+        "correlation_min_marginal": (
+            None if not isinstance(info, dict) else info.get("correlation_min_marginal")
+        ),
+        "n_frozen_occ": getattr(cfg, "n_frozen_occ", None),
+        "projector": None if not isinstance(info, dict) else info.get("projector"),
+        "geometry_file": geometry_file,
+        "geometry_parameter": geometry_parameter,
+        "qm_code": getattr(cfg, "qm_code", None),
+        "basis": describe.get("basis"),
+        # The workflow reorders the active atoms to the front, so the fragment AO
+        # indices are 0..len(active_atoms)-1 in this dump's atom map.
+        "active_atoms": getattr(cfg, "active_atoms", None),
+    }
+    payload["meta"] = np.asarray(json.dumps(meta))
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **payload)
+    return path
+
+
 def natural_occupations(rdm1: np.ndarray) -> list[float] | None:
     """Compute natural-orbital occupations from the 1-RDM.
 

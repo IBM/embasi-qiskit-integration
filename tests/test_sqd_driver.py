@@ -83,22 +83,18 @@ def test_sqd_diagnostics_present(sqd_result):
     assert d["n_distinct_bitstrings"] > 1
 
 
-def test_spin_dependent_fallback_warns_about_both_approximations(n2_ham, mock_counts):
-    """SQD's fallback must name the ERI loss, not just the averaged ``h1``.
+def test_spin_dependent_hamiltonian_requires_a_spin_capable_solver(n2_ham, mock_counts):
+    """A spin-dependent Hamiltonian is never silently spin-averaged by SQD.
 
-    ``diagonalize_fermionic_hamiltonian`` takes one ``one_body_tensor``, so a per-spin
-    downfold's ``(h1a, h1b)`` pair is averaged.  But ``ham.h2`` is the *alpha-only*
-    tensor, so ``h2_spin``'s genuine ``(aa, ab, bb)`` triple is dropped too -- a second,
-    independent approximation, and typically the larger one (~2.96 Ha on this repo's OH
-    radical fixture; 6.5 Ha vs 1.0 Ha on a synthetic polarised (3, 1) sector).
-
-    A warning naming only ``h1`` leaves a reader believing the ERIs were exact, which is
-    the kind of quiet misattribution that sends someone hunting for a sampling error.
+    ``diagonalize_fermionic_hamiltonian`` takes one ``one_body_tensor``, so the
+    stock qiskit selected-CI path would have to average ``(h1a, h1b)`` and drop
+    ``h2_spin``'s ``(aa, ab, bb)`` triple.  The integration now refuses that
+    combination and directs the caller to the default torch-sci spin-orbital
+    path (or FCI) instead.
     """
     norb = n2_ham.norb
     h1 = np.asarray(n2_ham.h1)
     h2 = np.asarray(n2_ham.h2)
-    # A genuinely polarised pair: h1b differs from h1a, and the ERI triple is present.
     ham_spin = n2_ham.model_copy(
         update={
             "h1a": h1,
@@ -108,7 +104,7 @@ def test_spin_dependent_fallback_warns_about_both_approximations(n2_ham, mock_co
     )
     assert ham_spin.is_spin_dependent and ham_spin.has_spin_dependent_eri
 
-    with pytest.warns(UserWarning, match="spin-averaged h1") as rec:
+    with pytest.raises(NotImplementedError, match="does not support a spin-dependent"):
         run_sqd(
             ham_spin,
             mock_counts,
@@ -116,10 +112,8 @@ def test_spin_dependent_fallback_warns_about_both_approximations(n2_ham, mock_co
             num_batches=2,
             max_iterations=1,
             seed=7,
+            sci_solver="qiskit_addon_sqd",
         )
-    text = " ".join(str(w.message) for w in rec)
-    assert "alpha-only" in text, "the warning must disclose that h2 is alpha-only too"
-    assert "LARGER" in text
 
 
 @pytest.fixture

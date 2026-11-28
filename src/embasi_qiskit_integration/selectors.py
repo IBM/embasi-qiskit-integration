@@ -53,10 +53,13 @@ sustainable long-term cut.  A rotation is not expressible as a column-index
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from embasi_qiskit_integration.backends.base import (
     CAP_MINAO_PROJECTOR,
+    MissingCapabilityError,
     as_ao_basis,
     atom_ao_indices,
     require_capability,
@@ -72,10 +75,14 @@ __all__ = [
     "concentric_localization_selector",
     "spade_virtual_selector",
     "fragment_ao_indices",
+    "fragment_ao_projector",
     "avas_ao_projector",
     "apc_pair_coefficients",
     "apc_orbital_entropies",
     "apc_active_space",
+    "MP2Correlation",
+    "mp2_orbital_correlation",
+    "select_correlated_orbitals",
 ]
 
 
@@ -547,6 +554,12 @@ def fragment_ao_indices(basis, active_atoms) -> np.ndarray:
 # the rotation itself lives on the adapter
 # (:meth:`ProjectionEmbeddingAdapter.build_orbitals_avas`), since it must stay inside
 # span(A) and respect the embedding's occupied/virtual split.
+#
+# ``fragment_ao_projector`` is the same metric built from target AOs in the *working*
+# basis instead of a MINAO reference.  It is what ``--selector ao-avas`` uses: the
+# selection then depends only on fixed fragment AOs and fixed occupied/virtual counts,
+# not on canonical orbital energies, and it is available on NAO/pseudopotential
+# backends that expose neither ``valence_ao_projector`` nor per-AO shell labels.
 
 
 def avas_ao_projector(basis, ao_labels, atoms=None, minao: str = "minao") -> np.ndarray:
@@ -576,6 +589,120 @@ def avas_ao_projector(basis, ao_labels, atoms=None, minao: str = "minao") -> np.
     basis = as_ao_basis(basis)
     require_capability(basis, CAP_MINAO_PROJECTOR, "the AVAS valence-AO projector")
     return basis.valence_ao_projector(list(ao_labels), atoms=atoms, minao=minao)
+
+
+def _overlap_matrix(basis) -> np.ndarray:
+    """AO overlap ``S`` from an AOIntegrals backend (the code-agnostic seam)."""
+    method = getattr(basis, "overlap", None)
+    if callable(method):
+        return np.asarray(method(), dtype=float)
+    raise TypeError(
+        f"{type(basis).__name__} has no overlap(); a fragment-AO projector needs an "
+        "AOIntegrals backend (e.g. adapter.ints), not a bare QM-code molecule object"
+    )
+
+
+def fragment_ao_projector(basis, ao_labels=None, atoms=None) -> np.ndarray:
+    """Same-basis fragment-AO projector ``M = S B (B^T S B)^-1 B^T S``.
+
+    The working-basis counterpart of :func:`avas_ao_projector`.  ``B`` selects target
+    AOs *in the system's own basis* (no MINAO reference), so for an S-normalised
+    orbital ``c`` the weight ``c^T M c`` is the squared S-norm of its S-orthogonal
+    projection onto ``span(target AOs)`` and lies in ``[0, 1]``.  This is the metric
+    :meth:`ProjectionEmbeddingAdapter.build_orbitals_avas` diagonalises inside the
+    occupied and virtual blocks of subsystem A.
+
+    Why a same-basis variant: the MINAO projector behind ``--selector avas`` needs
+    ``valence_ao_projector``, which NAO/pseudopotential backends (SIESTA) do not
+    provide.  Matching labels in the working basis needs only ``search_ao_label``.
+    SIESTA supplies it lazily from the ``.ORB_INDX`` its low-level run writes; when
+    a backend reports no shell labels at all, the fragment's AO *indices* from
+    ``atom_ao_indices`` are still enough: pass ``ao_labels=None`` to target every AO
+    of ``atoms``.  On a pseudopotential basis those are the valence functions, so
+    the "all fragment AOs" fallback is a chemically sensible valence target rather
+    than a core-inclusive one -- but it also includes every valence shell and
+    polarisation function, so it is a different target space from a specific
+    ``"N 2p"`` request.
+
+    The target AOs need not lie exactly inside ``span(A)``.  ``M`` is only the
+    *metric*; the selected orbitals are rotations of subsystem-A columns, so they
+    stay S-orthogonal to ``P_B`` whatever the target AOs' small environment tails.
+
+    Args:
+        basis: an :class:`~embasi_qiskit_integration.backends.base.AOIntegrals`
+            backend (it must expose ``overlap()``, ``atom_ao_indices`` and, for
+            labels, ``search_ao_label``).  The workflow passes ``adapter.ints``; this
+            is deliberately the backend seam rather than a bare QM-code molecule, so
+            no PySCF-specific object leaks outside ``backends/``.
+        ao_labels: AO labels matched in the working basis (``"N 2p"``, ``"C 2p"``).
+            ``None`` targets every AO of the fragment ``atoms`` -- the portable
+            choice for a backend without AO labels.
+        atoms: fragment atom indices (indices into the basis' atom order).  ``None``
+            uses every atom.
+
+    Returns:
+        ``(nao, nao)`` symmetric AO-basis metric ``M``.
+
+    Raises:
+        ValueError: no target AO, labels requested on a backend that reports none, or
+            linearly dependent target AOs (``B^T S B`` singular).
+        TypeError: the object is not an ``AOIntegrals`` backend (no ``overlap()``).
+    """
+    basis = as_ao_basis(basis)
+    s = _overlap_matrix(basis)
+    nao = int(basis.nao)
+    if s.shape != (nao, nao):
+        raise ValueError(f"overlap has shape {s.shape}, expected ({nao}, {nao})")
+
+    frag = (
+        np.arange(nao, dtype=int)
+        if atoms is None
+        else np.asarray(fragment_ao_indices(basis, atoms), dtype=int)
+    )
+    target = frag
+    if ao_labels:
+        search = getattr(basis, "search_ao_label", None)
+        if not callable(search):
+            raise ValueError(
+                "ao_labels were requested but this backend reports no AO shell labels; "
+                "omit ao_labels to target every AO of the fragment (the portable "
+                "choice for SIESTA's pseudopotential/NAO basis)"
+            )
+        try:
+            hits = np.asarray(search(list(ao_labels)), dtype=int)
+        except MissingCapabilityError as exc:
+            raise ValueError(
+                "ao_labels were requested but this backend reports no AO shell labels "
+                "(SIESTA's ASI basis descriptors carry only the atom index); omit "
+                "ao_labels to target every AO of the fragment"
+            ) from exc
+        target = np.intersect1d(hits, frag)
+        if target.size == 0:
+            try:
+                labels = basis.ao_labels()
+                shells = sorted({" ".join(labels[i][1:3]) for i in frag})
+                available = f"; the fragment's shells are: {', '.join(shells)}"
+            except (MissingCapabilityError, AttributeError):
+                available = ""
+            raise ValueError(
+                f"fragment-AO labels {list(ao_labels)} match no AO of the active "
+                f"fragment{available}"
+            )
+    if target.size == 0:
+        raise ValueError("the active fragment has no AOs to project onto")
+
+    b = np.zeros((nao, target.size), dtype=float)
+    b[target, np.arange(target.size)] = 1.0
+    s22 = b.T @ s @ b
+    w = np.linalg.eigvalsh(0.5 * (s22 + s22.T))
+    if w.size == 0 or w.min() <= 1.0e-10 * max(float(w.max()), 1.0):
+        raise ValueError(
+            "the fragment-AO target set is linearly dependent under S "
+            f"(overlap eigenvalues {np.array2string(w, precision=2)}); choose "
+            "independent AOs/labels"
+        )
+    m = s @ b @ np.linalg.solve(s22, b.T @ s)
+    return 0.5 * (m + m.T)
 
 
 # --------------------------------------------------------------------------- #
@@ -792,3 +919,283 @@ def apc_active_space(
     )
     _, _, _, active_idx = chooser.kernel()
     return np.asarray(sorted(active_idx), dtype=int)
+
+
+# --------------------------------------------------------------------------- #
+# MP2 correlation ranking (the ``correlation-avas`` virtual selector)
+# --------------------------------------------------------------------------- #
+#
+# The AVAS target-AO weight is a *one-electron* metric.  On SIESTA's DZP basis it
+# saturates: several high-energy N-localised pi* virtuals reach weight 1.000 while a
+# C-localised pi* pair, only ~0.04 Ha above the occupied pi, carries weight
+# 0.887/0.892.  A weight-only cut therefore keeps the wrong pair, and no
+# one-electron ranking can tell them apart.  The missing information is the
+# two-electron coupling and the downfolded excitation denominator, both of which
+# this module already receives from the ERI provider and ``h1``.
+#
+# The ranking below is closed-shell, *semicanonical* MP2 on the embedded one-body
+# operator:
+#
+#   f = h1 + 2J[d_occ] - K[d_occ]           (reference Fock, active occupieds only)
+#   f_oo -> diag(e_o), f_vv -> diag(e_v)    (separate rotations, MP2 invariant)
+#   T_ij^ab = (ia|jb) / (e_i + e_j - e_a - e_b)
+#   E_corr  = sum_ijab (2(ia|jb) - (ib|ja)) T_ij^ab
+#
+# Semicanonicalisation is essential rather than cosmetic: the F_emb eigenvectors
+# that AVAS ranks are *not* eigenstates of f, and the virtual-virtual block of f
+# is far from diagonal (measured max off-diagonal 5.9 Ha on butyronitrile 2.5 A).
+# Using the raw F_emb eigenvalues as denominators would be a different, and much
+# worse, approximation.
+#
+# The per-orbital *marginal correlation* splits E_corr symmetrically over its two
+# indices,
+#
+#   m_a = 1/2 [ sum_ijb E_ijab + sum_ijb E_ijba ],
+#
+# so sum_a m_a = E_corr.  It is the ranking metric: a virtual whose excitation
+# has a large coupling and a small denominator ranks far below one that is only
+# high-weight.  MP2 natural occupations are returned as a diagnostic but are not
+# used for ranking -- near-degenerate denominators can inflate a NOON while its
+# net energy contribution cancels (seen at butyronitrile 0.8 A).
+#
+# Only the *virtual* block is ranked here.  Ranking the occupied block by the
+# same marginal metric was tested against the archived butyronitrile dump and is
+# not safe: with all seven subsystem-A occupieds as the reference it ranks a
+# near-degenerate mixture of the two deepest core orbitals (marginal -0.22 Ha)
+# above the pi pair (-0.072 Ha), because core-valence mixing dominates the
+# occupied Fock rotations.  The chemically anchored AVAS target-AO weight is kept
+# for the occupied block, and MP2 only replaces the saturated virtual cut.
+
+
+@dataclass(frozen=True)
+class MP2Correlation:
+    """Semicanonical MP2 decomposition of a closed-shell reference.
+
+    All arrays are in the *semicanonical* basis: the returned rotations map the
+    caller's occupied/virtual blocks into the eigenvectors of the reference Fock
+    (columns of ``occupied_rotation`` / ``virtual_rotation``).
+
+    Attributes:
+        occupied_rotation: ``(n_occ, n_occ)`` rotation diagonalizing ``f_oo``.
+        occupied_energies: ``(n_occ,)`` semicanonical occupied Fock eigenvalues.
+        virtual_rotation: ``(n_virt, n_virt)`` rotation diagonalizing ``f_vv``.
+        virtual_energies: ``(n_virt,)`` semicanonical virtual Fock eigenvalues.
+        occupied_natural_occupations: ``(n_occ,)`` MP2 1-RDM diagonal, occupied block
+            (reference occupation 2 per spatial orbital plus the MP2 correction).
+        virtual_natural_occupations: ``(n_virt,)`` MP2 1-RDM diagonal, virtual block.
+        occupied_marginal_correlation: ``(n_occ,)`` symmetric split of ``e_corr`` over
+            the occupied indices (Ha; negative for normal correlation).
+        virtual_marginal_correlation: ``(n_virt,)`` the same over virtual indices;
+            the selector ranks these ascending (most negative first).
+        pair_energies: ``(n_occ, n_occ, n_virt, n_virt)`` per-excitation contribution
+            to ``e_corr`` in the semicanonical basis.
+        e_corr: total MP2 correlation energy (Ha).
+        n_skipped: number of amplitudes whose denominator fell below
+            ``denominator_floor`` and were excluded.
+    """
+
+    occupied_rotation: np.ndarray
+    occupied_energies: np.ndarray
+    virtual_rotation: np.ndarray
+    virtual_energies: np.ndarray
+    occupied_natural_occupations: np.ndarray
+    virtual_natural_occupations: np.ndarray
+    occupied_marginal_correlation: np.ndarray
+    virtual_marginal_correlation: np.ndarray
+    pair_energies: np.ndarray
+    e_corr: float
+    n_skipped: int
+
+
+def _symmetric(a: np.ndarray) -> np.ndarray:
+    a = np.asarray(a, dtype=float)
+    return 0.5 * (a + a.T)
+
+
+def mp2_orbital_correlation(
+    h1_oo: np.ndarray,
+    h1_vv: np.ndarray,
+    eri_ovov: np.ndarray,
+    eri_oooo: np.ndarray,
+    eri_vvoo: np.ndarray,
+    *,
+    denominator_floor: float = 1.0e-8,
+    build_fock: bool = True,
+) -> MP2Correlation:
+    """Closed-shell semicanonical MP2 from the embedded one- and two-body blocks.
+
+    The reference determinant doubly occupies every column of the occupied block
+    and leaves the virtual block empty.  ``h1_oo``/``h1_vv`` are the downfolded
+    one-body operator ``C^T (h_emb + veff_hf(dm_inactive)) C`` in the *same*
+    occupied/virtual bases as the ERI blocks.  The frozen core, if any, is already
+    folded into ``h1`` and is not part of the reference determinant used here (it
+    never is: the MP2 reference only fills the active occupieds).
+
+    Args:
+        h1_oo: ``(n_occ, n_occ)`` one-body block, active occupieds.
+        h1_vv: ``(n_virt, n_virt)`` one-body block, candidate virtuals.
+        eri_ovov: ``(n_occ, n_virt, n_occ, n_virt)`` chemists' ``(ia|jb)``.
+        eri_oooo: ``(n_occ, n_occ, n_occ, n_occ)`` chemists' ``(ij|kl)``.
+        eri_vvoo: ``(n_virt, n_virt, n_occ, n_occ)`` chemists' ``(ab|ij)``.
+        denominator_floor: amplitudes with ``|D| <= floor`` are dropped (counted
+            in ``n_skipped``) instead of dividing by a near-zero gap.  The default
+            only guards exact degeneracies; the ranking is unchanged for measured
+            gaps down to 1.5e-3 Ha.
+        build_fock: build the MP2 reference Fock ``h1 + 2J - K`` and diagonalize it
+            within the two blocks (the production path).  Set ``False`` only for a
+            ranking sanity check on a backend that exposes just a diagonal one-body
+            spectrum (the archived H2 dumps): the supplied ``h1`` diagonals are then
+            used directly as the denominators and the blocks are not rotated.  The
+            production selector never uses this mode.
+
+    Returns:
+        :class:`MP2Correlation`; see its attributes for the shapes and sign
+        conventions.
+
+    Raises:
+        ValueError: an input block has the wrong shape.
+    """
+    h1_oo = _symmetric(h1_oo)
+    h1_vv = _symmetric(h1_vv)
+    eri_ovov = np.asarray(eri_ovov, dtype=float)
+    eri_oooo = np.asarray(eri_oooo, dtype=float)
+    eri_vvoo = np.asarray(eri_vvoo, dtype=float)
+    n_occ = h1_oo.shape[0]
+    n_virt = h1_vv.shape[0]
+    if h1_oo.shape != (n_occ, n_occ) or h1_vv.shape != (n_virt, n_virt):
+        raise ValueError("h1_oo and h1_vv must be square occupied/virtual blocks")
+    if eri_ovov.shape != (n_occ, n_virt, n_occ, n_virt):
+        raise ValueError(
+            f"eri_ovov has shape {eri_ovov.shape}, expected {(n_occ, n_virt, n_occ, n_virt)}"
+        )
+    if eri_oooo.shape != (n_occ,) * 4:
+        raise ValueError(f"eri_oooo has shape {eri_oooo.shape}, expected {(n_occ,) * 4}")
+    if eri_vvoo.shape != (n_virt, n_virt, n_occ, n_occ):
+        raise ValueError(
+            f"eri_vvoo has shape {eri_vvoo.shape}, expected {(n_virt, n_virt, n_occ, n_occ)}"
+        )
+    if n_occ == 0 or n_virt == 0:
+        return MP2Correlation(
+            occupied_rotation=np.eye(n_occ),
+            occupied_energies=np.empty(0),
+            virtual_rotation=np.eye(n_virt),
+            virtual_energies=np.empty(0),
+            occupied_natural_occupations=np.full(n_occ, 2.0),
+            virtual_natural_occupations=np.empty(0),
+            occupied_marginal_correlation=np.empty(0),
+            virtual_marginal_correlation=np.empty(0),
+            pair_energies=np.empty((n_occ, n_occ, n_virt, n_virt)),
+            e_corr=0.0,
+            n_skipped=0,
+        )
+
+    if build_fock:
+        # Reference Fock in the caller's basis.  Only the active occupieds contribute
+        # to the mean field: the frozen core is already folded into h1 by the downfold.
+        j_oo = np.einsum("ijkk->ij", eri_oooo)
+        k_oo = np.einsum("ikjk->ij", eri_oooo)
+        f_oo = _symmetric(h1_oo + 2.0 * j_oo - k_oo)
+        j_vv = np.einsum("abii->ab", eri_vvoo)
+        k_vv = np.einsum("iaib->ab", eri_ovov)
+        f_vv = _symmetric(h1_vv + 2.0 * j_vv - k_vv)
+        e_o, u_o = np.linalg.eigh(f_oo)
+        e_v, u_v = np.linalg.eigh(f_vv)
+    else:
+        # Ranking-only: the caller swears the blocks are already diagonal.
+        e_o, u_o = np.diag(h1_oo).copy(), np.eye(n_occ)
+        e_v, u_v = np.diag(h1_vv).copy(), np.eye(n_virt)
+
+    # Rotate (ia|jb) -> (pa|qb) in the semicanonical basis.  ``u_o`` has the old
+    # index as its row and the new (eigenvector) index as its column, so the
+    # contraction is ``u_o[i, p]``, not ``u_o[p, i]``: the latter rotates by the
+    # transpose, which for an orthogonal matrix is the inverse rotation and gives
+    # the wrong correlation ranking.
+    tsc = np.einsum("iajb,ip,jq,ac,bd->pcqd", eri_ovov, u_o, u_o, u_v, u_v, optimize=True)
+    # x_ijab = (ia|jb); y_ijab = (ib|ja).
+    x = np.transpose(tsc, (0, 2, 1, 3))
+    y = np.transpose(tsc, (0, 2, 3, 1))
+    denominator = (
+        e_o[:, None, None, None]
+        + e_o[None, :, None, None]
+        - e_v[None, None, :, None]
+        - e_v[None, None, None, :]
+    )
+    good = np.abs(denominator) > float(denominator_floor)
+    amplitudes = np.zeros_like(x)
+    np.divide(x, denominator, out=amplitudes, where=good)
+
+    pair_energies = (2.0 * x - y) * amplitudes
+    e_corr = float(pair_energies.sum())
+
+    # Unrelaxed MP2 1-RDM (PySCF's conventions: T_ij^ab = (ia|jb)/D, spatial
+    # occupations, reference 2 per occupied).
+    virt_noon = 2.0 * np.einsum("ijca,ijca->a", amplitudes, amplitudes) - np.einsum(
+        "ijca,ijac->a", amplitudes, amplitudes
+    )
+    occ_correction = 2.0 * np.einsum("ijab,ijab->i", amplitudes, amplitudes) - np.einsum(
+        "ijab,ijba->i", amplitudes, amplitudes
+    )
+    occ_noon = 2.0 - occ_correction
+
+    occ_marginal = 0.5 * (pair_energies.sum(axis=(1, 2, 3)) + pair_energies.sum(axis=(0, 2, 3)))
+    virt_marginal = 0.5 * (pair_energies.sum(axis=(0, 1, 3)) + pair_energies.sum(axis=(0, 1, 2)))
+
+    return MP2Correlation(
+        occupied_rotation=u_o,
+        occupied_energies=e_o,
+        virtual_rotation=u_v,
+        virtual_energies=e_v,
+        occupied_natural_occupations=occ_noon,
+        virtual_natural_occupations=virt_noon,
+        occupied_marginal_correlation=occ_marginal,
+        virtual_marginal_correlation=virt_marginal,
+        pair_energies=pair_energies,
+        e_corr=e_corr,
+        n_skipped=int(np.count_nonzero(~good)),
+    )
+
+
+def select_correlated_orbitals(
+    correlation: MP2Correlation, *, n_virtual: int, n_occupied: int = 0
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pick the most strongly correlating occupied/virtual semicanonical orbitals.
+
+    Ranks by *marginal correlation energy*, ascending (most negative first): the
+    virtual whose excitations contribute most correlation energy is selected,
+    regardless of its AVAS weight or F_emb energy.  Ties keep the incoming order.
+
+    Occupied ranking is available but off by default (``n_occupied=0``): the
+    archived butyronitrile test shows it prefers a core-valence mixture over the
+    pi pair, so callers that want it must opt in and validate the chemistry.
+
+    Args:
+        correlation: result of :func:`mp2_orbital_correlation`.
+        n_virtual: number of virtuals the CAS budget needs.
+        n_occupied: number of occupieds to rank (0 keeps the caller's selection).
+
+    Returns:
+        ``(occupied_indices, virtual_indices)`` into the semicanonical rotations,
+        each sorted by increasing marginal correlation (most negative first).
+
+    Raises:
+        ValueError: more orbitals were requested than the blocks hold.
+    """
+    n_v = int(n_virtual)
+    n_o = int(n_occupied)
+    if not 0 <= n_v <= correlation.virtual_marginal_correlation.size:
+        raise ValueError(
+            f"n_virtual={n_v} does not fit the "
+            f"{correlation.virtual_marginal_correlation.size} candidate virtuals"
+        )
+    if not 0 <= n_o <= correlation.occupied_marginal_correlation.size:
+        raise ValueError(
+            f"n_occupied={n_o} does not fit the "
+            f"{correlation.occupied_marginal_correlation.size} candidate occupieds"
+        )
+    virt = np.argsort(correlation.virtual_marginal_correlation, kind="stable")[:n_v]
+    occ = (
+        np.argsort(correlation.occupied_marginal_correlation, kind="stable")[:n_o]
+        if n_o
+        else np.empty(0, dtype=int)
+    )
+    return occ.astype(int), virt.astype(int)

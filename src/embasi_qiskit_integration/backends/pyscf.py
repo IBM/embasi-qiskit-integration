@@ -12,6 +12,7 @@ through the :class:`~embasi_qiskit_integration.backends.base.AOIntegrals` protoc
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -65,13 +66,27 @@ _PYSCF_SCF_HINT = (
 
 
 def pyscf_layer_footing(layer: Any) -> tuple[np.ndarray, float]:
-    """``(h_core, E_nuc)`` of the ``Mole`` an EmbASI PySCF layer integrates on.
+    """``(h_core, E_nuc)`` of the mean field an EmbASI PySCF layer integrates on.
 
-    ``h_core`` is PySCF's full core Hamiltonian, ECP / pseudopotential terms included, so it
-    lives on the same footing as ``PySCFIntegrals.hcore()`` (``mf.get_hcore()``).  A bare
-    ``int1e_kin + int1e_nuc`` omits the ECP and shifts the WF-in-DFT energy by
-    ``tr[dm V_ECP]`` (50.5 Ha for HI/def2-SVP); without an ECP the two are identical.
+    Both come from the layer's SCF object (``method``), not its bare ``Mole``: an SCF can
+    override ``get_hcore``/``energy_nuc`` to include an external potential (for example
+    ``pyscf.qmmm.add_mm_charges``), and the layer's own energy is built with those
+    overrides.  Reading ``scf.hf.get_hcore(mol)``/``mol.energy_nuc()`` would silently drop
+    them.  With no override the method calls equal the ``Mole`` ones, and ``h_core`` still
+    carries the ECP/pseudopotential terms: a bare ``int1e_kin + int1e_nuc`` omits the ECP
+    and shifts the WF-in-DFT energy by ``tr[dm V_ECP]`` (50.5 Ha for HI/def2-SVP).
+
+    A calculator with no ``method`` (a plain ``Mole`` stub) falls back to the ``Mole``
+    operators.
+
+    TODO(embasi-upstream): delete this reach-through once EmbASI exposes the layer's
+    A-fragment ``h_core``/``E_nuc`` including any mean-field overrides, so the adapter
+    need not reconstruct them from the backend.
     """
+    mf = _layer_method(layer)
+    if mf is not None:
+        return np.asarray(mf.get_hcore()), float(mf.energy_nuc())
+
     from pyscf import scf
 
     mol = layer.atoms.calc.mol
@@ -318,6 +333,28 @@ class PySCFIntegrals(PySCFBasis):
             self._df.build()
         return ao2mo.restore(1, self._df.ao2mo(mo_coeff), nmo)
 
+    def eri_mo_block(self, mo_a, mo_b, mo_c, mo_d) -> np.ndarray:
+        """``(p_a q_b | r_c s_d)`` for four independent blocks; see the protocol.
+
+        Uses PySCF's four-orbital-set ``ao2mo.general`` (the same call behind
+        :meth:`eri_mo_mixed`), so the four blocks may have different widths.  The
+        exact transform is required: a density-fitted backend could assemble this
+        from its three-index tensor, but the correlation ranking's denominators and
+        couplings are only meaningful if they are consistent with the exact ERIs the
+        downfold will use, so DF is refused here rather than silently mixed in.
+        """
+        from pyscf import ao2mo
+
+        if self._density_fit:
+            raise NotImplementedError(
+                "eri_mo_block needs the exact ERIs; the correlation-avas ranking "
+                "does not support a density-fitted PySCF backend"
+            )
+        blocks = tuple(np.asarray(m, dtype=float, order="F") for m in (mo_a, mo_b, mo_c, mo_d))
+        shape = tuple(b.shape[1] for b in blocks)
+        out = ao2mo.general(self.mol, blocks, compact=False)
+        return np.asarray(out, dtype=float).reshape(shape)
+
     def eri_mo_mixed(self, mo_a: np.ndarray, mo_b: np.ndarray) -> np.ndarray:
         """Mixed-spin ``(p_a q_a | r_b s_b)``, shape ``(nmo,)*4``.
 
@@ -350,7 +387,15 @@ class PySCFIntegrals(PySCFBasis):
         return np.asarray(out).reshape(nmo, nmo, nmo, nmo)
 
     def energy_nuc(self) -> float:
-        return float(self.mol.energy_nuc())
+        """Nuclear-repulsion reference of the mean field handed to EmbASI.
+
+        ``mf.energy_nuc()`` equals ``mol.energy_nuc()`` for an ordinary SCF, but an
+        external potential such as ``pyscf.qmmm.add_mm_charges`` adds its
+        charge-nucleus terms to the override.  The downfold's ``e_core`` and the WF
+        energy reference are built against that same Hamiltonian, so the override
+        must be included here too.
+        """
+        return float(self.mf.energy_nuc())
 
     # ---------------- capabilities / energies / SCF status ---------------- #
     @property
@@ -399,6 +444,74 @@ class PySCFIntegrals(PySCFBasis):
 # --------------------------------------------------------------------------- #
 # Calculator construction (``--qm_code pyscf``)
 # --------------------------------------------------------------------------- #
+def _preserve_scf_state_on_deepcopy(mf: Any, chkfile: str | None = None) -> None:
+    """Keep PySCF runtime state that its pickle protocol drops across EmbASI copies.
+
+    PySCF's ``__getstate__`` excludes ``chkfile``, ``_opt`` and related attributes,
+    and ``__setstate__`` nulls them.  EmbASI deepcopies each SCF object for every
+    layer, so:
+    * a requested checkpoint would disappear (the ``--scf_chkfile_out`` bug), and
+    * ``_opt=None`` leaves the direct-SCF path broken for larger Gaussian bases
+      (``SCF.get_jk`` reads ``self._opt.get(omega)``).
+
+    Preserve the checkpoint and restore the direct-SCF initializer in a private
+    subclass; the SCF type is otherwise unchanged.  A second-order (Newton) wrapper
+    keeps the mean field it accelerates in ``_scf`` and EmbASI deep-copies that inner
+    object through the wrapper; Newton's Fock builds call ``_scf.get_veff``, so the
+    inner SCF gets the same protection.  The wrapper owns the checkpoint file, so only
+    the outer object is given ``chkfile``.
+
+    TODO(embasi-upstream): delete this subclass and the inner-object call once
+    EmbASI restores ``_opt`` (and a requested ``chkfile``) on the calculators it
+    deep-copies, or once PySCF's ``__setstate__`` re-initializes ``_opt`` itself.
+    """
+    _preserve_one_scf_on_deepcopy(mf, chkfile)
+    inner = vars(mf).get("_scf")
+    if inner is not None and inner is not mf and hasattr(type(inner), "__setstate__"):
+        _preserve_one_scf_on_deepcopy(inner, None)
+
+
+def _preserve_one_scf_on_deepcopy(mf: Any, chkfile: str | None) -> None:
+    """Install the state-preserving subclass on one PySCF SCF object."""
+    if getattr(type(mf), "_embasi_deepcopy_state", False):
+        if chkfile:
+            mf.chkfile = str(chkfile)
+        return
+
+    base = type(mf)
+    original_get = base.__getstate__
+    original_set = base.__setstate__
+
+    class _EmbasiSCF(base):  # type: ignore[misc, valid-type]
+        __module__ = base.__module__
+
+        def __getstate__(self):
+            state = original_get(self)
+            # Never carry the live direct-SCF cache, even if a subclass's
+            # ``__getstate__`` includes it: it is bound to the pre-copy Mole.
+            state.pop("_opt", None)
+            if chkfile:
+                state["_embasi_chkfile"] = chkfile
+            return state
+
+        def __setstate__(self, state):
+            saved_chkfile = state.pop("_embasi_chkfile", None)
+            original_set(self, state)
+            # The original optimizer cache holds ctypes pointers bound to the
+            # pre-copy Mole, so it neither deep-copies nor transfers safely.  Start
+            # the copy with the value an uncopied SCF has; PySCF rebuilds each
+            # omega's optimizer lazily on the first get_jk.
+            self._opt = {None: None}
+            if saved_chkfile:
+                self.chkfile = saved_chkfile
+
+    _EmbasiSCF.__name__ = base.__name__
+    _EmbasiSCF._embasi_deepcopy_state = True
+    mf.__class__ = _EmbasiSCF
+    if chkfile:
+        mf.chkfile = str(chkfile)
+
+
 def _pyscf_mean_fields(atoms: Any, charge: int, cfg: Any) -> tuple[Any, Any, Any]:
     """``(mol, mf_ll, mf_hl)`` for ``atoms``, configured from the workflow settings.
 
@@ -441,13 +554,86 @@ def _pyscf_mean_fields(atoms: Any, charge: int, cfg: Any) -> tuple[Any, Any, Any
     # Read with a default so drivers whose settings predate the flag are unaffected.
     if getattr(cfg, "scf_newton", False):
         mf_ll = mf_ll.newton()
+    chkfile = getattr(cfg, "scf_chkfile_out", None)
+    path: str | None = None
+    if chkfile:
+        resolved = Path(chkfile).expanduser()
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        path = str(resolved)
+    for mf in (mf_ll, mf_hl):
+        _preserve_scf_state_on_deepcopy(mf, path)
     return mol, mf_ll, mf_hl
+
+
+def _apply_method_hcore_shift(rundata: Any, mf: Any) -> bool:
+    """Add mean-field hcore overrides missing from EmbASI's ``ham_estat_xc``.
+
+    EmbASI builds ``ham_estat_xc`` from the bare ``Mole`` nuclear attraction plus
+    ``veff``.  An SCF may override ``get_hcore`` to include an external potential
+    (for example point charges) or an ECP; ``ham_kin`` covers only the kinetic term,
+    so that extra one-body part must be added here to keep
+    ``ham_kin + ham_estat_xc == ham_tot``.  Returns whether anything changed.
+
+    TODO(embasi-upstream): delete once EmbASI builds ``ham_estat_xc`` from the
+    mean field's hcore (minus the kinetic term) instead of the bare ``Mole``.
+    """
+    delta = (
+        np.asarray(mf.get_hcore())
+        - np.asarray(mf.mol.intor("int1e_nuc"))
+        - np.asarray(mf.mol.intor("int1e_kin"))
+    )
+    if np.max(np.abs(delta)) <= 1e-12:
+        return False
+    stat = rundata.ham_estat_xc
+    for spin in range(stat.n_spins):
+        for kpoint in range(stat.n_kpoints):
+            current = np.asarray(stat[spin, kpoint])
+            if current.shape != delta.shape:
+                raise ValueError(
+                    "cannot apply the mean-field hcore shift: ham_estat_xc has shape "
+                    f"{current.shape}, hcore has {delta.shape} (truncated layers are "
+                    "not supported)"
+                )
+            stat[spin, kpoint] = current + delta
+    return True
+
+
+def _install_pyscf_adapter_hcore_shim() -> bool:
+    """Wrap EmbASI's PySCF adapter so its extracted matrices include hcore overrides.
+
+    EmbASI is optional here: the PySCF backend also has to build in environments
+    where EmbASI is absent or cannot import its MPI dependency.  In that case
+    there is no adapter to wrap, so leave the backend untouched.
+
+    TODO(embasi-upstream): delete with :func:`_apply_method_hcore_shift` when EmbASI
+    consumes the mean-field hcore directly.
+    """
+    try:
+        from embasi.qmcode_adapters import PySCFAdapter
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+    original = PySCFAdapter.run_scf
+    if getattr(original, "_embasi_hcore_shift", False):
+        return False
+
+    def run_scf(self: Any, atomsembed: Any) -> None:
+        original(self, atomsembed)
+        mf = getattr(getattr(getattr(atomsembed, "atoms", None), "calc", None), "method", None)
+        rundata = getattr(self, "scf_rundata", None)
+        if mf is not None and rundata is not None:
+            _apply_method_hcore_shift(rundata, mf)
+
+    run_scf._embasi_hcore_shift = True  # type: ignore[attr-defined]
+    PySCFAdapter.run_scf = run_scf
+    return True
 
 
 @register_backend(
     "pyscf",
     backend_only_settings={
         "scf_newton": False,
+        "scf_chkfile_out": None,
         "init_guess": None,
         "init_guess_breaksym": None,
         "density_fit": False,
@@ -457,6 +643,8 @@ def _pyscf_mean_fields(atoms: Any, charge: int, cfg: Any) -> tuple[Any, Any, Any
 def build_pyscf_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend:
     """PySCF ``Mole`` + KS/UKS calculators for EmbASI, and the integrals over them."""
     from pyscf.pbc.tools.pyscf_ase import PySCF
+
+    _install_pyscf_adapter_hcore_shim()
 
     _mol, mf_ll, mf_hl = _pyscf_mean_fields(atoms, charge, cfg)
     # PySCFIntegrals wraps the *same* mf_hl/mf_ll objects handed to
@@ -488,6 +676,9 @@ class _PySCFEri:
 
     def eri_mo_mixed(self, mo_a: np.ndarray, mo_b: np.ndarray) -> np.ndarray:
         return self._ints.eri_mo_mixed(mo_a, mo_b)
+
+    def eri_mo_block(self, mo_a, mo_b, mo_c, mo_d) -> np.ndarray:
+        return self._ints.eri_mo_block(mo_a, mo_b, mo_c, mo_d)
 
 
 class PySCFCallbackIntegrals(CallbackIntegrals):
@@ -524,11 +715,16 @@ def build_pyscf_callback_backend(atoms: Any, charge: int, cfg: Any) -> QMBackend
     """
     from pyscf.pbc.tools.pyscf_ase import PySCF
 
+    _install_pyscf_adapter_hcore_shim()
     mol, mf_ll, mf_hl = _pyscf_mean_fields(atoms, charge, cfg)
     calc_ll, calc_hl = PySCF(method=mf_ll), PySCF(method=mf_hl)
     # The exchange evaluator: an unrestricted HF on the same Mole, so one evaluation at
-    # (d, 0) separates J from K.  Never handed to ProjectionEmbedding.
-    calc_hf = PySCF(method=mol.UHF())
+    # (d, 0) separates J from K.  Never handed to ProjectionEmbedding, but LayerEvaluator
+    # deep-copies it before every non-SCF evaluation, so give it the same pickle-state
+    # protection as the embedding calculators (see _preserve_scf_state_on_deepcopy).
+    hf_method = mol.UHF()
+    _preserve_scf_state_on_deepcopy(hf_method)
+    calc_hf = PySCF(method=hf_method)
     ll_spin = is_spin_resolved(mf_ll)
     density_fit: bool | str = getattr(cfg, "df_auxbasis", None) or getattr(
         cfg, "density_fit", False

@@ -16,8 +16,12 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
+      # Patch context lines may legitimately contain a single trailing space;
+      # stripping it would make the patch fail to apply.
       - id: trailing-whitespace
+        exclude: ^scripts/patches/.*\.patch$
       - id: end-of-file-fixer
+        exclude: ^scripts/patches/.*\.patch$
       - id: check-yaml
       - id: check-toml
       - id: check-added-large-files

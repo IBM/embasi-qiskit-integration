@@ -46,8 +46,26 @@ def _importable(module: str) -> bool:
         return False
 
 
+def _mpi4py_usable() -> bool:
+    """Whether pyomo's optional MPI dependency can actually load.
+
+    Pyomo imports ``mpi4py`` while initialising its dependency registry.  A
+    present-but-unloadable ``mpi4py`` (the common CI case: installed without a
+    system ``libmpi``) raises ``RuntimeError`` during ``import pyomo`` rather
+    than presenting as a missing module, so ``find_spec`` alone is insufficient.
+    """
+    if not _importable("mpi4py"):
+        return True
+    try:
+        import mpi4py.MPI  # noqa: F401
+    except (ImportError, OSError, RuntimeError):
+        return False
+    return True
+
+
+@functools.cache
 def relabel_available() -> bool:
-    """True if the optional relabel solver stack (``pyomo`` + HiGHS) is importable.
+    """True if the optional relabel solver stack (``pyomo`` + HiGHS) is usable.
 
     ``RelabelModes`` needs ``pyomo`` to build the MILP and a solver to solve it;
     :class:`NativeHighsSolverAdapter` uses pyomo's bundled appsi HiGHS interface,
@@ -55,12 +73,13 @@ def relabel_available() -> bool:
     permutation (it warns and returns the circuit unchanged), so callers should
     check this before requesting ``optimize=True``.
 
-    Probes with ``find_spec`` rather than importing, so the classical and replay
-    paths never pay for pulling pyomo in. A broken or partially-installed package
-    counts as unavailable: this gates a default, so it must answer rather than
-    propagate.
+    Probes with ``find_spec`` rather than importing pyomo, so the classical and
+    replay paths never pay for pulling pyomo in. A broken or partially-installed
+    package counts as unavailable: this gates a default, so it must answer rather
+    than propagate.  In particular, pyomo imports mpi4py, so an installed but
+    unloadable mpi4py makes pyomo unusable on CI hosts without a system MPI.
     """
-    return all(_importable(module) for module in ("pyomo", "highspy"))
+    return all(_importable(module) for module in ("pyomo", "highspy")) and _mpi4py_usable()
 
 
 def cpsat_available() -> bool:

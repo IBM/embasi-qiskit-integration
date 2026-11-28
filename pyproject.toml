@@ -32,6 +32,23 @@ fermions = ["qiskit-fermions>=0.3.1,<0.4.0"]
 relabel  = ["pyomo>=6.7", "highspy>=1.7,<1.14", "ortools>=9.15"]
 hardware = ["qiskit-ibm-runtime", "samplomatic"]
 embed    = ["embasi @ git+https://github.com/tamm-cci/EmbASI.git@qm-code-adapter"]
+# SIESTA ASI flavour 3. This installs ONLY the ASI Python wrapper + h5py --
+# SIESTA itself is never a Python dependency. Build it locally (see
+# docker/siesta-asi/) and set ASI_LIB_PATH. PyPI's latest asi4py (1.4.9) maps
+# flavours 0-2 only; 1.4.10 is ASI main at the MR !112 merge. Replace the URL
+# with "asi4py>=1.4.10" once that release is on PyPI.
+# TODO(asi4py-1.4.10): swap for a version bound when 1.4.10 is published.
+siesta   = ["asi4py @ git+https://gitlab.com/pvst/asi.git@303a9d7#subdirectory=pyasi", "h5py>=3"]
+# IBM/sci-solvers: the unified selected-CI solver interface (torch_sci is the
+# default, but sbd/dice/arpack/... are available through the same
+# create_solver() API).  The top-level package and its torch-sci-solver
+# workspace member are both installed from the public GitHub monorepo.
+# torch is a transitive dependency (large; included by `all`).
+# TODO(sci-solvers): replace with versioned PyPI dependencies when published.
+sci-solvers = [
+    "sci-solvers @ git+https://github.com/IBM/sci-solvers.git ; python_version >= '3.12'",
+    "torch-sci-solver[sqd] @ git+https://github.com/IBM/sci-solvers.git#subdirectory=packages/torch-sci-solver ; python_version >= '3.12'",
+]
 # An MPI runtime for the mpi4py that EmbASI imports, for Linux hosts with none.
 # Opt-in, and not part of `all`: mpi4py loads a library in .venv/lib before the system
 # one, so on a cluster with its own MPI this would shadow it and mismatch its mpirun.
@@ -39,7 +56,7 @@ mpi      = ["mpich; sys_platform == 'linux'"]
 chem     = ["rdkit>=2023.9"]         # SMILES-derived charge in molecule/geometry.py (optional)
 dev      = ["pytest>=7", "pytest-cov", "ruff==0.15.20", "mypy>=2.2,<2.4", "pre-commit", "rdkit>=2023.9"]
 # Every runtime extra in one shot (excludes `dev` tooling).
-all      = ["embasi-qiskit-integration[quantum,fermions,relabel,hardware,embed]"]
+all      = ["embasi-qiskit-integration[quantum,fermions,relabel,hardware,embed,siesta,sci-solvers]"]
 
 [project.scripts]
 embasi-qiskit-integration = "embasi_qiskit_integration.cli:main"
@@ -48,6 +65,8 @@ embasi-qiskit-integration = "embasi_qiskit_integration.cli:main"
 markers = [
     "embasi: requires EmbASI + FHI-aims",
     "slow: heavy simulation",
+    "siesta_real: requires a real SIESTA ASI/QCOMP build (skipped on CI)",
+    "siesta_docker: full Docker-based SIESTA integration (skipped on CI)",
     "shipped_aer_default: see the real Aer default, not the suite's statevector pin",
 ]
 addopts = "-m 'not embasi'"
@@ -61,6 +80,12 @@ filterwarnings = [
     "ignore:overflow encountered:RuntimeWarning",
     "ignore:invalid value encountered:RuntimeWarning",
 ]
+
+[tool.uv.sources]
+# Force the flavour-3-capable wrapper for EmbASI's unpinned `asi4py` dependency.
+# Delete once asi4py >= 1.4.10 is on PyPI and the `siesta` extra uses a version bound.
+# TODO(asi4py-1.4.10): remove this source override at the same time.
+asi4py = { git = "https://gitlab.com/pvst/asi.git", rev = "303a9d7", subdirectory = "pyasi" }
 
 [tool.hatch.metadata]
 # The `embed` extra references EmbASI directly from git (it is not on PyPI);

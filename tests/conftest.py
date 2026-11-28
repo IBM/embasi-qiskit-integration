@@ -19,6 +19,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+# Test modules such as test_circuit_generator import qiskit-aer at module level,
+# which pytest evaluates before the package's own OpenMP preload would run.
+# Preload here so the suite exercises the normal multi-threaded torch path.
+from embasi_qiskit_integration._openmp import preload_torch_openmp
+
+preload_torch_openmp()
+
 EMBASI_AVAILABLE = os.environ.get("EMBASI_AVAILABLE") == "1"
 
 # Frozen global seed so any accidental un-seeded randomness is still reproducible.

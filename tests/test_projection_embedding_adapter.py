@@ -597,6 +597,9 @@ def test_projection_energy_from_state_matches_the_live_assembly():
 
     adapter = _build_adapter()
     adapter.run_low_level()
+    # Exercise the SIESTA-style total-energy reference: the snapshot must carry
+    # it too, or a two-process assembly drops the full pseudopotential offset.
+    adapter.ints.high_level_reference_energy = lambda layer: 2.5
     orbitals = adapter.build_orbitals(n_frozen_occ=0, n_virtual=None)
     result = FCISolver().solve(adapter.embedded_hamiltonian(orbitals))
 

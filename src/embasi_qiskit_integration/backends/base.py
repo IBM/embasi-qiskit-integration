@@ -141,6 +141,23 @@ class AOIntegrals(AOBasis, Protocol):
     def eri_mo_mixed(self, mo_a: np.ndarray, mo_b: np.ndarray) -> np.ndarray:
         """Mixed-spin ``(p_a q_a | r_b s_b)``, shape ``(nmo,)*4``."""
 
+    def eri_mo_block(
+        self,
+        mo_a: np.ndarray,
+        mo_b: np.ndarray,
+        mo_c: np.ndarray,
+        mo_d: np.ndarray,
+    ) -> np.ndarray:
+        """Chemist-notation ``(p_a q_b | r_c s_d)`` for four independent orbital blocks.
+
+        The four coefficient blocks may have different widths and need not span the
+        same space.  This is what an integral-driven active-space ranking needs:
+        transforming the union of the occupied and candidate virtual blocks through
+        :meth:`eri_mo` would form an ``(n_occ+n_virt)^4`` tensor that is unnecessary
+        (and on a 100-AO NAO basis infeasible).  Shape is
+        ``(n_a, n_b, n_c, n_d)``.
+        """
+
     def energy_nuc(self) -> float: ...
 
     def layer_scf_status(self, layer: Any) -> dict[str, Any] | None:

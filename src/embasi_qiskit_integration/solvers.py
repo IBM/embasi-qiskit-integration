@@ -295,8 +295,8 @@ class SQDSolver(ActiveSpaceSolver):
     ``len(evolution_time) * len(num_groups) * num_randomizations * shots``.
     ``method="exact"`` builds one circuit per evolution time.
 
-    ``optimize`` (default True) lets the generator
-    relabel the fermionic modes to shorten each circuit. That makes every circuit
+    ``optimize`` (default: probe whether the relabel extra is available) lets the
+    generator relabel the fermionic modes to shorten each circuit. That makes every circuit
     sample in its *own* permuted mode order, which this class handles end to end:
     the reference determinant is prepared in the permuted order, and each
     circuit's counts are mapped back to the original order *before* the ensemble
@@ -318,7 +318,7 @@ class SQDSolver(ActiveSpaceSolver):
         num_batches: int = 5,
         max_iterations: int = 5,
         seed: int | None = None,
-        optimize: bool | None = True,
+        optimize: bool | None = None,
         time_limit: float = 10.0,
         relabel_solver: str = "cpsat",
         cpsat_workers: int = 1,
@@ -329,6 +329,8 @@ class SQDSolver(ActiveSpaceSolver):
         workers: int = 1,
         symmetrize_spin: bool | None = None,
         spin_sq: float | None = None,
+        sci_solver: str = "torch_sci",
+        torch_sci_kwargs: dict[str, Any] | None = None,
     ):
         self.sampler = sampler
         self.shots = shots
@@ -358,6 +360,13 @@ class SQDSolver(ActiveSpaceSolver):
         # Target S(S+1). None (default) imposes no projection: nelec fixes Sz, not S, so
         # set this when a wrong-multiplicity state could lie below the intended one.
         self.spin_sq = spin_sq
+        # Subspace diagonalizer. "torch_sci" (default) is IBM/sci-solvers'
+        # TorchSCISolver, installed through the optional `sci-solvers` extra; a
+        # spin-dependent Hamiltonian automatically uses its spin-orbital path.
+        # "qiskit_addon_sqd" is the addon's own PySCF selected-CI path and needs
+        # no extra; it is the fallback baseline, not a Qiskit-branded solver.
+        self.sci_solver = sci_solver
+        self.torch_sci_kwargs = dict(torch_sci_kwargs or {})
         self._permutations: list[list[int] | None] = []
         self._reseeded: list[dict] = []
 
@@ -382,6 +391,8 @@ class SQDSolver(ActiveSpaceSolver):
             symmetrize_spin=self.symmetrize_spin,
             spin_sq=self.spin_sq,
             seed=self.seed,
+            sci_solver=self.sci_solver,
+            torch_sci_kwargs=self.torch_sci_kwargs,
         )
         res.diagnostics.update(
             shots=self.shots,

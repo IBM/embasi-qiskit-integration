@@ -82,6 +82,13 @@ class LayerEvaluator:
         # re-run as neutral -- and for an odd charge PySCF refuses the Mole outright
         # (electron count and spin no longer have the same parity).
         self._layer.input_total_charge = float(charge)
+        # TODO(embasi-siesta-shim): delete this call with backends/_embasi_compat.py
+        # once EmbASI sets the non-SCF correction state itself.  Non-SCF-corrected
+        # codes (SIESTA, FHI-aims) need the fragment electron count and
+        # basis_info EmbASI only sets inside ProjectionEmbedding.
+        from embasi_qiskit_integration.backends._embasi_compat import prime_layer
+
+        prime_layer(self._layer)
 
     def _wrap(self, dm: DensityArg) -> Any:
         from embasi.ks_array import SpinKpointArray
@@ -151,6 +158,9 @@ class CallbackIntegrals:
         nao: number of AO basis functions (sizes the zero-density evaluation).
         basis_atoms: AO-to-atom map, ``(nao,)``; ``None`` if the code reports none.
         ao_labels: ``(atom, element, shell, m)`` per AO, if the code reports them.
+            May also be a zero-argument callable returning that list, for a code
+            whose labels are only written after the first evaluation (SIESTA's
+            ``.ORB_INDX``); it is resolved once, on the first ``ao_labels()`` call.
         describe: fingerprint fields (``basis``, ``natm``, ``charge``, ``spin``,
             ``atom_coords``, ``atom_symbols``, and optionally ``xc_hl``).
         ll_spin_resolved: whether the low-level calculator has two spin channels.
@@ -159,11 +169,24 @@ class CallbackIntegrals:
         cheap_evaluations: declare ``arbitrary_dm_veff`` (evaluations are cheap enough to
             sit inside an SCF loop -- true for an in-process code, not for a file-driven
             one).
+        arbitrary_dm_veff: override the ``arbitrary_dm_veff`` declaration independently
+            of cost.  A SIESTA evaluation can evaluate ``veff`` at an arbitrary density
+            (one ASI run), which the WF downfold needs even though each run is expensive.
+            Defaults to ``cheap_evaluations``.
         scf_status: ``layer -> dict | None`` for EmbASI layers (``None``: no flag).
         hl_status: ``() -> dict`` for the high-level mean field.
         layer_footing: ``layer -> (hcore, E_nuc)`` for an EmbASI layer; ``None`` uses
             this backend's own supersystem ``hcore``/``E_nuc`` (right since EmbASI's
             ``ghosts=0``: every layer integrates on the supersystem frame).
+        nuclear_energy: ``() -> E_nuc`` when the code does not expose the bare ion-ion
+            repulsion through a zero-density energy.  SIESTA's ASI energy is an SCF
+            total, not ``E_nuc``; the backend computes it from the pseudopotential
+            valence charges instead.  ``None`` uses the zero-density energy (PySCF).
+        high_level_reference: ``layer -> energy`` added to the high-level WF total
+            so it lands on the low-level code's total-energy reference.  SIESTA's
+            bare valence FCI lacks the pseudopotential/double-counting reference
+            that its DFT total contains; the backend supplies the full
+            ``E_bare(D_A) - E_low(A)`` offset.  ``None`` adds zero (PySCF).
     """
 
     def __init__(
@@ -174,14 +197,21 @@ class CallbackIntegrals:
         *,
         nao: int,
         basis_atoms: np.ndarray | None = None,
-        ao_labels: list[tuple[int, str, str, str]] | None = None,
+        ao_labels: (
+            Sequence[tuple[int, str, str, str]]
+            | Callable[[], Sequence[tuple[int, str, str, str]]]
+            | None
+        ) = None,
         describe: dict[str, Any] | None = None,
         ll_spin_resolved: bool = False,
         eri_provider: EriProvider | None = None,
         cheap_evaluations: bool = False,
+        arbitrary_dm_veff: bool | None = None,
         scf_status: Callable[[Any], dict[str, Any] | None] | None = None,
         hl_status: Callable[[], dict[str, Any]] | None = None,
         layer_footing: Callable[[Any], tuple[np.ndarray, float]] | None = None,
+        nuclear_energy: Callable[[], float] | None = None,
+        high_level_reference: Callable[[Any], float] | None = None,
     ):
         self._eval_ll = eval_ll
         self._eval_hl = eval_hl
@@ -193,24 +223,39 @@ class CallbackIntegrals:
                 f"basis_atoms has shape {self._basis_atoms.shape}, expected ({self._nao},)"
             )
         self._ao_labels = ao_labels
+        self._ao_labels_resolved: list[tuple[int, str, str, str]] | None = None
         self._describe = dict(describe or {})
         self._ll_spin_resolved = bool(ll_spin_resolved)
         self._eri = eri_provider
         self._cheap = bool(cheap_evaluations)
+        self._arbitrary_dm_veff = (
+            self._cheap if arbitrary_dm_veff is None else bool(arbitrary_dm_veff)
+        )
         self._scf_status = scf_status
         self._hl_status = hl_status
         self._layer_footing = layer_footing
+        self._nuclear_energy = nuclear_energy
+        self._high_level_reference = high_level_reference
         self._zero: dict[str, Evaluation] = {}
+        # Last density -> mean-field channels per level.  The WF workflow reads
+        # veff_ll(gamma_A) twice in one energy assembly (h_emb then v_emb); the
+        # evaluator is deterministic, so reuse it instead of another ASI/SCF run.
+        self._veff_cache: dict[str, tuple[tuple[bytes, ...], tuple[np.ndarray, ...]]] = {}
+        self._eval_cache: dict[str, tuple[tuple[bytes, ...], Evaluation]] = {}
 
     # ---------------- capabilities ---------------- #
     @property
     def capabilities(self) -> frozenset[str]:
         caps = {CAP_HCORE, CAP_ENERGY_ELEC}
-        if self._eval_hf is not None:
+        # Exact exchange comes either from a UHF evaluator or from the AO ERIs
+        # (K[dm] is a direct contraction; no separate HF mean field needed).
+        if self._eval_hf is not None or (
+            self._eri is not None and callable(getattr(self._eri, "jk", None))
+        ):
             caps.add(CAP_EXACT_EXCHANGE)
         if self._eri is not None:
             caps.add(CAP_ERI)
-        if self._cheap:
+        if self._arbitrary_dm_veff:
             caps.add(CAP_ARBITRARY_DM_VEFF)
         return frozenset(caps)
 
@@ -251,7 +296,19 @@ class CallbackIntegrals:
     def ao_labels(self) -> list[tuple[int, str, str, str]]:
         if self._ao_labels is None:
             raise MissingCapabilityError("this backend's QM code reports no AO labels")
-        return list(self._ao_labels)
+        if self._ao_labels_resolved is None:
+            # A callable is resolved once: the labels may only become readable after
+            # the first evaluation (SIESTA writes .ORB_INDX then), and the basis does
+            # not change between evaluations.
+            source = self._ao_labels() if callable(self._ao_labels) else self._ao_labels
+            labels = [tuple(label) for label in source]
+            if len(labels) != self._nao:
+                raise ValueError(
+                    f"AO label provider returned {len(labels)} labels for a "
+                    f"{self._nao}-function basis; its ordering cannot be trusted"
+                )
+            self._ao_labels_resolved = labels
+        return list(self._ao_labels_resolved)
 
     def search_ao_label(self, labels: Sequence[str]) -> np.ndarray:
         """AO indices whose ``"<element> <shell>"`` matches any of ``labels``."""
@@ -277,17 +334,40 @@ class CallbackIntegrals:
         return h0[0]
 
     def energy_nuc(self) -> float:
+        if self._nuclear_energy is not None:
+            return float(self._nuclear_energy())
         return self._at_zero("ll").energy
 
     def energy_elec_ll(self, dm: np.ndarray) -> float:
-        return self._eval_ll(np.asarray(dm)).energy - self._at_zero("ll").energy
+        return self._evaluate("ll", np.asarray(dm)).energy - self._at_zero("ll").energy
 
     # ---------------- mean-field potentials ---------------- #
+    @staticmethod
+    def _density_key(dm: DensityArg) -> tuple[bytes, ...]:
+        blocks = dm if isinstance(dm, tuple) else (dm,)
+        return tuple(
+            np.ascontiguousarray(np.asarray(block, dtype=float)).tobytes() for block in blocks
+        )
+
+    def _evaluate(self, which: str, dm: DensityArg) -> Evaluation:
+        key = self._density_key(dm)
+        cached = self._eval_cache.get(which)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        ev = {"ll": self._eval_ll, "hl": self._eval_hl}[which](dm)
+        self._eval_cache[which] = (key, ev)
+        return ev
+
     def _veff_channels(self, which: str, dm: DensityArg) -> tuple[np.ndarray, ...]:
-        ev = {"ll": self._eval_ll, "hl": self._eval_hl}[which]
-        h = ev(dm).hamiltonian
+        key = self._density_key(dm)
+        cached = self._veff_cache.get(which)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        h = self._evaluate(which, dm).hamiltonian
         h0 = self._at_zero(which).hamiltonian
-        return tuple(hs - h0s for hs, h0s in zip(h, h0, strict=True))
+        channels = tuple(hs - h0s for hs, h0s in zip(h, h0, strict=True))
+        self._veff_cache[which] = (key, channels)
+        return channels
 
     @staticmethod
     def _mean(channels: tuple[np.ndarray, ...]) -> np.ndarray:
@@ -315,19 +395,34 @@ class CallbackIntegrals:
             raise ValueError("the HF evaluator must be unrestricted (two spin channels)")
         return h[0] - h0[0], h[1] - h0[1]
 
+    def _eri_jk(self, dm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """``(J[dm], K[dm])`` from the AO ERI provider, when it supports it."""
+        if self._eri is None or not callable(getattr(self._eri, "jk", None)):
+            raise MissingCapabilityError(
+                "this backend's QM code has no exact exchange (no UHF evaluator and "
+                "no ERI-based J/K)"
+            )
+        return self._eri.jk(np.asarray(dm))
+
     def get_jk(self, dm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """``(J[dm], K[dm])`` from one UHF evaluation at ``(dm, 0)``."""
-        v_a, v_b = self._hf_pair(dm, np.zeros_like(dm))
-        return v_b, v_b - v_a
+        """``(J[dm], K[dm])`` from a UHF evaluation or directly from the AO ERIs."""
+        if self._eval_hf is not None:
+            v_a, v_b = self._hf_pair(dm, np.zeros_like(dm))
+            return v_b, v_b - v_a
+        return self._eri_jk(dm)
 
     def get_k(self, dm: np.ndarray) -> np.ndarray:
         return self.get_jk(np.asarray(dm))[1]
 
     def veff_hf(self, dm: np.ndarray) -> np.ndarray:
-        # Restricted J - K/2 at a 2-occupancy dm == the UHF potential at (dm/2, dm/2).
-        d = 0.5 * np.asarray(dm)
-        v_a, _v_b = self._hf_pair(d, d)
-        return v_a
+        """Restricted ``J - K/2`` at a 2-occupancy ``dm``."""
+        if self._eval_hf is not None:
+            # The UHF potential at (dm/2, dm/2) is J - K/2.
+            d = 0.5 * np.asarray(dm)
+            v_a, _v_b = self._hf_pair(d, d)
+            return v_a
+        j, k = self._eri_jk(dm)
+        return j - 0.5 * k
 
     def veff_uhf(self, dm_a, dm_b) -> tuple[np.ndarray, np.ndarray, float]:
         d_a, d_b = np.asarray(dm_a), np.asarray(dm_b)
@@ -347,6 +442,34 @@ class CallbackIntegrals:
             raise MissingCapabilityError("this backend's QM code provides no ERIs")
         return self._eri.eri_mo_mixed(mo_a, mo_b)
 
+    def eri_mo_block(self, mo_a, mo_b, mo_c, mo_d) -> np.ndarray:
+        """Four independent orbital blocks; see :meth:`AOIntegrals.eri_mo_block`.
+
+        The native path delegates to the code-specific ERI provider (SIESTA-QCOMP's
+        block transform streams the stored quartets).  A provider that only exposes
+        ``eri_mo`` falls back to transforming the union of the four blocks, which is
+        only allowed for small unions: on an NAO basis the union of the occupied and
+        candidate-virtual blocks is essentially the whole subsystem, and its fourth
+        power is exactly what this method exists to avoid.
+        """
+        if self._eri is None:
+            raise MissingCapabilityError("this backend's QM code provides no ERIs")
+        native = getattr(self._eri, "eri_mo_block", None)
+        if callable(native):
+            return np.asarray(native(mo_a, mo_b, mo_c, mo_d), dtype=float)
+        blocks = [np.asarray(m, dtype=float) for m in (mo_a, mo_b, mo_c, mo_d)]
+        union = np.hstack(blocks)
+        if union.shape[1] > 24:
+            raise MissingCapabilityError(
+                "this backend's ERI provider implements only eri_mo(); the "
+                "correlation-avas block transform needs eri_mo_block() (or a union "
+                f"of at most 24 orbitals, got {union.shape[1]})"
+            )
+        transformed = self.eri_mo(union)
+        offsets = np.cumsum([0] + [b.shape[1] for b in blocks])
+        idx = [np.arange(offsets[i], offsets[i + 1]) for i in range(4)]
+        return np.asarray(transformed[np.ix_(idx[0], idx[1], idx[2], idx[3])], dtype=float)
+
     # ---------------- SCF status / footing ---------------- #
     def layer_scf_status(self, layer: Any) -> dict[str, Any] | None:
         return None if self._scf_status is None else self._scf_status(layer)
@@ -360,3 +483,9 @@ class CallbackIntegrals:
         if self._layer_footing is not None:
             return self._layer_footing(layer)
         return self.hcore(), self.energy_nuc()
+
+    def high_level_reference_energy(self, layer: Any) -> float:
+        """High-level total-energy reference for ``layer`` (zero unless configured)."""
+        if self._high_level_reference is None:
+            return 0.0
+        return float(self._high_level_reference(layer))

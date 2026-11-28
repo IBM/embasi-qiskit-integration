@@ -41,6 +41,11 @@ class SolveCommand(BaseSettings):
 
     directory: CliPositionalArg[str]
     solver: Literal["sqd", "fci"] = "sqd"
+    # SQD subspace diagonalizer; torch_sci requires the optional `sci-solvers` extra.
+    sci_solver: str = "torch_sci"
+    # None auto-detects CUDA, then Apple MPS, then CPU.
+    torch_sci_device: str | None = None
+    torch_sci_apply_ab_projection: bool = False
     sampler: Literal["aer", "mock", "runtime"] = "runtime"
     # Which Aer simulator, when --sampler aer; None takes the package default (MPS).
     aer_method: str | None = None
@@ -140,6 +145,11 @@ class SolveCommand(BaseSettings):
             evolution_time=self.evolution_time,
             num_groups=self.num_groups,
             num_randomizations=self.num_randomizations,
+            sci_solver=self.sci_solver,
+            torch_sci_kwargs={
+                "apply_ab_projection": self.torch_sci_apply_ab_projection,
+                **({"device": self.torch_sci_device} if self.torch_sci_device else {}),
+            },
         )
 
     def _sampler_options(self) -> dict | None:

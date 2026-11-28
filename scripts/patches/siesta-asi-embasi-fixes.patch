@@ -1,0 +1,25 @@
+diff --git a/Src/fft.F b/Src/fft.F
+index 03010faa4..abb1492fd 100644
+--- a/Src/fft.F
++++ b/Src/fft.F
+@@ -111,6 +111,8 @@
+         implicit none
+ 
+         call de_alloc( trigs, 'trigs', 'fft' )
++        frsttime = .TRUE.
++        OldMesh = 0
+       end subroutine fft_trigs_reset
+ 
+       subroutine fft_set_fftw( use_fftw_in )
+diff --git a/Src/m_fft_gpfa.F b/Src/m_fft_gpfa.F
+index 380e1218f..766a9b65d 100644
+--- a/Src/m_fft_gpfa.F
++++ b/Src/m_fft_gpfa.F
+@@ -5362,6 +5362,7 @@ C WRITTEN BY J.M.SOLER. MAY/95.
+             implicit none
+ 
+             if ( allocated(trigs) ) deallocate(trigs)
++            nold = -1
+       end subroutine fft_gpfa_trigs_reset
+       end module gpfa_fft
+ 

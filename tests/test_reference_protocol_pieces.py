@@ -15,6 +15,16 @@ import numpy as np
 import pytest
 
 from embasi_qiskit_integration.projection_embedding_adapter import _require_scf_converged
+from embasi_qiskit_integration.backends.base import (
+    CAP_ARBITRARY_DM_VEFF,
+    CAP_ENERGY_ELEC,
+    CAP_ERI,
+    CAP_EXACT_EXCHANGE,
+    CAP_HCORE,
+)
+from embasi_qiskit_integration.reference_protocol import (
+    reference_wf_in_dft_hamiltonian,
+)
 from embasi_qiskit_integration.selectors import (
     concentric_localization_selector,
     fragment_ao_indices,
@@ -80,3 +90,110 @@ def test_scf_guard_passes_converged_noscf_and_other_backends():
     _require_scf_converged(_layer(converged=True, max_cycle=50, e_tot=-1.0), "test SCF")
     _require_scf_converged(_layer(converged=False, max_cycle=0, e_tot=-1.0), "no-SCF evaluation")
     _require_scf_converged(SimpleNamespace(atoms=SimpleNamespace(calc=SimpleNamespace())), "aims")
+
+
+class _ReferenceFakeIntegrals:
+    """A 4-AO closed-shell stand-in for the reference-protocol wrapper.
+
+    ``F = diag(-1, -0.5, 0.5, 1)`` in an orthonormal basis with a zero low-level
+    potential, so the initial density is already the fixed point.  The active space
+    is two occupied orbitals plus the fragment-spanned virtual AO 2.  A nonzero
+    ``high_level_reference_energy`` stands in for SIESTA's pseudopotential /
+    double-counting offset.
+    """
+
+    capabilities = frozenset(
+        {CAP_HCORE, CAP_EXACT_EXCHANGE, CAP_ARBITRARY_DM_VEFF, CAP_ENERGY_ELEC, CAP_ERI}
+    )
+
+    def __init__(self, *, reference_energy: float) -> None:
+        self._reference_energy = float(reference_energy)
+
+    def overlap(self) -> np.ndarray:
+        return np.eye(4)
+
+    def hcore(self) -> np.ndarray:
+        return np.diag([-1.0, -0.5, 0.5, 1.0])
+
+    def energy_nuc(self) -> float:
+        return 0.5
+
+    def veff_ll(self, dm: np.ndarray) -> np.ndarray:
+        return np.zeros((4, 4))
+
+    def energy_elec_ll(self, dm: np.ndarray) -> float:
+        return 0.0
+
+    def veff_hf(self, dm: np.ndarray) -> np.ndarray:
+        return np.zeros((4, 4))
+
+    def eri_mo(self, coeff: np.ndarray) -> np.ndarray:
+        n = coeff.shape[1]
+        return np.zeros((n, n, n, n))
+
+    def high_level_reference_energy(self, layer) -> float:
+        return self._reference_energy
+
+
+def _reference_fake_adapter(*, reference_energy: float):
+    ints = _ReferenceFakeIntegrals(reference_energy=reference_energy)
+    # One occupied B orbital under the level-shift projector, so the wrapper's
+    # projector-leak guard sees a genuine B occupied (not a shifted virtual).
+    dm_b = np.diag([0.0, 0.0, 0.0, 2.0])
+    p_b = 1.0e6 * np.diag([0.0, 0.0, 0.0, 1.0])
+    adapter = SimpleNamespace(
+        ints=ints,
+        _dm_a=np.diag([2.0, 2.0, 0.0, 0.0]),
+        _dm_b=dm_b,
+        p_b=p_b,
+        p=SimpleNamespace(A_LL=object()),
+    )
+    return adapter
+
+
+def test_reference_protocol_subtracts_the_backend_high_level_reference():
+    """SIESTA's same-density offset must reach E[γ_A], not only E_high(A).
+
+    The single-shot path subtracts ``high_level_reference_energy`` from
+    ``E_high(A)``.  Without the same subtraction in the variational path the
+    reference total sits tens of hartree away on a pseudopotential code (measured
+    -61.6 vs -34.4 Ha at butyronitrile 0.8 A in SZ), while PySCF is unaffected.
+    """
+    adapter = _reference_fake_adapter(reference_energy=10.0)
+    ham, info = reference_wf_in_dft_hamiltonian(
+        adapter, np.array([0, 1, 2]), n_frozen_occ=0, n_virtual=1, n_shells=0
+    )
+
+    # Raw E[γ_A] = tr[h γ_A] + E_nuc = -3.0 + 0.5; the backend offset is 10 Ha.
+    assert info.e_variational == pytest.approx(-12.5, abs=1e-12)
+    assert info.scf_history[-1].energy == pytest.approx(-12.5, abs=1e-12)
+    # The applied offset is reported, so a scan can recover the raw energy: the
+    # same-density offset is geometry dependent on a pseudopotential code and must
+    # not enter relative energies.
+    assert info.energy_offset == pytest.approx(-10.0, abs=1e-12)
+    assert info.e_variational - info.energy_offset == pytest.approx(-2.5, abs=1e-12)
+    # Active-space HF reference: two occupied orbitals of diag(-1, -0.5, 0.5).
+    assert info.e_reference == pytest.approx(-3.0, abs=1e-12)
+    assert ham.e_core == pytest.approx(-9.5, abs=1e-12)
+    assert ham.e_core + info.e_reference == pytest.approx(info.e_variational, abs=1e-12)
+
+    # A zero reference (the PySCF/plain-callback path) leaves the raw energy alone.
+    plain = _reference_fake_adapter(reference_energy=0.0)
+    _ham, plain_info = reference_wf_in_dft_hamiltonian(
+        plain, np.array([0, 1, 2]), n_frozen_occ=0, n_virtual=1, n_shells=0
+    )
+    assert plain_info.e_variational == pytest.approx(-2.5, abs=1e-12)
+    assert plain_info.energy_offset == 0.0
+    assert _ham.e_core == pytest.approx(0.5, abs=1e-12)
+
+
+def test_reference_protocol_rejects_an_explicit_energy_offset():
+    adapter = _reference_fake_adapter(reference_energy=10.0)
+    with pytest.raises(ValueError, match="energy_offset"):
+        reference_wf_in_dft_hamiltonian(
+            adapter,
+            np.array([0, 1, 2]),
+            n_frozen_occ=0,
+            n_virtual=1,
+            scf_options={"energy_offset": 1.0},
+        )

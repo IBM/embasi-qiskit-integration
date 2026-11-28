@@ -79,7 +79,8 @@ Upstream gaps that remain (each marked ``TODO(embasi-api)`` inline):
   ``(pq|rs) = sum_P M^P_pq M^P_rs`` -- so FHI-aims cannot drive the WF-in-DFT half
   and the workflow stays PySCF-only.  See :class:`FHIaimsIntegrals`.
 * **No A-fragment footing (h_core^A / E_nuc^A).**  The WF-path nuclear-frame rebase
-  asks the backend for ``layer_footing(A_LL)`` (PySCF: ``A_LL.atoms.calc.mol``) because EmbASI exposes
+  asks the backend for ``layer_footing(A_LL)`` (PySCF: the layer's mean field,
+  ``A_LL.atoms.calc.method``) because EmbASI exposes
   no backend-agnostic A-fragment one-electron operator / nuclear repulsion; the
   rebase is therefore PySCF-only.  See :meth:`_a_fragment_footing`.
   **Largely moot since EmbASI's ``9c21cac``**, which sets ``ghosts=0`` on every
@@ -160,12 +161,12 @@ per-spin leak ~2e-10, ``E_solver = -53.522493`` Ha.
   *count* does not freeze corresponding orbitals) and is validated against the narrower
   channel, with a warning when a frozen pair's ``|<a_i|S|b_i>|`` drops below
   ``_FROZEN_OVERLAP_TOL``.
-* **Only FCI consumes the pair.**  SQD's ``diagonalize_fermionic_hamiltonian`` and the
-  FCIDUMP format each take a single one-body tensor; both fall back to the spin-averaged
-  ``h1`` and warn.  ``h2_spin`` is likewise FCI-only.  This is an upstream
-  ``qiskit-addon-sqd`` limitation (no UHF entry point, and its ``sci_solver`` hook
-  receives the tensor already substituted), not something fixable here -- see
-  ``port.md``.
+* **FCI and the default torch-sci SQD path consume the pair.**  The default
+  ``torch_sci`` solver automatically maps a spin-dependent
+  ``(h1a, h1b, h2_spin)`` set to a ``2*norb`` spin-orbital Hamiltonian and uses
+  torch-sci's spinless engine; other selected SQD solvers raise instead of
+  silently averaging.  The path does not support ``spin_sq`` and needs the
+  dense ``(2*norb)^4`` ERI.  The FCIDUMP format remains spin-averaged.
 * **The energy terms are contracted per channel, and the totals derived from them.**
   Every density-linear term in :meth:`projection_energy` contracts each channel against
   *its own* ``v_emb``/``P_B`` (:meth:`v_emb_spin`, ``_p_b_spin``) and sums, because that
@@ -466,6 +467,12 @@ def projection_energy_from_state(
         + np.einsum("ij,ji->", dm_hl, _array("hcore_full") - _array("hcore_a"))
     )
     e_high_a -= footing_shift
+
+    # The live path subtracts the backend's total-energy reference (SIESTA's
+    # same-density offset); carry it in the snapshot too, or a two-process
+    # assembly silently drops a ~1 Ha pseudopotential reference.
+    if "high_level_reference" in state:
+        e_high_a -= float(_array("high_level_reference"))
 
     return ProjectionEnergy(
         e_low_total=float(_array("e_low_total")),
@@ -1051,6 +1058,12 @@ class ProjectionEmbeddingAdapter:
         state["enuc_full"] = np.asarray(float(self.ints.energy_nuc()))
         state["e_low_total"] = np.asarray(e_low_ab)
         state["e_low_a"] = np.asarray(e_low_a)
+        # SIESTA's same-density reference is part of the energy, not an array in
+        # the live embedding object; carry it so an out-of-process assembly
+        # subtracts the same offset as projection_energy().
+        reference = getattr(self.ints, "high_level_reference_energy", None)
+        if callable(reference):
+            state["high_level_reference"] = np.asarray(float(reference(self.p.A_LL)))
         # Per-spin state, when there is any.  Without this an out-of-process open-shell
         # loop silently degrades to the spin-summed arrays -- it would restore, assemble a
         # plausible restricted Fock and report a wrong energy with nothing to flag it.
@@ -2185,7 +2198,13 @@ class ProjectionEmbeddingAdapter:
             max_size: fixed ``(nelec, norb)`` active space, filled by projected weight
                 instead of cut at ``threshold``.  ``None`` (default) -> threshold cut.
             n_frozen_occ: lowest doubly occupied orbitals excluded from the projection
-                and always frozen (PySCF's ``ncore``).
+                and always frozen (PySCF's ``ncore``).  With a fixed ``max_size`` the
+                remaining occupied candidates are ranked by target-AO weight and the
+                lowest-weight ones are frozen too, so this is a *floor* on the core --
+                the ``--selector ao-avas`` reading.  (If ``n_frozen_occ`` leaves exactly
+                the requested number of occupied candidates, they are forced and the
+                selection falls back to the canonical energy order -- the behaviour
+                ``ao-avas`` exists to avoid, hence its recommended ``n_frozen_occ=0``.)
             restrict_to_a: forwarded to :meth:`build_orbitals` -- a pure performance
                 knob, ``False`` only needed against a stub adapter without live EmbASI.
             use_relaxed: diagonalize the relaxed embedded-HF Fock from
@@ -2237,16 +2256,326 @@ class ProjectionEmbeddingAdapter:
             "max_size": max_size,
             "occ_weights": sel["occ_weights"],
             "virt_weights": sel["virt_weights"],
+            "virt_selection_weights": sel["virt_selection_weights"],
             "n_active_occ": sel["n_active_occ"],
             "n_active_virt": sel["n_active_virt"],
             "n_somo": n_somo,
         }
+        for key in (
+            "virt_candidate_column",
+            "virt_candidate_energy",
+            "virt_selection_column",
+        ):
+            if key in sel:
+                self._avas_info[key] = sel[key]
         return EmbeddedOrbitals(
             coeff=sel["coeff"],
             energy=sel["energy"],
             n_occ=n_occ,
             inactive=sel["inactive"],
             active=sel["active"],
+            n_occ_b=orbitals.n_occ_b,
+        )
+
+    def build_orbitals_correlation_avas(
+        self,
+        *,
+        ao_projector: np.ndarray,
+        max_size: tuple[int, int],
+        n_frozen_occ: int = 0,
+        restrict_to_a: bool = True,
+        use_relaxed: bool = False,
+        denominator_floor: float = 1.0e-8,
+        min_marginal: float = 0.01,
+    ) -> EmbeddedOrbitals:
+        """Opt-in AVAS variant that ranks virtuals by **embedded MP2 correlation**.
+
+        The occupied block keeps the standard AVAS target-AO ranking: the fragment's
+        highest-weight doubly occupied orbitals fill the fixed budget and the rest
+        are frozen.  The virtual block does *not* use the AVAS weight.  Instead, the
+        full subsystem-A downfolded one-body operator
+
+        ``h1 = C^T (h_emb + veff_hf(dm_inactive)) C``
+
+        and the bare ERI blocks ``(ia|jb)``, ``(ij|kl)``, ``(ab|ij)`` feed a
+        closed-shell semicanonical MP2 calculation (:func:`selectors.
+        mp2_orbital_correlation`) over the active occupieds x candidate virtuals.
+        The ``n_act_virt`` virtuals with the most negative *marginal correlation*
+        are kept; their semicanonical eigenvectors are returned as the active
+        virtual block, with the remaining virtual eigenvectors after them.  A
+        rotation within the virtual span leaves the CASCI energy invariant, so the
+        returned columns are a legal :class:`EmbeddedOrbitals` basis.
+
+        Why this is not the default: the SIESTA DZP AVAS weight saturates at 1.000
+        for several high-energy N-localised pi* virtuals.  The MP2 metric sees the
+        two-electron coupling and the downfolded denominator, and on the archived
+        butyronitrile 2.5 A dump it ranks the C/N pi* pair (-0.224 Ha pair MP2)
+        far above every other virtual (< -0.061 Ha).  It is an *opt-in* selector
+        (``--selector correlation-avas``); ``ao-avas`` is untouched.
+
+        Only the virtuals are ranked.  Ranking the occupied block by the same MP2
+        marginal was tested on the archived dump and rejected: with all seven
+        occupieds as the reference it ranks a near-degenerate core-valence mixture
+        above the pi pair.  The target-AO weight is the chemically anchored choice
+        for the occupied block.
+
+        Args:
+            ao_projector: ``(nao, nao)`` target-AO metric (as
+                :meth:`build_orbitals_avas`).
+            max_size: fixed ``(nelec, norb)`` active-space budget.  Required: a
+                correlation ranking needs a known number of virtual slots.
+            n_frozen_occ: lowest doubly occupied orbitals always frozen (also the
+                AVAS core floor).
+            restrict_to_a: forwarded to :meth:`build_orbitals` (performance knob).
+            use_relaxed: use the relaxed embedded-HF Fock instead of the one-shot
+                low-level ``F_emb`` for the occupied AVAS ranking and the reported
+                energies.
+            denominator_floor: MP2 amplitudes with ``|e_i + e_j - e_a - e_b|`` at
+                or below this are dropped (Ha); the default only guards exact
+                degeneracies.
+            min_marginal: **weak-signal guard** (Ha).  The MP2 ranking is used only
+                if every selected virtual's ``|marginal correlation|`` reaches this
+                value.  Otherwise the whole virtual block falls back to the
+                standard AVAS target-AO weight ranking, i.e. exactly the default
+                ``ao-avas`` space.  The archived butyronitrile 0.8 A dump has a
+                weak, diffuse signal (top marginals -0.0077/-0.0043 Ha) that
+                otherwise selects C/N 3d/N2p virtuals and moves the correction
+                away; 0.01 Ha keeps the strong H2 (-0.016) and butyronitrile 2.5
+                (-0.138/-0.135) selections and rejects the weak one.  ``0``
+                disables the guard.
+
+        Returns:
+            The :class:`EmbeddedOrbitals` with the MP2-selected virtuals first, or
+            the standard AVAS orbitals when the weak-signal guard falls back.
+
+        Raises:
+            NotImplementedError: for an open-shell subsystem A (the metric is
+                closed-shell only), or a backend without the downfold integrals.
+            ValueError: if ``max_size`` is missing or the budget does not fit.
+        """
+        from embasi_qiskit_integration.selectors import (
+            mp2_orbital_correlation,
+            select_correlated_orbitals,
+        )
+
+        if max_size is None:
+            raise ValueError(
+                "correlation-avas needs a fixed active-space budget: pass "
+                "--cas-size/--avas-max-size (nelec, norb)"
+            )
+        size = tuple(int(n) for n in max_size)
+        if len(size) != 2:
+            raise ValueError(
+                "correlation-avas supports a (nelec, norb) budget only; the "
+                "per-spin (nelec_alpha, nelec_beta, norb) form is open-shell"
+            )
+        if not np.isfinite(min_marginal) or min_marginal < 0.0:
+            raise ValueError(
+                f"min_marginal={min_marginal} must be a finite, non-negative "
+                "correlation energy (Ha); 0 disables the weak-signal guard"
+            )
+        self._require_downfold_capabilities("the correlation-avas MP2 ranking")
+
+        orbitals = self.build_orbitals(
+            n_frozen_occ=0, restrict_to_a=restrict_to_a, use_relaxed=use_relaxed
+        )
+        n_occ = orbitals.n_occ
+        n_docc = n_occ if orbitals.n_occ_b is None else orbitals.n_occ_b
+        n_somo = n_occ - n_docc
+        if n_somo:
+            raise NotImplementedError(
+                "correlation-avas is closed-shell only: the MP2 metric enumerates "
+                f"doubly occupied -> virtual pairs, but subsystem A has {n_somo} "
+                "singly occupied orbital(s).  Use --selector ao-avas for open shell."
+            )
+        if not 0 <= n_frozen_occ < n_occ:
+            raise ValueError(f"n_frozen_occ={n_frozen_occ} outside [0, {n_occ})")
+
+        fock = self._fock_relaxed_arr if use_relaxed else self._fock_arr
+        canonical = np.asarray(orbitals.coeff, dtype=float)
+        n_virt_total = canonical.shape[1] - n_occ
+        n_act_budget = self._avas_budget(
+            size, 0, n_avail_occ=n_occ - n_frozen_occ, n_avail_virt=n_virt_total
+        )
+
+        # Occupied block: standard AVAS target-AO ranking (fixed counts).  We keep
+        # only the occupied columns of _avas_select's result and rebuild the virtual
+        # block below from the untouched canonical virtuals.
+        sel = self._avas_select(
+            canonical,
+            np.asarray(orbitals.energy, dtype=float).copy(),
+            fock,
+            np.asarray(ao_projector, dtype=float),
+            n_occ=n_occ,
+            n_docc=n_docc,
+            n_frozen_occ=n_frozen_occ,
+            choose=lambda _w_occ, _w_virt, budget=n_act_budget: budget,
+        )
+        n_act_occ, n_act_virt = int(sel["n_active_occ"]), int(sel["n_active_virt"])
+        if n_act_virt == 0:
+            # Nothing to rank: every virtual is frozen.  Return the AVAS result.
+            sel["selector"] = "correlation-avas"
+            self._avas_info = {
+                "threshold": None,
+                "max_size": size,
+                "occ_weights": sel["occ_weights"],
+                "virt_weights": sel["virt_weights"],
+                "virt_selection_weights": np.empty(0),
+                "n_active_occ": n_act_occ,
+                "n_active_virt": 0,
+                "n_somo": 0,
+                "correlation_metric": "mp2-marginal",
+                "correlation_fallback": False,
+                "correlation_min_marginal": float(min_marginal),
+            }
+            return EmbeddedOrbitals(
+                coeff=sel["coeff"],
+                energy=sel["energy"],
+                n_occ=n_occ,
+                inactive=np.asarray(sel["inactive"], dtype=int),
+                active=np.asarray(sel["active"], dtype=int),
+                n_occ_b=orbitals.n_occ_b,
+            )
+
+        occupied_block = np.asarray(sel["coeff"], dtype=float)[:, :n_occ]
+        active_occ = np.asarray(sel["active"], dtype=int)
+        active_occ = active_occ[active_occ < n_occ]
+        inactive = np.asarray(sel["inactive"], dtype=int)
+        c_act_occ = occupied_block[:, active_occ]
+        c_in = occupied_block[:, inactive]
+        c_virt = canonical[:, n_occ:]
+        canonical_virt_energy = np.asarray(orbitals.energy, dtype=float)[n_occ:]
+
+        # Full-A one-body operator.  The inactive core is folded into veff_hf; the
+        # MP2 reference itself contains only the active occupieds.
+        h_emb = np.asarray(self.h_emb, dtype=float)
+        if c_in.shape[1]:
+            dm_in = 2.0 * (c_in @ c_in.T)
+            veff_in = np.asarray(self.ints.veff_hf(dm_in), dtype=float)
+        else:
+            veff_in = np.zeros_like(h_emb)
+        one_body = h_emb + veff_in
+        h1_oo = c_act_occ.T @ one_body @ c_act_occ
+        h1_vv = c_virt.T @ one_body @ c_virt
+
+        # Only the blocks MP2 needs: never the fourth power of the A space.
+        eri_block = getattr(self.ints, "eri_mo_block", None)
+        if not callable(eri_block):
+            raise MissingCapabilityError(
+                "correlation-avas needs the AOIntegrals.eri_mo_block() arbitrary-block "
+                f"ERI transform, which the {type(self.ints).__name__} backend does not "
+                "provide (it has eri_mo, but transforming the union of the occupied and "
+                "candidate-virtual blocks is the tensor this method avoids)"
+            )
+        eri_ovov = eri_block(c_act_occ, c_virt, c_act_occ, c_virt)
+        eri_oooo = eri_block(c_act_occ, c_act_occ, c_act_occ, c_act_occ)
+        eri_vvoo = eri_block(c_virt, c_virt, c_act_occ, c_act_occ)
+
+        correlation = mp2_orbital_correlation(
+            h1_oo,
+            h1_vv,
+            eri_ovov,
+            eri_oooo,
+            eri_vvoo,
+            denominator_floor=denominator_floor,
+        )
+        _ranked_occ, ranked_virt = select_correlated_orbitals(correlation, n_virtual=n_act_virt)
+        if ranked_virt.size != n_act_virt:
+            raise ValueError(
+                f"correlation-avas needed {n_act_virt} virtuals but the MP2 ranking "
+                f"returned {ranked_virt.size}"
+            )
+        selected_marginals = correlation.virtual_marginal_correlation[ranked_virt]
+
+        # Weak-signal guard: a diffuse/low-correlation point can produce a ranking
+        # driven by near-degenerate denominators or high-lying 3d/N2p functions
+        # (butyronitrile 0.8 A).  If any selected |marginal| is below the guard,
+        # discard the whole MP2 virtual space and return the standard AVAS weight
+        # selection -- exactly the default ao-avas space for the same target/budget.
+        if np.any(np.abs(selected_marginals) < float(min_marginal)):
+            fallback = self.build_orbitals_avas(
+                ao_projector=ao_projector,
+                max_size=size,
+                n_frozen_occ=n_frozen_occ,
+                restrict_to_a=restrict_to_a,
+                use_relaxed=use_relaxed,
+            )
+            info = self._avas_info
+            info["correlation_metric"] = "mp2-marginal"
+            info["correlation_fallback"] = True
+            info["correlation_min_marginal"] = float(min_marginal)
+            info["correlation_attempted_marginals"] = np.asarray(
+                selected_marginals, dtype=float
+            ).copy()
+            return fallback
+
+        # Semicanonical virtuals, selected first; the remaining block keeps the
+        # rest so every S-orthonormal virtual is still represented.
+        virt_rot = c_virt @ correlation.virtual_rotation
+        rest = np.setdiff1d(np.arange(n_virt_total), ranked_virt)
+        order = np.concatenate([ranked_virt, rest]).astype(int)
+        virt_final = np.ascontiguousarray(virt_rot[:, order])
+
+        coeff = np.hstack([occupied_block, virt_final])
+        energy = np.empty(coeff.shape[1], dtype=float)
+        energy[:n_occ] = np.asarray(sel["energy"], dtype=float)[:n_occ]
+        # Rotated virtuals are not F_emb eigenvectors; report their F_emb expectation
+        # (not an eigenvalue) so diagnostics stay finite and traceable.
+        energy[n_occ:] = np.einsum("pi,pq,qi->i", virt_final, fock, virt_final)
+
+        gram = coeff.T @ self._s_arr @ coeff
+        if not np.allclose(gram, np.eye(gram.shape[0]), atol=1.0e-6):
+            raise ValueError(
+                "correlation-avas produced a non-S-orthonormal orbital set "
+                f"(max |C^T S C - I| = {np.abs(gram - np.eye(gram.shape[0])).max():.2e})"
+            )
+
+        active = np.concatenate([active_occ, n_occ + np.arange(n_act_virt)]).astype(int)
+        # Report the final-column ordering, matching what the dump's `coeff` holds.
+        candidate_order = np.concatenate(
+            [ranked_virt, np.setdiff1d(np.arange(n_virt_total), ranked_virt)]
+        ).astype(int)
+        final_weights = np.einsum(
+            "pi,pq,qi->i",
+            virt_final,
+            np.asarray(ao_projector, dtype=float),
+            virt_final,
+        )
+        self._avas_info = {
+            "threshold": None,
+            "max_size": size,
+            "occ_weights": sel["occ_weights"],
+            "virt_weights": final_weights,
+            "virt_selection_weights": correlation.virtual_marginal_correlation[ranked_virt],
+            "n_active_occ": n_act_occ,
+            "n_active_virt": n_act_virt,
+            "n_somo": 0,
+            "correlation_metric": "mp2-marginal",
+            "correlation_fallback": False,
+            "correlation_min_marginal": float(min_marginal),
+            "correlation_denominator_floor": float(denominator_floor),
+            "correlation_e_corr": float(correlation.e_corr),
+            "correlation_n_skipped": int(correlation.n_skipped),
+            "mp2_virtual_natural_occupations": correlation.virtual_natural_occupations[
+                candidate_order
+            ],
+            "mp2_virtual_marginal_correlation": correlation.virtual_marginal_correlation[
+                candidate_order
+            ],
+            "mp2_occupied_natural_occupations": correlation.occupied_natural_occupations,
+            "mp2_semicanonical_virtual_energies": correlation.virtual_energies,
+            # Window-style candidate columns: positional into the returned virtual
+            # block, so `coeff[:, n_occ + column]` is the candidate.
+            "virt_candidate_column": n_occ + np.arange(n_virt_total, dtype=int),
+            "virt_candidate_energy": canonical_virt_energy[candidate_order],
+            "virt_selection_column": n_occ + np.arange(n_act_virt, dtype=int),
+        }
+        return EmbeddedOrbitals(
+            coeff=coeff,
+            energy=energy,
+            n_occ=n_occ,
+            inactive=inactive,
+            active=active,
             n_occ_b=orbitals.n_occ_b,
         )
 
@@ -2271,9 +2600,6 @@ class ProjectionEmbeddingAdapter:
         the eigenvectors of their AVAS projection; ``choose(w_occ, w_virt)`` (weights
         ascending / descending) returns how many of each to keep; every group is then
         semi-canonicalized against ``fock``.
-
-        Returns a dict with the rotated ``coeff`` and ``energy``, ``active`` / ``inactive``
-        column indices, the ``occ_weights`` / ``virt_weights`` and the kept counts.
         """
         c = coeff.copy()
         energy = energy.copy()
@@ -2302,13 +2628,13 @@ class ProjectionEmbeddingAdapter:
         w_occ = project(occ_idx, ascending=True)
         w_virt = project(virt_idx, ascending=False)
         n_act_occ, n_act_virt = choose(w_occ, w_virt)
-
+        active_virt = virt_idx[:n_act_virt]
+        virt_selection_weights = w_virt[:n_act_virt]
         inactive_occ = occ_idx[: occ_idx.size - n_act_occ]
         active_occ = occ_idx[occ_idx.size - n_act_occ :]
-        active_virt = virt_idx[:n_act_virt]
-        for group in (inactive_occ, active_occ, active_virt, virt_idx[n_act_virt:]):
+        discarded_virt = virt_idx[n_act_virt:]
+        for group in (inactive_occ, active_occ, active_virt, discarded_virt):
             semicanonicalize(group)
-
         return {
             "coeff": c,
             "energy": energy,
@@ -2318,6 +2644,7 @@ class ProjectionEmbeddingAdapter:
             "inactive": np.concatenate([np.arange(n_frozen_occ), inactive_occ]).astype(int),
             "occ_weights": w_occ,
             "virt_weights": w_virt,
+            "virt_selection_weights": virt_selection_weights,
             "n_active_occ": n_act_occ,
             "n_active_virt": n_act_virt,
         }
@@ -2427,15 +2754,22 @@ class ProjectionEmbeddingAdapter:
                     active=sel["active"],
                 )
             )
-            info["channels"].append(
-                {
-                    "occ_weights": sel["occ_weights"],
-                    "virt_weights": sel["virt_weights"],
-                    "n_active_occ": sel["n_active_occ"],
-                    "n_active_virt": sel["n_active_virt"],
-                    "n_frozen": int(sel["inactive"].size),
-                }
-            )
+            channel_info = {
+                "occ_weights": sel["occ_weights"],
+                "virt_weights": sel["virt_weights"],
+                "virt_selection_weights": sel["virt_selection_weights"],
+                "n_active_occ": sel["n_active_occ"],
+                "n_active_virt": sel["n_active_virt"],
+                "n_frozen": int(sel["inactive"].size),
+            }
+            for key in (
+                "virt_candidate_column",
+                "virt_candidate_energy",
+                "virt_selection_column",
+            ):
+                if key in sel:
+                    channel_info[key] = sel[key]
+            info["channels"].append(channel_info)
 
         alpha, beta = out
         cosines = np.linalg.svd(alpha.c_active.T @ self._s_arr @ beta.c_active, compute_uv=False)
@@ -3565,6 +3899,15 @@ class ProjectionEmbeddingAdapter:
         )
         e_high_a -= footing_shift
 
+        # Put a bare-Hamiltonian WF total on the low-level code's total-energy
+        # reference.  SIESTA's DFT total carries the pseudopotential and
+        # double-counting terms; the external FCI does not.  The backend
+        # subtracts the full same-density offset, not just ``Ena``.  PySCF
+        # (and the test stand-ins) return zero here.
+        reference = getattr(self.ints, "high_level_reference_energy", None)
+        if callable(reference):
+            e_high_a -= float(reference(self.p.A_LL))
+
         e_low_ab, e_low_a = self._low_level_energies()
         return ProjectionEnergy(
             e_low_total=e_low_ab,
@@ -3673,13 +4016,16 @@ class ProjectionEmbeddingAdapter:
         only**: the DFT-in-DFT path reads EmbASI's native ``DFT_AinB_total_energy``,
         which telescopes on EmbASI's own frame and needs no rebase (:meth:`dft_in_dft_energy`).
 
-        We read the operators *directly* off EmbASI's ``A_LL`` ``mol`` (the same
-        object it integrated), not by reconstructing them from a subtraction of
-        exposed matrices -- ``A_LL.hamiltonian_estat_plus_xc`` bundles the nuclear
-        attraction together with Coulomb+xc, so h_core^A is not separable from
-        what EmbASI exports.  ``int1e_kin + int1e_nuc`` on that ``mol`` reproduces
-        ``subsys_A_lowlvl_totalen`` to ~1e-14 Ha (asserted in the tests), and its
-        overlap matches ``self._s`` bit-for-bit (same basis, same AO ordering).
+        We read the operators off EmbASI's ``A_LL`` mean field (the same SCF object
+        it integrated), not by reconstructing them from a subtraction of exposed
+        matrices -- ``A_LL.hamiltonian_estat_plus_xc`` bundles the nuclear
+        attraction together with Coulomb+xc, so h_core^A is not separable from what
+        EmbASI exports.  ``method.get_hcore()`` and ``method.energy_nuc()`` on that
+        layer reproduce ``subsys_A_lowlvl_totalen`` to ~1e-14 Ha (asserted in the
+        tests), include any mean-field overrides (an external point-charge
+        potential), and its overlap matches ``self._s`` bit-for-bit (same basis,
+        same AO ordering); a calculator without a ``method`` falls back to
+        ``int1e_kin + int1e_nuc`` on its ``mol``.
 
         TODO(embasi-api): this reach-through is physically unavoidable for the WF
         path against today's EmbASI.  The rebase needs ``h_core^A`` (a matrix) and the
@@ -3691,9 +4037,9 @@ class ProjectionEmbeddingAdapter:
         high level is HF + an external correlated solver, so EmbASI's value is only
         the *mean-field* HF-in-DFT reference (and is the *embedded* energy, carrying
         ``v_emb``/``P_B``), not the bare correlated ``E_high(A)`` the assembly needs.
-        Absent an EmbASI-native A-fragment footing, we reach through
-        ``A_LL.atoms.calc.mol`` to a PySCF ``Mole`` (now behind the backend's
-        ``layer_footing``) -- fine for PySCF, but there is no
+        Absent an EmbASI-native A-fragment footing, we reach through the layer's
+        PySCF mean field (behind the backend's ``layer_footing``) -- fine for PySCF,
+        but there is no
         equivalent for the FHI-aims/ASI backend, so the WF-path rebase is PySCF-only.
         A backend-agnostic A-fragment ``h_core`` / ``energy_nuc`` on EmbASI would
         remove the reach-through entirely.
