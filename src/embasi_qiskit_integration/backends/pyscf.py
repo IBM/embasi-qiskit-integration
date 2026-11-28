@@ -601,10 +601,17 @@ def _apply_method_hcore_shift(rundata: Any, mf: Any) -> bool:
 def _install_pyscf_adapter_hcore_shim() -> bool:
     """Wrap EmbASI's PySCF adapter so its extracted matrices include hcore overrides.
 
+    EmbASI is optional here: the PySCF backend also has to build in environments
+    where EmbASI is absent or cannot import its MPI dependency.  In that case
+    there is no adapter to wrap, so leave the backend untouched.
+
     TODO(embasi-upstream): delete with :func:`_apply_method_hcore_shift` when EmbASI
     consumes the mean-field hcore directly.
     """
-    from embasi.qmcode_adapters import PySCFAdapter
+    try:
+        from embasi.qmcode_adapters import PySCFAdapter
+    except (ImportError, OSError, RuntimeError):
+        return False
 
     original = PySCFAdapter.run_scf
     if getattr(original, "_embasi_hcore_shift", False):

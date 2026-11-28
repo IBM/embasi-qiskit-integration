@@ -865,7 +865,6 @@ def test_solver_report_is_not_logged_at_info():
     """
     import logging
 
-    pytest.importorskip("pyomo")
     from embasi_qiskit_integration.circuit_generator.relabel import (
         NativeHighsSolverAdapter,
         relabel_available,
